@@ -7,7 +7,7 @@ from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 from torch.utils.data import Subset, DataLoader
 from flow import *
-import numpy as np
+import numpy as np #note
 def train_minn(encoder, channel, decoder, train_loader, num_epochs=10, lr=1e-3, device="cpu"):
     """
     MINN training loop:
