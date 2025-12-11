@@ -9,7 +9,6 @@ from torch.utils.data import Subset, DataLoader
 from flow import *
 from channel_tensors import generate_channel_tensors
 import numpy as np  # note
-from CODE_EXAMPLE.simnet import SimNet, RisLayer
 import argparse
 import math
 
@@ -42,7 +41,8 @@ def train_minn(
     channel,
     encoder,
     decoder,
-    simnet,
+    controller,
+    physical_sim,
     train_loader,
     num_epochs=10,
     lr=1e-3,
@@ -71,10 +71,13 @@ def train_minn(
     channel_aware_decoder = hasattr(decoder, 'channel_aware') and decoder.channel_aware
 
     criterion = nn.CrossEntropyLoss()
+    # Always train encoder and decoder
     params = list(encoder.parameters()) + list(decoder.parameters())
+    # For metasurface path, only train the controller DNN.
     if combine_mode in ["metanet", "both"]:
-        simnet.to(device)
-        params += list(simnet.parameters())
+        controller.to(device)
+        physical_sim.to(device)
+        params += list(controller.parameters())
 
     optimizer = optim.Adam(params, lr=lr, weight_decay=weight_decay)
 
@@ -122,8 +125,13 @@ def train_minn(
                 else:
                     pass
             if combine_mode in ["metanet", "both"]:
-                s_ms = torch.matmul(H_1, s_c.transpose(1, 2)).transpose(1, 2)
-                y_ms = simnet(s_ms, H=H_1)  # (batch, N_ms)
+                # Signal at metasurface
+                s_ms = torch.matmul(H_1, s_c.transpose(1, 2)).transpose(1, 2).squeeze()  # (batch, N_ms)
+                # Controller: CSI -> per-layer phases
+                theta_list = controller(H_D, H_1)
+                # Physical SIM: field + phases -> output field
+                y_ms = physical_sim(s_ms, theta_list)  # (batch, N_ms_out)
+                # Propagate to RX via H_2
                 y_metanet = torch.matmul(H_2, y_ms.unsqueeze(-1)).squeeze(-1)  # (batch, N_r)
                 if combine_mode == "metanet":
                     y = y_metanet
@@ -168,30 +176,23 @@ def train_minn(
     return encoder, decoder
 
 if __name__ == '__main__':
-    from CODE_EXAMPLE.simnet import SimNet, RisLayer  # top of file
-    from flow import Encoder, Decoder, ChannelPool, SimRISChannel, SimNet, build_simnet  # adapt imports
-
-    # Parse command line arguments
+    from flow import Encoder, Decoder, ChannelPool, SimRISChannel, build_simnet, Controller_DNN, Physical_SIM  # adapt imports
     parser = argparse.ArgumentParser(description='Train MINN on MNIST dataset')
-
     # Data configuration
     parser.add_argument('--subset_size', type=int, default=1000, help='Number of samples to use from training set')
     parser.add_argument('--batchsize', type=int, default=100, help='Batch size for training')
     parser.add_argument('--epochs', type=int, default=10, help='Number of training epochs')
-
+    parser.add_argument('--channel_sampling_size', type=int, default=1, help='Channel pool sampling size')
     # Model dimensions
     parser.add_argument('--N_t', type=int, default=10, help='Encoder output dimension (number of transmit antennas)')
     parser.add_argument('--N_r', type=int, default=8, help='Number of receive antennas')
-
+    parser.add_argument('--N_m', type=int, default=9, help='Number of metasurface elements per layer (N_m).'
+    'Must be a perfect square; layers use n_x1 = n_y1 = n_xL = n_yL = sqrt(N_m).')
     # Channel configuration
-    parser.add_argument('--channel_sampling_size', type=int, default=1, help='Channel pool sampling size')
-    parser.add_argument('--noise_std', type=float, default=0.000001, help='Noise standard deviation')
-    parser.add_argument('--lam', type=float, default=0.125, help='Lambda parameter for SimNet')
-    parser.add_argument('--N_m', type=int, default=9, help='Number of metasurface elements per layer (N_m). Must be a perfect square; '
-    'layers use n_x1 = n_y1 = n_xL = n_yL = sqrt(N_m).',)
     parser.add_argument('--combine_mode', type=str, default='both', choices=['direct', 'metanet', 'both'],
                         help='Channel combination mode: direct, simnet, or both')
-        # Channel fading configuration
+    parser.add_argument('--noise_std', type=float, default=0.000001, help='Noise standard deviation')
+    parser.add_argument('--lam', type=float, default=0.125, help='Lambda parameter for SimNet')
     parser.add_argument('--fading_type', type=str, default='ricean', choices=['rayleigh', 'ricean'],
                         help='Channel fading type: rayleigh (pure NLoS) or ricean (LoS + NLoS)')
     parser.add_argument('--k_factor_db', type=float, default=3.0,
@@ -200,7 +201,6 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay for optimizer')
     parser.add_argument('--device', type=str, default=None, help='Device to use (cuda/cpu). If None, auto-detect')
-
     args = parser.parse_args()
 
     # Set device
@@ -208,58 +208,35 @@ if __name__ == '__main__':
         device = "cuda" if torch.cuda.is_available() else "cpu"
     else:
         device = args.device
-
-    # Extract configuration from args
-    subset_size = 1000#args.subset_size
-    batch_size =100#args.batchsize
-    channel_sampling_size = 100#args.channel_sampling_size
-    epochs = 200#args.epochs
-    N_t = args.N_t
-    N_r = args.N_r
-    N_m = args.N_m
-    noise_std = args.noise_std
-    lam = args.lam
-    combine_mode = args.combine_mode
-    fading_type = args.fading_type
-    k_factor_db = args.k_factor_db
+    # Configuration
+    subset_size,batch_size,channel_sampling_size,epochs = 1000,100,100,1
+    N_t,N_m,N_r = 10,9,8
+    combine_mode,noise_std,lam = args.combine_mode,args.noise_std,args.lam
+    k_factor_db, fading_type = args.k_factor_db, args.fading_type
+    channel_params = chennel_params(noise_std=noise_std,combine_mode=combine_mode,
+    path_loss_direct_db=3.0,path_loss_ms_db=13.0)
     # ===== Data subset =====
     transform = transforms.Compose([transforms.ToTensor()])
     train_dataset = datasets.MNIST(root="./data", train=True, transform=transform, download=True)
     indices = np.random.choice(len(train_dataset), subset_size, replace=False)
     train_subset = Subset(train_dataset, indices)
     train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True)
-
-    base_simnet = build_simnet(N_m, lam=lam).to(device)
-    simnet = SimNet_wrapper(
-        base_simnet,
-        channel_aware=True,
-        n_rx=N_m,  # Metasurface receives from TX, so n_rx = N_ms
-        n_tx=N_t    # TX transmits to metasurface
-    ).to(device)
-    H_d_all, H_1_all, H_2_all = generate_channel_tensors(
-        N_t=N_t,
-        N_r=N_r,
-        N_m=N_m,
-        num_channels=channel_sampling_size,
-        device=device,
-        fading_type=fading_type,
-        k_factor_d_db=k_factor_db,   # TX-RX direct K-factor
-        k_factor_h1_db=13.0,         # TX-MS link K-factor
-        k_factor_h2_db=7.0,          # MS-RX link K-factor
-    )
-    channel_params = chennel_params(
-        noise_std=noise_std,
-        combine_mode=combine_mode,
-        path_loss_direct_db=3.0,
-        path_loss_ms_db=13.0,
-    )
+    H_d_all, H_1_all, H_2_all = generate_channel_tensors(N_t=N_t,N_r=N_r,N_m=N_m,num_channels=channel_sampling_size,
+    device=device,fading_type=fading_type,k_factor_d_db=k_factor_db,k_factor_h1_db=13.0,k_factor_h2_db=7.0)
+    # ===== DNN =====
+    #simnet = SimNet_wrapper(base_simnet,channel_aware=True, n_rx=N_m, n_tx=N_t).to(device)
+    simnet = build_simnet(N_m, lam=lam).to(device)
+    for p in simnet.parameters():
+        p.requires_grad = False
+    layer_sizes = [layer.num_elems for layer in simnet.ris_layers]
+    physical_sim = Physical_SIM(simnet).to(device) #wrapper for propogate s throw simnet
+    controller = Controller_DNN(n_t=N_t, n_r=N_r, n_ms=N_m, layer_sizes=layer_sizes).to(device)
     encoder = Encoder(N_t).to(device)
+    decoder = Decoder(n_rx=N_r,n_tx=N_t,n_m=N_m).to(device)
 
-    decoder = Decoder(
-        n_rx=N_r,
-        n_tx=N_t,
-        n_m=N_m
-    ).to(device)
+    train_minn(channel_params,encoder,decoder,controller,physical_sim,train_loader,num_epochs=epochs,
+    lr=args.lr,weight_decay=args.weight_decay,device=device,combine_mode=combine_mode,
+    H_d_all=H_d_all,H_1_all=H_1_all,H_2_all=H_2_all)
     # Print model sizes
     # print_model_size(encoder, "Encoder")
     # print_model_size(decoder, "Decoder")
@@ -300,30 +277,13 @@ if __name__ == '__main__':
     # params = list(encoder.parameters()) + list(decoder.parameters()) + list(channel.simnet.parameters())
     #
     # (see below)
-    train_minn(
-        channel_params,
-        encoder,
-        decoder,
-        simnet,
-        train_loader,
-        num_epochs=epochs,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        device=device,
-        combine_mode=combine_mode,
-        H_d_all=H_d_all,
-        H_1_all=H_1_all,
-        H_2_all=H_2_all,
-    )
     # Save final model
-    # torch.save({
-    #     'encoder': encoder.state_dict(),
-    #     'decoder': decoder.state_dict(),
-    #     'simnet': channel.simnet.state_dict() if hasattr(channel, 'simnet') and channel.simnet is not None else None,
-    # }, "minn_model.pth")
-    # print("Model saved to minn_model.pth")
-
-    # To load a checkpoint before training (move this code before train_minn() call):
+    torch.save({
+        'encoder': encoder.state_dict(),
+        'decoder': decoder.state_dict(),
+        'controller': controller.state_dict()
+        }, "minn_model.pth")
+    print("Model saved to minn_model.pth")
     # import os
     # checkpoint_path = "minn_checkpoint.pth"
     # if os.path.exists(checkpoint_path):
@@ -333,6 +293,5 @@ if __name__ == '__main__':
     #     if checkpoint.get('simnet') is not None and hasattr(channel, 'simnet') and channel.simnet is not None:
     #         channel.simnet.load_state_dict(checkpoint['simnet'])
     #     print(f"Loaded checkpoint from epoch {checkpoint.get('epoch', 0)}")
-    #
     # Note: To save checkpoints during training, modify train_minn() to save checkpoints inside the training loop.
     # The optimizer state can only be saved/loaded inside train_minn() where optimizer exists.

@@ -438,6 +438,55 @@ class Decoder(nn.Module):
 
         logits = self.fc_out(x)
         return logits
+class ChannelAwareDecoder(nn.Module):
+    def __init__(self, Nt, Nr, N, hidden_dim=32):
+        super(ChannelAwareDecoder, self).__init__()
+        self.Nt           = Nt
+        self.Nr           = Nr
+        self.N            = N
+        self.hidden_dim   = hidden_dim
+        self.n_classes    = 10
+        self.received_signal_size = 2 * self.Nr
+        self.channel_dim          = 2 * (self.Nt * self.N + self.Nr * self.N + self.Nt * self.Nr)
+
+        self.channel_decoder = nn.Sequential(
+            nn.LayerNorm(self.channel_dim),
+            nn.Linear(self.channel_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.LayerNorm(64),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, self.hidden_dim)
+        )
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(self.hidden_dim + self.received_signal_size),
+            nn.Linear(self.hidden_dim + self.received_signal_size, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.LayerNorm(64),
+            nn.ReLU(),
+            nn.Linear(64, self.n_classes),
+            #nn.Softmax(dim=1),
+        )
+    def forward(self, tv):
+        b         = tv.inputs.shape[0]
+        C_ue_bs   = tv.H_ue_bs_noise[:,0,:,:].view(b, -1)
+        C_ue_ris  = tv.H_ris_bs_noise[:,0,:,:].view(b, -1)
+        C_ris_bs  = tv.H_ue_ris_noise[:,0,:,:].view(b, -1)
+        C         = torch.concatenate([C_ue_bs, C_ris_bs, C_ue_ris], dim=1)
+        C         = torch.concatenate([torch.real(C), torch.imag(C)], dim=1)
+
+        C_decoded = self.channel_decoder(C)
+
+        y         = tv.received_signal
+        y         = y.view(b, self.received_signal_size)
+        x         = torch.concatenate([y, C_decoded], dim=1)
+        out       = self.classifier(x)
+        return out
 
 def test_minn(encoder, channel, decoder, test_loader, device="cpu"):
     encoder.to(device)
@@ -521,6 +570,102 @@ def build_simnet(N_m,lam=0.125):
         complex_dtype=torch.complex64,
     )
     return simnet
+
+
+class Controller_DNN(nn.Module):
+    """
+    Metasurface controller DNN: observes CSI (H_D, H_1) and outputs per-layer phases.
+    H_D: (B, N_r, N_t) complex  - direct TX-RX
+    H_1: (B, N_ms, N_t) complex - TX-MS
+    """
+    def __init__(self, n_t: int, n_r: int, n_ms: int, layer_sizes: list[int]):
+        super().__init__()
+        self.n_t = n_t
+        self.n_r = n_r
+        self.n_ms = n_ms
+        self.layer_sizes = layer_sizes
+
+        # input dim: Re/Im(H_D) + Re/Im(H_1)
+        h_d_dim = n_r * n_t * 2
+        h_1_dim = n_ms * n_t * 2
+        self.h_dim = h_d_dim + h_1_dim
+
+        self.h_norm = nn.LayerNorm(self.h_dim)
+        self.fc_h1 = nn.Linear(self.h_dim, 256)
+        self.fc_h2 = nn.Linear(256, 256)
+
+        total_phase_params = sum(layer_sizes)
+        self.fc_h3 = nn.Linear(256, total_phase_params)
+
+    def forward(self, H_D: torch.Tensor, H_1: torch.Tensor) -> list[torch.Tensor]:
+        """
+        Returns a list of theta tensors, one per SIM layer.
+        thetas[i]: (B, layer_sizes[i])
+        """
+        # flatten and concatenate CSI
+        H_D_real, H_D_imag = H_D.real, H_D.imag
+        H_1_real, H_1_imag = H_1.real, H_1.imag
+
+        v_D = torch.cat([H_D_real.flatten(1), H_D_imag.flatten(1)], dim=1)
+        v_1 = torch.cat([H_1_real.flatten(1), H_1_imag.flatten(1)], dim=1)
+        h_in = torch.cat([v_D, v_1], dim=1)
+
+        h_in = self.h_norm(h_in)
+        h = F.relu(self.fc_h1(h_in))
+        h = F.relu(self.fc_h2(h))
+        theta_all = self.fc_h3(h)  # (B, sum(layer_sizes))
+
+        # split per layer
+        thetas = []
+        start = 0
+        for L in self.layer_sizes:
+            thetas.append(theta_all[:, start:start+L])
+            start += L
+        return thetas
+
+
+class Physical_SIM(nn.Module):
+    """
+    Thin wrapper around a base SimNet that:
+      - takes s_ms (field on the metasurface),
+      - takes per-layer theta vectors from Controller_DNN,
+      - applies mean phase per element across batch,
+      - runs SimNet forward.
+    """
+    def __init__(self, simnet: nn.Module):
+        super().__init__()
+        self.simnet = simnet
+        # number of elements per layer
+        self.layer_sizes = [layer.num_elems for layer in self.simnet.ris_layers]
+
+    def forward(self, s_ms: torch.Tensor, theta_list: list[torch.Tensor]) -> torch.Tensor:
+        """
+        s_ms: (B, N_ms_in) complex
+        theta_list: list of length num_layers; each (B, N_layer_elems)
+        Returns:
+            y_ms: (B, N_ms_out) complex
+        """
+        assert len(theta_list) == len(self.simnet.ris_layers), \
+            "theta_list length must match number of SIM layers"
+
+        # save original thetas
+        original_thetas = [layer.theta.data.clone() for layer in self.simnet.ris_layers]
+
+        # set layer.theta based on averaged controller output (per element)
+        for i, layer in enumerate(self.simnet.ris_layers):
+            theta_layer = theta_list[i]  # (B, N_layer_elems)
+            # mean across batch → one phase per element
+            theta_mean = theta_layer.mean(dim=0)  # (N_layer_elems,)
+            layer.theta.data = theta_mean.to(layer.theta.data.device)
+
+        # propagate through SIM
+        y_ms = self.simnet(s_ms)
+
+        # restore original thetas
+        for layer, orig in zip(self.simnet.ris_layers, original_thetas):
+            layer.theta.data = orig
+
+        return y_ms
 
 
 class SimNet_wrapper(nn.Module):
