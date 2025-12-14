@@ -14,6 +14,46 @@ import math
 import os
 import sys
 
+
+def _parse_bool(raw) -> bool:
+    """
+    Parse a CLI boolean.
+
+    Accepts: True/False, 1/0, yes/no, y/n, on/off (case-insensitive).
+    """
+    if isinstance(raw, bool):
+        return raw
+    s = str(raw).strip().lower()
+    if s in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {raw!r}")
+
+
+def _parse_bool_or_bool_list(raw):
+    """
+    Parse either a single boolean or a Python-ish list like: [True, False].
+
+    This enables:
+      - --encoder_distill            (=> True)
+      - --encoder_distill False      (=> False)
+      - --encoder_distill [True,False]  (=> [True, False])
+    """
+    if raw is None:
+        # nargs="?" + const=True means: flag present with no value
+        return True
+    if isinstance(raw, list):
+        return [_parse_bool(x) for x in raw]
+    s = str(raw).strip()
+    if s.startswith("[") and s.endswith("]"):
+        inner = s[1:-1].strip()
+        if inner == "":
+            return []
+        parts = [p.strip() for p in inner.split(",")]
+        return [_parse_bool(p) for p in parts if p != ""]
+    return _parse_bool(s)
+
 def print_model_size(model, model_name="Model"):
     """Print detailed model size information."""
     total_params = 0
@@ -285,8 +325,29 @@ if __name__ == '__main__':
                         help='Live-update a plot window during training (may require GUI support).')
     parser.add_argument('--no_show_plot_end', action='store_true',
                         help='Do not display the plot window when training finishes (still saves PNG).')
+    parser.add_argument(
+        "--compare_arg",
+        nargs="+",
+        default=None,
+        help=(
+            "Generic comparison: provide an argument name followed by values, and produce ONE combined plot "
+            "with all curves + legend. Example: --compare_arg combine_mode direct metanet both  OR "
+            "--compare_arg noise_std 0.1 0.2. Only one arg can be compared at a time."
+        ),
+    )
     # Encoder feature distillation
-    parser.add_argument('--encoder_distill', action='store_true', help='Enable encoder feature distillation')
+    parser.add_argument(
+        '--encoder_distill',
+        nargs='?',
+        const=True,
+        default=False,
+        type=_parse_bool_or_bool_list,
+        help=(
+            "Enable encoder feature distillation. "
+            "You can pass an explicit boolean (e.g. '--encoder_distill False'). "
+            "You can also pass a list like '--encoder_distill [True,False]' to run a comparison in one process."
+        ),
+    )
     parser.add_argument(
         '--teacher_path',
         type=str,
@@ -310,6 +371,44 @@ if __name__ == '__main__':
     DEFAULT_TEACHER_STORE_NAME = "teacher/minn_model_teacher"
     DEFAULT_STUDENT_STORE_NAME = "students/minn_model_student"
 
+    def _safe_token(s: str) -> str:
+        allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-=")
+        return "".join((ch if ch in allowed else "_") for ch in str(s))
+
+    def _suffix_path(path: str, suffix: str) -> str:
+        root, ext = os.path.splitext(path)
+        return f"{root}{suffix}{ext}"
+
+    def _is_dir_like_path(p: str) -> bool:
+        return bool(p) and (p.endswith(("/", "\\")) or (os.path.isdir(p) and os.path.splitext(p)[1] == ""))
+
+    def _save_model(*, save_path_arg: str | None, model_store_name: str, suffix: str | None,
+                    encoder, decoder, controller) -> None:
+        if save_path_arg == "":
+            print("[INFO] Skipping model save because --save_path was set to an empty string.")
+            return
+        save_path = save_path_arg or f"MY_code/models_dict/{model_store_name}.pth"
+        if _is_dir_like_path(save_path):
+            save_path = os.path.join(save_path, f"{model_store_name}.pth")
+        if suffix:
+            save_path = _suffix_path(save_path, suffix)
+        save_dir = os.path.dirname(save_path)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+        torch.save(
+            {'encoder': encoder.state_dict(), 'decoder': decoder.state_dict(), 'controller': controller.state_dict()},
+            save_path,
+        )
+        print(f"[INFO] Model saved to {save_path}")
+
+    # If user provided encoder_distill as a list, treat it as a compare run.
+    if isinstance(args.encoder_distill, list):
+        if args.compare_arg is not None:
+            raise ValueError("Do not use both '--encoder_distill [..]' and '--compare_arg ...' at the same time.")
+        args.compare_arg = ["encoder_distill", *[("True" if v else "False") for v in args.encoder_distill]]
+        # Base value (will be overridden per compare run).
+        args.encoder_distill = False
+
     # Resolve teacher checkpoint path only when distillation is enabled.
     if args.encoder_distill and (args.teacher_ckpt is None):
         teacher_store = args.teacher_path or DEFAULT_TEACHER_STORE_NAME
@@ -319,68 +418,220 @@ if __name__ == '__main__':
         device = "cuda" if torch.cuda.is_available() else "cpu"
     else:
         device = args.device
-    # Configuration (respect CLI args)
-    subset_size, batch_size, channel_sampling_size, epochs = (
-        args.subset_size,
-        args.batchsize,
-        args.channel_sampling_size,
-        args.epochs,
-    )
-    N_t, N_m, N_r = args.N_t, args.N_m, args.N_r
-    combine_mode, noise_std, lam = args.combine_mode, args.noise_std, args.lam
-    k_factor_db, fading_type = args.k_factor_db, args.fading_type
-    channel_params = chennel_params(noise_std=noise_std,combine_mode=combine_mode,
-    path_loss_direct_db=3.0,path_loss_ms_db=13.0)
-    # ===== Data subset =====
-    transform = transforms.Compose([transforms.ToTensor()])
-    train_dataset = datasets.MNIST(root="./data", train=True, transform=transform, download=True)
-    indices = np.random.choice(len(train_dataset), subset_size, replace=False)
-    train_subset = Subset(train_dataset, indices)
-    train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True)
-    H_d_all, H_1_all, H_2_all = generate_channel_tensors(N_t=N_t,N_r=N_r,N_m=N_m,num_channels=channel_sampling_size,
-    device=device,fading_type=fading_type,k_factor_d_db=k_factor_db,k_factor_h1_db=13.0,k_factor_h2_db=7.0)
-    # ===== DNN =====
-    #simnet = SimNet_wrapper(base_simnet,channel_aware=True, n_rx=N_m, n_tx=N_t).to(device)
-    simnet = build_simnet(N_m, lam=lam).to(device)
-    for p in simnet.parameters():
-        p.requires_grad = False
-    layer_sizes = [layer.num_elems for layer in simnet.ris_layers]
-    physical_sim = Physical_SIM(simnet).to(device) #wrapper for propagation s throw simnet
-    controller = Controller_DNN(n_t=N_t, n_r=N_r, n_ms=N_m, layer_sizes=layer_sizes).to(device)
-    decoder = Decoder(n_rx=N_r,n_tx=N_t,n_m=N_m).to(device)
-    encoder = Encoder(N_t).to(device)
+    def _run_one(cfg) -> dict:
+        # ===== Data subset =====
+        transform = transforms.Compose([transforms.ToTensor()])
+        train_dataset = datasets.MNIST(root="./data", train=True, transform=transform, download=True)
+        indices = np.random.choice(len(train_dataset), int(cfg.subset_size), replace=False)
+        train_subset = Subset(train_dataset, indices)
+        train_loader = DataLoader(train_subset, batch_size=int(cfg.batchsize), shuffle=True)
 
-    use_feature_distiller = bool(args.encoder_distill)
-    encoder_distiller = None
-    model_store_name = DEFAULT_TEACHER_STORE_NAME
-    if use_feature_distiller:
-        model_store_name = DEFAULT_STUDENT_STORE_NAME
-        teacher_encoder = Encoder(N_t).to(device)
-        ckpt = torch.load(args.teacher_ckpt, map_location=device)
-        teacher_encoder.load_state_dict(ckpt["encoder"], strict=True)
-        #encoder.load_state_dict(ckpt["encoder"], strict=True)
-        teacher_encoder.eval()
-        for p in teacher_encoder.parameters():
+        # ===== Channels =====
+        H_d_all, H_1_all, H_2_all = generate_channel_tensors(
+            N_t=int(cfg.N_t),
+            N_r=int(cfg.N_r),
+            N_m=int(cfg.N_m),
+            num_channels=int(cfg.channel_sampling_size),
+            device=device,
+            fading_type=str(cfg.fading_type),
+            k_factor_d_db=float(cfg.k_factor_db),
+            k_factor_h1_db=13.0,
+            k_factor_h2_db=7.0,
+        )
+
+        channel_params = chennel_params(
+            noise_std=float(cfg.noise_std),
+            combine_mode=str(cfg.combine_mode),
+            path_loss_direct_db=3.0,
+            path_loss_ms_db=13.0,
+        )
+
+        # ===== DNN stack =====
+        simnet = build_simnet(int(cfg.N_m), lam=float(cfg.lam)).to(device)
+        for p in simnet.parameters():
             p.requires_grad = False
-        encoder_distiller = EncoderFeatureDistiller(teacher_encoder, encoder, pre_relu=True, distill_conv=True,
-        distill_s=True, lambda_conv=1.0, lambda_s=1.0).to(device)
-        # decoder.load_state_dict(ckpt["decoder"], strict=True)
-        # decoder.eval()
-        # for p in decoder.parameters():
-        #     p.requires_grad = False
-        # if "controller" in ckpt:
-        #     controller.load_state_dict(ckpt["controller"], strict=True)
-        #     controller.eval()
-        #     for p in controller.parameters():
-        #         p.requires_grad = False
-    train_minn(channel_params,encoder,decoder,controller,physical_sim,train_loader,num_epochs=epochs,
-    lr=args.lr,weight_decay=args.weight_decay,device=device,combine_mode=combine_mode,
-    H_d_all=H_d_all,H_1_all=H_1_all,H_2_all=H_2_all,
-    encoder_distiller=encoder_distiller,
-    plot_acc=(not args.no_plot_acc),
-    plot_path=args.plot_path,
-    plot_live=args.plot_live,
-    show_plot_end=(not args.no_show_plot_end))
+        layer_sizes = [layer.num_elems for layer in simnet.ris_layers]
+        physical_sim = Physical_SIM(simnet).to(device)
+        controller = Controller_DNN(n_t=int(cfg.N_t), n_r=int(cfg.N_r), n_ms=int(cfg.N_m), layer_sizes=layer_sizes).to(device)
+        decoder = Decoder(n_rx=int(cfg.N_r), n_tx=int(cfg.N_t), n_m=int(cfg.N_m)).to(device)
+        encoder = Encoder(int(cfg.N_t)).to(device)
+
+        encoder_distiller = None
+        model_store_name = DEFAULT_TEACHER_STORE_NAME
+        if bool(cfg.encoder_distill):
+            model_store_name = DEFAULT_STUDENT_STORE_NAME
+            teacher_ckpt = cfg.teacher_ckpt
+            if teacher_ckpt is None:
+                teacher_store = cfg.teacher_path or DEFAULT_TEACHER_STORE_NAME
+                teacher_ckpt = f"MY_code/models_dict/{teacher_store}.pth"
+            teacher_encoder = Encoder(int(cfg.N_t)).to(device)
+            ckpt = torch.load(teacher_ckpt, map_location=device)
+            teacher_encoder.load_state_dict(ckpt["encoder"], strict=True)
+            teacher_encoder.eval()
+            for p in teacher_encoder.parameters():
+                p.requires_grad = False
+            encoder_distiller = EncoderFeatureDistiller(
+                teacher_encoder, encoder, pre_relu=True, distill_conv=True, distill_s=True, lambda_conv=1.0, lambda_s=1.0
+            ).to(device)
+
+        history = train_minn(
+            channel_params,
+            encoder,
+            decoder,
+            controller,
+            physical_sim,
+            train_loader,
+            num_epochs=int(cfg.epochs),
+            lr=float(cfg.lr),
+            weight_decay=float(cfg.weight_decay),
+            device=device,
+            combine_mode=str(cfg.combine_mode),
+            H_d_all=H_d_all,
+            H_1_all=H_1_all,
+            H_2_all=H_2_all,
+            encoder_distiller=encoder_distiller,
+            # For compare runs, we plot once at the end; disable internal plotting.
+            plot_acc=False,
+            plot_path=None,
+            plot_live=False,
+            show_plot_end=False,
+        )
+
+        # Save model (optional) per run
+        suffix = None
+        if getattr(cfg, "_save_suffix", None):
+            suffix = str(cfg._save_suffix)
+        _save_model(
+            save_path_arg=cfg.save_path,
+            model_store_name=model_store_name,
+            suffix=suffix,
+            encoder=encoder,
+            decoder=decoder,
+            controller=controller,
+        )
+        return history
+
+    # ----- Compare mode: train multiple configs in ONE process and make ONE combined figure -----
+    if args.compare_arg:
+        if len(args.compare_arg) < 2:
+            raise ValueError("--compare_arg requires: <arg_name> <v1> [v2 ...]")
+        arg_name = str(args.compare_arg[0]).lstrip("-")
+        values = [str(v) for v in args.compare_arg[1:]]
+
+        def _cast(name: str, raw: str):
+            if name in {"encoder_distill"}:
+                return _parse_bool(raw)
+            if name in {"noise_std", "lam", "k_factor_db", "lr", "weight_decay"}:
+                return float(raw)
+            if name in {"subset_size", "batchsize", "epochs", "channel_sampling_size", "N_t", "N_r", "N_m"}:
+                return int(float(raw))
+            if name in {"combine_mode", "fading_type"}:
+                return str(raw)
+            raise ValueError(
+                f"Unsupported compare_arg '{name}'. Supported: combine_mode, fading_type, noise_std, "
+                "lam, k_factor_db, lr, weight_decay, subset_size, batchsize, epochs, channel_sampling_size, N_t, N_r, N_m, encoder_distill."
+            )
+
+        # Headless-safe backend when we only save (no show-at-end)
+        plot_enabled = (not args.no_plot_acc)
+        if plot_enabled and args.no_show_plot_end:
+            import matplotlib
+            matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        histories: list[tuple[str, dict]] = []
+        for raw in values:
+            cast_val = _cast(arg_name, raw)
+            cfg = argparse.Namespace(**vars(args))
+            setattr(cfg, arg_name, cast_val)
+            # Suffix saved model per compared value to avoid overwrites
+            cfg._save_suffix = f"_{_safe_token(arg_name)}={_safe_token(cast_val)}"
+            print(f"\n=== Training {arg_name}={cast_val} ===")
+            hist = _run_one(cfg)
+            histories.append((f"{arg_name}={cast_val}", hist))
+
+        if plot_enabled:
+            fig, (ax_acc, ax_loss) = plt.subplots(nrows=2, ncols=1, figsize=(8, 8), sharex=True)
+
+            def _has_fd(hist: dict) -> bool:
+                fd = hist.get("loss_fd", [])
+                try:
+                    return any(abs(float(x)) > 1e-12 for x in fd)
+                except Exception:
+                    return False
+
+            any_fd = any(_has_fd(h) for _, h in histories)
+            for label, hist in histories:
+                xs = hist["epoch"]
+                ax_acc.plot(xs, hist["acc"], label=label)
+                ax_loss.plot(xs, hist["loss_total"], label=f"{label} (L_total)")
+                # When distillation is enabled, include L_fd on the loss subplot.
+                if any_fd and _has_fd(hist):
+                    ax_loss.plot(xs, hist["loss_fd"], linestyle="--", label=f"{label} (L_fd)")
+            ax_acc.grid(True)
+            ax_acc.set_ylim(0.0, 100.0)
+            ax_acc.set_ylabel("acc (%)")
+            ax_acc.set_title("Training curves (comparison)")
+            ax_acc.legend(loc="best")
+
+            ax_loss.grid(True)
+            ax_loss.set_xlabel("epoch")
+            ax_loss.set_ylabel("loss")
+            ax_loss.legend(loc="best")
+            fig.tight_layout()
+
+            if args.plot_path != "":
+                os.makedirs(os.path.dirname(args.plot_path) or ".", exist_ok=True)
+                fig.savefig(args.plot_path)
+                print(f"[INFO] Saved plot to {args.plot_path}")
+
+            if not args.no_show_plot_end:
+                try:
+                    plt.show()
+                except Exception:
+                    pass
+
+        raise SystemExit(0)
+
+    # ----- Normal single-run path -----
+    history = _run_one(args)
+    # Plot (single run) handled by train_minn when enabled
+    if not args.no_plot_acc:
+        # Re-run plotting using train_minn's built-in plot for consistency
+        # (Best-effort: call train_minn once more with plotting enabled is too expensive; instead, do a simple plot here.)
+        if args.no_show_plot_end:
+            import matplotlib
+            matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        fig, (ax_acc, ax_loss) = plt.subplots(nrows=2, ncols=1, figsize=(8, 8), sharex=True)
+        xs = history["epoch"]
+        ax_acc.plot(xs, history["acc"], label="acc (%)")
+        ax_acc.grid(True)
+        ax_acc.set_ylim(0.0, 100.0)
+        ax_acc.set_ylabel("acc (%)")
+        ax_acc.set_title("Training curves")
+        ax_acc.legend(loc="best")
+
+        ax_loss.plot(xs, history["loss_total"], label="L_total")
+        # Include L_fd when encoder distillation is active (best-effort: detect non-zero).
+        try:
+            if any(abs(float(x)) > 1e-12 for x in history.get("loss_fd", [])):
+                ax_loss.plot(xs, history["loss_fd"], linestyle="--", label="L_fd")
+        except Exception:
+            pass
+        ax_loss.grid(True)
+        ax_loss.set_xlabel("epoch")
+        ax_loss.set_ylabel("loss")
+        ax_loss.legend(loc="best")
+        fig.tight_layout()
+        if args.plot_path != "":
+            os.makedirs(os.path.dirname(args.plot_path) or ".", exist_ok=True)
+            fig.savefig(args.plot_path)
+        if not args.no_show_plot_end:
+            try:
+                plt.show()
+            except Exception:
+                pass
     # Print model sizes
     # print_model_size(encoder, "Encoder")
     # print_model_size(decoder, "Decoder")
@@ -421,22 +672,7 @@ if __name__ == '__main__':
     # params = list(encoder.parameters()) + list(decoder.parameters()) + list(channel.simnet.parameters())
     #
     # (see below)
-    # Save final model (optional)
-    if args.save_path == "":
-        print("[INFO] Skipping model save because --save_path was set to an empty string.")
-    else:
-        save_path = args.save_path or f"MY_code/models_dict/{model_store_name}.pth"
-        # If user passed a directory-like save_path, save under that directory using the default model_store_name.
-        if save_path.endswith(("/", "\\")) or (os.path.isdir(save_path) and os.path.splitext(save_path)[1] == ""):
-            save_path = os.path.join(save_path, f"{model_store_name}.pth")
-        save_dir = os.path.dirname(save_path)
-        if save_dir:
-            os.makedirs(save_dir, exist_ok=True)
-        torch.save(
-            {'encoder': encoder.state_dict(), 'decoder': decoder.state_dict(), 'controller': controller.state_dict()},
-            save_path,
-        )
-        print(f"Model saved to {save_path}")
+    # Model saving is handled inside _run_one (per run), including compare mode.
     # import os
     # checkpoint_path = "minn_checkpoint.pth"
     # if os.path.exists(checkpoint_path):

@@ -39,7 +39,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    IDE_COMMAND = "train"
+    IDE_COMMAND = "test"
     # Example sweep:
     #   "--N_t": [10, 15]
     # Example multi-value:
@@ -52,24 +52,23 @@ if __name__ == "__main__":
         "--N_t": 10,  # or [10, 15]
         "--N_m": 9,
         "--N_r": 8,
-        "--combine_mode": ["direct", "metanet", "both"],
+        "--combine_mode": 'direct',
         "--noise_std": 1,
         "--fading_type": "ricean",
         #"--k_factor_db": 3.0,
         "--save_path": "MY_code/models_dict/",
         "--plot_path": "MY_code/plots/training_curves.png",
         #"--plot_live": True,
-        #"--encoder_distill": True,
-        "--teacher_path": "teacher/minn_model_teacher"
+        "--encoder_distill": [False, True],
+        "--teacher_path": "teacher/minn_model_teacher_encoder_distill=False"
     }
 
     IDE_TEST_ARGS: dict[str, object] = {
-        # "--compare_checkpoints": (
-        #     "teacher/minn_model_teacher_fading_type=rayleigh_meta.pth",
-        #     "teacher/minn_model_teacher_fading_type=ricean_direct.pth",
-        #     "teacher/minn_model_teacher_fading_type=rayleigh_direct.pth",
-        # ),
-        "--checkpoint": "teacher/minn_model_teacher_fading_type=rayleigh_meta.pth",
+        "--compare_checkpoints": (
+            "teacher/minn_model_teacher_encoder_distill=False.pth",
+            "students/minn_model_student_encoder_distill=True.pth",
+        ),
+        #"--checkpoint": "teacher/minn_model_teacher_fading_type=rayleigh_meta.pth",
         "--num_trials": 10,
         "--subset_size": 1000,
         "--batchsize": 100,
@@ -77,12 +76,11 @@ if __name__ == "__main__":
         "--N_t": 10,  # or [10, 15]
         "--N_r": 8,
         "--N_m": 9,
-        "--combine_mode": "both",
+        "--combine_mode": "direct",
         "--noise_std": 1,
-        "--lam": 0.125,
         "--fading_type": "ricean",
         "--k_factor_db": 3.0,
-        "--plot_path": "MY_code/plots/test_summary.png",
+        "--plot_path": "MY_code/plots/test_summary_1.png",
     }
 
     def _safe_token(s: str) -> str:
@@ -134,8 +132,16 @@ if __name__ == "__main__":
         return os.path.join("MY_code", "models_dict", p)
 
     def _role_subdir_for_train(arg_dict: dict[str, object]) -> str:
-        # Per user convention: teacher if encoder_distill is not True, students otherwise.
-        return "students" if bool(arg_dict.get("--encoder_distill")) else "teacher"
+        """
+        Per user convention:
+          - teacher when encoder distillation is disabled
+          - students when enabled
+          - compare when encoder_distill is provided as a list (compare mode)
+        """
+        v = arg_dict.get("--encoder_distill")
+        if isinstance(v, list):
+            return "compare"
+        return "students" if bool(v) else "teacher"
 
     DEFAULT_TEACHER_STORE_NAME = "teacher/minn_model_teacher"
     DEFAULT_STUDENT_STORE_NAME = "students/minn_model_student"
@@ -147,7 +153,11 @@ if __name__ == "__main__":
 
     def _model_store_name_for_save(arg_dict: dict[str, object]) -> str:
         # Save teacher model when not distilling; save student model when distilling.
-        return DEFAULT_STUDENT_STORE_NAME if bool(arg_dict.get("--encoder_distill")) else DEFAULT_TEACHER_STORE_NAME
+        v = arg_dict.get("--encoder_distill")
+        # If it's a list, we are in "compare" intent; default to student naming so users don't overwrite teacher by accident.
+        if isinstance(v, list):
+            return DEFAULT_STUDENT_STORE_NAME
+        return DEFAULT_STUDENT_STORE_NAME if bool(v) else DEFAULT_TEACHER_STORE_NAME
 
     def _resolve_train_save_path(
         save_path_value: str,
@@ -233,6 +243,29 @@ if __name__ == "__main__":
         checkpoint_is_under_models_dict: bool = False,
         collapse_sweep_to_compare_arg: bool = False,
     ) -> list[list[str]]:
+        def _effective_encoder_distill_for_run(
+            *,
+            sweep_key: str | None,
+            sweep_v: object | None,
+            compare_key: str | None,
+            compare_vals: list[object] | None,
+        ) -> bool:
+            """
+            Determine whether encoder distillation should be considered enabled for:
+              - teacher_path injection
+              - role-based plot/save path resolution
+            """
+            raw = arg_dict.get("--encoder_distill")
+            if isinstance(raw, list):
+                # Collapsed compare run: treat as enabled if ANY compared value is truthy.
+                if compare_key == "encoder_distill" and compare_vals is not None:
+                    return any(bool(x) for x in compare_vals)
+                # Sweep run: per-run decision.
+                if sweep_key == "--encoder_distill":
+                    return bool(sweep_v)
+                return any(bool(x) for x in raw)
+            return bool(raw)
+
         sweep_key: str | None = None
         sweep_vals: list[object] | None = None
         for k, v in arg_dict.items():
@@ -258,6 +291,13 @@ if __name__ == "__main__":
             sweep_vals = [None]
 
         for sweep_v in sweep_vals or [None]:
+            # If we're doing a true sweep (multiple runs), make a per-run view of the args dict
+            # so helper logic doesn't see the raw list value (e.g. bool([True, False]) == True).
+            arg_dict_run = arg_dict
+            if (compare_key is None) and (sweep_key is not None) and isinstance(arg_dict.get(sweep_key), list):
+                arg_dict_run = dict(arg_dict)
+                arg_dict_run[sweep_key] = sweep_v
+
             args: list[str] = []
             for k, v in arg_dict.items():
                 if v is None:
@@ -291,9 +331,14 @@ if __name__ == "__main__":
                 args += ["--compare_arg", compare_key, *[str(x) for x in compare_vals]]
 
             # Teacher-path is only relevant for feature distillation.
-            if bool(arg_dict.get("--encoder_distill")):
+            if _effective_encoder_distill_for_run(
+                sweep_key=sweep_key,
+                sweep_v=sweep_v,
+                compare_key=compare_key,
+                compare_vals=compare_vals,
+            ):
                 if "--teacher_path" not in arg_dict:
-                    args += ["--teacher_path", _default_teacher_path_for_fd(arg_dict)]
+                    args += ["--teacher_path", _default_teacher_path_for_fd(arg_dict_run)]
             else:
                 # Ensure we do not pass teacher_path when not distilling (treat as None).
                 # (If it was accidentally present in the dict, remove it from the args list.)
@@ -338,7 +383,10 @@ if __name__ == "__main__":
                     try:
                         i = args.index("--save_path")
                         base = args[i + 1]
-                        args[i + 1] = _resolve_train_save_path(base, arg_dict, sweep_key, sweep_v)
+                        # If we collapsed into --compare_arg, don't mutate save_path here; training.py
+                        # will save per compared value with its own suffixing.
+                        if compare_key is None:
+                            args[i + 1] = _resolve_train_save_path(base, arg_dict_run, sweep_key, sweep_v)
                     except Exception:
                         pass
                 # Auto-suffix plot_path to prevent overwrites when sweeping.
@@ -349,11 +397,14 @@ if __name__ == "__main__":
                         # If we collapsed into --compare_arg, suffix the plot ONCE with the compared key
                         # (avoid the previous behavior of suffixing with "<key>=None").
                         if compare_key is not None:
-                            resolved = _resolve_plain_plot_path(base, None, None, default_plot_filename)
+                            if plot_role_subdir:
+                                resolved = _resolve_train_plot_path(base, arg_dict, None, None)
+                            else:
+                                resolved = _resolve_plain_plot_path(base, None, None, default_plot_filename)
                             args[i + 1] = _suffix_path(resolved, f"_{compare_key}")
                         else:
                             if plot_role_subdir:
-                                args[i + 1] = _resolve_train_plot_path(base, arg_dict, sweep_key, sweep_v)
+                                args[i + 1] = _resolve_train_plot_path(base, arg_dict_run, sweep_key, sweep_v)
                             else:
                                 args[i + 1] = _resolve_plain_plot_path(base, sweep_key, sweep_v, default_plot_filename)
                     except Exception:
@@ -364,7 +415,7 @@ if __name__ == "__main__":
                     try:
                         i = args.index("--save_path")
                         base = args[i + 1]
-                        args[i + 1] = _resolve_train_save_path(base, arg_dict, None, None)
+                        args[i + 1] = _resolve_train_save_path(base, arg_dict_run, None, None)
                     except Exception:
                         pass
                 # No sweep: resolve plot_path (train: add role subdir; test: keep path, but support dir-like values).
@@ -373,7 +424,7 @@ if __name__ == "__main__":
                         i = args.index("--plot_path")
                         base = args[i + 1]
                         if plot_role_subdir:
-                            args[i + 1] = _resolve_train_plot_path(base, arg_dict, None, None)
+                            args[i + 1] = _resolve_train_plot_path(base, arg_dict_run, None, None)
                         else:
                             args[i + 1] = _resolve_plain_plot_path(base, None, None, default_plot_filename)
                     except Exception:
@@ -394,7 +445,7 @@ if __name__ == "__main__":
             plot_role_subdir=(IDE_COMMAND == "train"),
             default_plot_filename=("training_curves.png" if IDE_COMMAND == "train" else "test_summary.png"),
             checkpoint_is_under_models_dict=(IDE_COMMAND == "test"),
-            collapse_sweep_to_compare_arg=(IDE_COMMAND == "test"),
+            collapse_sweep_to_compare_arg=(IDE_COMMAND in {"test", "train"}),
         ):
             rc = main([IDE_COMMAND, *run_args])
             if rc != 0:
