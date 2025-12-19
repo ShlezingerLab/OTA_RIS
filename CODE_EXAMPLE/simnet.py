@@ -454,10 +454,23 @@ class SimNet(nn.Module):
         self.complex_dtype         = complex_dtype
         self.layer_distances       = repeat_num_to_list_if_not_list_already(layer_dist, len(layers)-1)
         self.num_layers            = len(layers)
-        (self.ris_layers,
-         self.transmission_layers) = self._construct_layers(layers, self.layer_distances, wavelength, elem_area,
-                                                            elem_dist, layers_orientation_plane,
-                                                            first_layer_central_coords, complex_dtype)
+        # IMPORTANT:
+        # `ris_layers` and `transmission_layers` must be registered as submodules so that
+        # `model.to(device)` / `model.cuda()` correctly moves all parameters & buffers.
+        # Plain Python lists will NOT be traversed by PyTorch, which leads to CPU/CUDA
+        # device mismatches (e.g., `phi_antenna` on CPU while `x` is on CUDA).
+        ris_layers, transmission_layers = self._construct_layers(
+            layers,
+            self.layer_distances,
+            wavelength,
+            elem_area,
+            elem_dist,
+            layers_orientation_plane,
+            first_layer_central_coords,
+            complex_dtype,
+        )
+        self.ris_layers = nn.ModuleList(ris_layers)
+        self.transmission_layers = nn.ModuleList(transmission_layers)
 
 
     def _construct_layers(self,
@@ -654,5 +667,3 @@ if __name__ == '__main__':
 
     test_layers()
     test_network()
-
-

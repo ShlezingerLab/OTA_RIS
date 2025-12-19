@@ -610,6 +610,71 @@ python evaluate.py --model minn_model_article.pth --power-sweep
 4. **Complex Operations**: Channel operations use complex arithmetic
 5. **Channel Pool**: Fixed pool ensures reproducibility across runs
 
+## Device Placement (CPU vs CUDA) and Common Pitfalls
+
+This codebase is written to run on either CPU or GPU. In practice, you typically want **CUDA** whenever it is available (for speed), but PyTorch will only use CUDA if:
+
+- your tensors are on a CUDA device, and
+- your modules' parameters/buffers are on the same CUDA device.
+
+### The “found at least two devices, cuda:0 and cpu” error
+
+If you see an error like:
+
+> `RuntimeError: Expected all tensors to be on the same device, but found at least two devices, cuda:0 and cpu!`
+
+it means at least one operation mixed CPU and CUDA tensors (e.g., `phi_antenna * x` where `phi_antenna` is on CPU but `x` is on CUDA).
+
+#### Root cause we hit in `CODE_EXAMPLE/simnet.py`
+
+`SimNet` originally stored its internal layer modules (`ris_layers` and `transmission_layers`) in **plain Python lists**. PyTorch does **not** register modules inside a plain list, so calling:
+
+```python
+simnet = build_simnet(...).to(device)
+```
+
+would move `SimNet` itself, but **would not move** the parameters inside the list members. That led to a device mismatch when computing:
+
+- `x` came from upstream computation already on CUDA, but
+- `phi_antenna = self.ris_layers[0]()` was produced by a `Metasurface` whose `theta` parameter stayed on CPU.
+
+#### Fix
+
+`SimNet` now wraps those lists using `nn.ModuleList`, so `.to("cuda")` / `.cuda()` correctly moves:
+
+- `Metasurface.theta` parameters (trainable), and
+- `Surface2SurfaceTransmission.W` buffers (registered via `register_buffer`).
+
+### Practical checklist to “prefer CUDA”
+
+- **Pick the device once**:
+
+```python
+device = "cuda" if torch.cuda.is_available() else "cpu"
+```
+
+- **Move every model to that device**:
+  - `encoder.to(device)`
+  - `decoder.to(device)`
+  - `controller.to(device)` (if used)
+  - `physical_sim.to(device)` and/or `simnet.to(device)`
+
+- **Create tensors on the right device**:
+  - Prefer `torch.zeros(..., device=device)` / `torch.randn(..., device=device)` rather than creating on CPU then moving.
+  - Or use existing tensors: `new = old.new_zeros(...)` to inherit device + dtype.
+
+- **Sanity-check devices when debugging**:
+
+```python
+print("s_ms:", s_ms.device)
+print("theta0:", physical_sim.simnet.ris_layers[0].theta.device)
+print("W0:", physical_sim.simnet.transmission_layers[0].W.device)
+```
+
+### SLURM note (important)
+
+On a login node, `torch.cuda.is_available()` is often **False**, even if the cluster has GPUs. You only get CUDA inside a GPU allocation/job. If you see `cuda_available: False` in a quick local test, that’s expected unless you’re on a GPU node.
+
 ## Additional Features
 
 ### Channel-Aware Mode
