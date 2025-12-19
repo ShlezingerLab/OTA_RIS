@@ -39,7 +39,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    IDE_COMMAND = "test"
+    IDE_COMMAND = "train"
     # Example sweep:
     #   "--N_t": [10, 15]
     # Example multi-value:
@@ -48,18 +48,18 @@ if __name__ == "__main__":
         "--subset_size": 1000,
         "--batchsize": 100,
         "--channel_sampling_size": 100,
-        "--epochs": 50,
+        "--epochs": 20,
         "--N_t": 10,  # or [10, 15]
         "--N_m": 9,
         "--N_r": 8,
-        "--combine_mode": 'direct',
+        "--combine_mode": 'direct',  #TODO : both doesnt converge well
         "--noise_std": 1,
         "--fading_type": "ricean",
-        #"--k_factor_db": 3.0,
+        #"--k_factor_db": 3.0,DD
         "--save_path": "MY_code/models_dict/",
         "--plot_path": "MY_code/plots/training_curves.png",
         #"--plot_live": True,
-        "--encoder_distill": [False, True],
+        #"--encoder_distill": [False, True],
         "--teacher_path": "teacher/minn_model_teacher_encoder_distill=False"
     }
 
