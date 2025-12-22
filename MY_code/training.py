@@ -7,12 +7,20 @@ from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 from torch.utils.data import Subset, DataLoader
 from flow import *
-from channel_tensors import generate_channel_tensors
+from channel_tensors import generate_channel_tensors_by_type
 import numpy as np  # note
 import argparse
 import math
 import os
 import sys
+
+
+def _dbm_to_watt(p_dbm: float) -> float:
+    """
+    Convert dBm to Watts.
+    0 dBm = 1 mW = 1e-3 W.
+    """
+    return float(10.0 ** ((float(p_dbm) - 30.0) / 10.0))
 
 
 def _parse_bool(raw) -> bool:
@@ -86,7 +94,8 @@ encoder_distiller: EncoderFeatureDistiller | None = None,
 plot_acc: bool = False,
 plot_path: str | None = None,
 plot_live: bool = False,
-show_plot_end: bool = True):
+show_plot_end: bool = True,
+tx_power_dbm: float = 30.0):
     """
     MINN training loop:
     Encoder --> Channel (SimRISChannel/RayleighChannel) --> Decoder
@@ -124,6 +133,7 @@ show_plot_end: bool = True):
     criterion = nn.CrossEntropyLoss()
     num_channels = H_d_all.size(0)
     channel_cursor = 0
+    tx_amp_scale = _dbm_to_watt(tx_power_dbm)  # CODE_EXAMPLE-style scaling (they multiply by P in Watt)
 
     epoch_accs: list[float] = []
     epoch_total_losses: list[float] = []
@@ -165,6 +175,10 @@ show_plot_end: bool = True):
             # (optional debugging hooks)
             # s.retain_grad()
             s_c = s_for_ce.to(torch.complex64) if not torch.is_complex(s_for_ce) else s_for_ce
+            # Scale transmit signal power (CODE_EXAMPLE-style) to make geometric pathloss + noise comparable.
+            # Note: this is a scalar amplitude multiplier applied before the channel.
+            if tx_amp_scale != 1.0:
+                s_c = s_c * float(tx_amp_scale)
             batch_size = s.size(0)
             idxs = (torch.arange(batch_size, device=device) + channel_cursor) % num_channels
             channel_cursor = (channel_cursor + batch_size) % num_channels
@@ -172,9 +186,16 @@ show_plot_end: bool = True):
             H_1 = H_1_all[idxs].to(device)   # (batch, N_ms, N_t)
             H_2 = H_2_all[idxs].to(device)   # (batch, N_r, N_ms)
 
+            # Path-loss scaling (if provided by `channel` config).
+            # Keep `y` and the channel tensors passed to the decoder consistent.
+            pl_d = float(getattr(channel, "path_loss_direct", 1.0))
+            pl_ms = float(getattr(channel, "path_loss_ms", 1.0))
+            H_D_eff = H_D * pl_d
+            H_2_eff = H_2 * pl_ms
+
             if combine_mode in ["direct", "both"]:
                 # (batch, N_r, N_t) @ (batch, N_t, 1) -> (batch, N_r, 1) -> (batch, N_r)
-                y_direct = torch.matmul(H_D, s_c.transpose(1, 2)).squeeze(-1)
+                y_direct = torch.matmul(H_D_eff, s_c.transpose(1, 2)).squeeze(-1)
                 if combine_mode == "direct":
                     y = y_direct
                 else:
@@ -182,9 +203,12 @@ show_plot_end: bool = True):
             if combine_mode in ["metanet", "both"]:
                 # (batch, N_ms, N_t) @ (batch, N_t, 1) -> (batch, N_ms, 1) -> (batch, N_ms)
                 s_ms = torch.matmul(H_1, s_c.transpose(1, 2)).squeeze(-1)
-                theta_list = controller(H_D, H_1)
+                if getattr(controller, "ctrl_full_csi", True):
+                    theta_list = controller(H_1=H_1, H_D=H_D_eff, H_2=H_2_eff)
+                else:
+                    theta_list = controller(H_1=H_1)
                 y_ms = physical_sim(s_ms, theta_list)  # (batch, N_ms_out)
-                y_metanet = torch.matmul(H_2, y_ms.unsqueeze(-1)).squeeze(-1)  # (batch, N_r)
+                y_metanet = torch.matmul(H_2_eff, y_ms.unsqueeze(-1)).squeeze(-1)  # (batch, N_r)
                 if combine_mode == "metanet":
                     y = y_metanet
                 else:
@@ -198,7 +222,13 @@ show_plot_end: bool = True):
             noise = torch.complex(nr, ni)
             y = y + noise
             # y.retain_grad()
-            logits = decoder(y, H_D=H_D, H_2=H_2)  # Pass H_D and H_2 separately
+            if combine_mode == "direct":
+                logits = decoder(y, H_D=H_D_eff)
+            elif combine_mode == "metanet":
+                logits = decoder(y, H_2=H_2_eff)
+            else:
+                logits = decoder(y,H_D=H_D_eff, H_2=H_2_eff)
+
             loss_ce = criterion(logits, labels)
             # If distillation is enabled, CE typically does NOT backprop to the encoder because we detach `s_for_ce`
             # (and in your script you also freeze the decoder). Keep CE for logging/monitoring unless you want
@@ -305,12 +335,57 @@ if __name__ == '__main__':
     # Channel configuration
     parser.add_argument('--combine_mode', type=str, default='both', choices=['direct', 'metanet', 'both'],
                         help='Channel combination mode: direct, simnet, or both')
-    parser.add_argument('--noise_std', type=float, default=1, help='Noise standard deviation')
+    parser.add_argument(
+        '--cotrl_CSI',
+        nargs='?',
+        const=True,
+        default=True,
+        type=_parse_bool,
+        help=(
+            "Controller CSI knowledge. "
+            "If True: controller observes full CSI (H_D, H_1, H_2) similar to the reference implementation. "
+            "If False: controller observes only H_1 (TX->MS)."
+        ),
+    )
+    # NOTE: For geometric channels at 28 GHz with distance-based pathloss, magnitudes are tiny (often ~1e-5),
+    # so noise_std=1 would imply effectively zero SNR and nothing will learn. We therefore default noise_std
+    # based on channel_type unless the user explicitly overrides it.
+    parser.add_argument('--noise_std', type=float, default=None,
+                        help='Noise standard deviation. If omitted, choose a sensible default based on --channel_type.')
     parser.add_argument('--lam', type=float, default=0.125, help='Lambda parameter for SimNet')
+    parser.add_argument(
+        "--channel_type",
+        type=str,
+        default="geometric_ricean",
+        choices=["synthetic_rayleigh", "synthetic_ricean", "geometric_rayleigh", "geometric_ricean"],
+        help=(
+            "Channel type selector (single flag). "
+            "synthetic_* uses i.i.d. channels; geometric_* uses CODE_EXAMPLE-like geometry "
+            "(positions, distance-based pathloss, steering-vector LoS for ricean)."
+        ),
+    )
     parser.add_argument('--fading_type', type=str, default='ricean', choices=['rayleigh', 'ricean'],
-                        help='Channel fading type: rayleigh (pure NLoS) or ricean (LoS + NLoS)')
+                        help='[LEGACY] Only used by old code paths. Prefer --channel_type.')
     parser.add_argument('--k_factor_db', type=float, default=3.0,
                         help='Ricean K-factor in dB (for direct TX-RX link)')
+    parser.add_argument(
+        "--tx_power_dbm",
+        type=float,
+        default=30.0,
+        help="Transmit power in dBm (CODE_EXAMPLE-like). Used to scale s before the channel. 30 dBm = 1 W.",
+    )
+    parser.add_argument(
+        "--geo_pathloss_exp",
+        type=float,
+        default=2.0,
+        help="Geometric channel pathloss exponent (only affects geometric_* channel_type). CODE_EXAMPLE default: 2.0",
+    )
+    parser.add_argument(
+        "--geo_pathloss_gain_db",
+        type=float,
+        default=0.0,
+        help="Extra gain added to geometric pathloss (dB). Positive reduces attenuation; try +40..+80 if training is too hard.",
+    )
     # Training configuration
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=0, help='Weight decay for optimizer')
@@ -367,6 +442,14 @@ if __name__ == '__main__':
         ),
     )
     args = parser.parse_args()
+    if args.noise_std is None:
+        # CODE_EXAMPLE uses noise_sigma_sq = -90 dBm => noise power ~1e-12 W => noise_std ~1e-6
+        # Use that as a sane default for geometric channels; keep legacy default=1 for synthetic.
+        if str(getattr(args, "channel_type", "")).lower().startswith("geometric_"):
+            args.noise_std = 1e-6
+        else:
+            args.noise_std = 1.0
+        print(f"[INFO] --noise_std not provided; using noise_std={args.noise_std:g} for channel_type={args.channel_type}")
 
     DEFAULT_TEACHER_STORE_NAME = "teacher/minn_model_teacher"
     DEFAULT_STUDENT_STORE_NAME = "students/minn_model_student"
@@ -427,23 +510,25 @@ if __name__ == '__main__':
         train_loader = DataLoader(train_subset, batch_size=int(cfg.batchsize), shuffle=True)
 
         # ===== Channels =====
-        H_d_all, H_1_all, H_2_all = generate_channel_tensors(
+        H_d_all, H_1_all, H_2_all = generate_channel_tensors_by_type(
+            channel_type=str(getattr(cfg, "channel_type", "geometric_ricean")),
             N_t=int(cfg.N_t),
             N_r=int(cfg.N_r),
             N_m=int(cfg.N_m),
             num_channels=int(cfg.channel_sampling_size),
             device=device,
-            fading_type=str(cfg.fading_type),
-            k_factor_d_db=float(cfg.k_factor_db),
+            k_factor_d_db=float(getattr(cfg, "k_factor_db", 3.0)),
             k_factor_h1_db=13.0,
             k_factor_h2_db=7.0,
+            pathloss_exp=float(getattr(cfg, "geo_pathloss_exp", 2.0)),
+            geo_pathloss_gain_db=float(getattr(cfg, "geo_pathloss_gain_db", 0.0)),
         )
 
         channel_params = chennel_params(
             noise_std=float(cfg.noise_std),
             combine_mode=str(cfg.combine_mode),
-            path_loss_direct_db=3.0,
-            path_loss_ms_db=13.0,
+            path_loss_direct_db=0,#3.0
+            path_loss_ms_db=0,#13.0
         )
 
         # ===== DNN stack =====
@@ -452,7 +537,13 @@ if __name__ == '__main__':
             p.requires_grad = False
         layer_sizes = [layer.num_elems for layer in simnet.ris_layers]
         physical_sim = Physical_SIM(simnet).to(device)
-        controller = Controller_DNN(n_t=int(cfg.N_t), n_r=int(cfg.N_r), n_ms=int(cfg.N_m), layer_sizes=layer_sizes).to(device)
+        controller = Controller_DNN(
+            n_t=int(cfg.N_t),
+            n_r=int(cfg.N_r),
+            n_ms=int(cfg.N_m),
+            layer_sizes=layer_sizes,
+            ctrl_full_csi=bool(cfg.cotrl_CSI),
+        ).to(device)
         decoder = Decoder(n_rx=int(cfg.N_r), n_tx=int(cfg.N_t), n_m=int(cfg.N_m)).to(device)
         encoder = Encoder(int(cfg.N_t)).to(device)
 
@@ -490,6 +581,7 @@ if __name__ == '__main__':
             H_1_all=H_1_all,
             H_2_all=H_2_all,
             encoder_distiller=encoder_distiller,
+            tx_power_dbm=float(getattr(cfg, "tx_power_dbm", 30.0)),
             # For compare runs, we plot once at the end; disable internal plotting.
             plot_acc=False,
             plot_path=None,
@@ -521,6 +613,14 @@ if __name__ == '__main__':
         def _cast(name: str, raw: str):
             if name in {"encoder_distill"}:
                 return _parse_bool(raw)
+            if name in {"cotrl_CSI"}:
+                return _parse_bool(raw)
+            if name in {"channel_type"}:
+                return str(raw)
+            if name in {"geo_pathloss_exp", "geo_pathloss_gain_db"}:
+                return float(raw)
+            if name in {"tx_power_dbm"}:
+                return float(raw)
             if name in {"noise_std", "lam", "k_factor_db", "lr", "weight_decay"}:
                 return float(raw)
             if name in {"subset_size", "batchsize", "epochs", "channel_sampling_size", "N_t", "N_r", "N_m"}:
@@ -529,7 +629,8 @@ if __name__ == '__main__':
                 return str(raw)
             raise ValueError(
                 f"Unsupported compare_arg '{name}'. Supported: combine_mode, fading_type, noise_std, "
-                "lam, k_factor_db, lr, weight_decay, subset_size, batchsize, epochs, channel_sampling_size, N_t, N_r, N_m, encoder_distill."
+                "lam, k_factor_db, lr, weight_decay, subset_size, batchsize, epochs, channel_sampling_size, N_t, N_r, N_m, "
+                "encoder_distill, cotrl_CSI, channel_type, geo_pathloss_exp, geo_pathloss_gain_db, tx_power_dbm."
             )
 
         # Headless-safe backend when we only save (no show-at-end)

@@ -45,22 +45,37 @@ if __name__ == "__main__":
     # Example multi-value:
     #   "--compare_combine_modes": ("direct", "metanet", "both")
     IDE_TRAIN_ARGS: dict[str, object] = {
-        "--subset_size": 10000,
-        "--batchsize": 1000,
-        "--channel_sampling_size": 1000,
-        "--epochs": 10,
-        "--N_t": 120,  # or [10, 15]
-        "--N_m": 100,
-        "--N_r": 90,
-        "--combine_mode": 'direct',  #TODO : both doesnt converge well
-        "--noise_std": 0.5,
-        "--fading_type": "rayleigh",
-        #"--k_factor_db": 3.0,DD
-        "--save_path": "MY_code/models_dict/",
-        "--plot_path": "MY_code/plots/training_curves.png",
+        "--subset_size": 1000,
+        "--batchsize": 100,
+        "--channel_sampling_size": 200,
+        "--epochs": 50,
+        "--N_t": 10,  # or [10, 15]
+        "--N_m": 36, #TODO: less than 36 is not working well
+        "--N_r": 8,
+        "--combine_mode": ["direct","metanet","both"],
+        "--cotrl_CSI": False,
+        "--channel_type": "synthetic_ricean",
+        # Defaults (when not explicitly provided on the CLI):
+        # - noise_std: None => auto
+        #     - geometric_* => 1e-6 (matches CODE_EXAMPLE: noise_sigma_sq = -90 dBm => noise_std ~= 1e-6)
+        #     - synthetic_* => 1.0 (legacy behavior)
+        # - geo_pathloss_exp: 2.0
+        # - geo_pathloss_gain_db: 0.0  (set +40..+80 to mitigate harsh 28 GHz pathloss for easier training)
+        # - k_factor_db: 3.0 (direct link; H1/H2 use 13/7 inside training.py)
+        "--noise_std":  1,#1e-6,
+        #TODO: understand this section, and why geo_pathloss_gain_db so important
+        # Transmit power (CODE_EXAMPLE-style): scales the transmitted vector `s` before the channel.
+        # 30 dBm = 1 W.
+        #"--tx_power_dbm": 30.0,
+        #"--geo_pathloss_exp": 2.0,
+        #"--geo_pathloss_gain_db": 45, #should be 0!
+        #"--k_factor_db": 3.0, #path loss in non-geometric is set to 0 now (k factor like in their example)
+
+        #"--save_path": "MY_code/models_dict/",
+        #"--plot_path": "MY_code/plots/geo_ricean_metanet_learning.png",
         #"--plot_live": True,
         #"--encoder_distill": [False, True],
-        "--teacher_path": "teacher/minn_model_teacher_encoder_distill=False"
+        #"--teacher_path": "teacher/minn_model_teacher_encoder_distill=False"
     }
 
     IDE_TEST_ARGS: dict[str, object] = {
@@ -77,8 +92,9 @@ if __name__ == "__main__":
         "--N_r": 8,
         "--N_m": 9,
         "--combine_mode": "direct",
+        "--cotrl_CSI": True,
         "--noise_std": 1,
-        "--fading_type": "ricean",
+        "--channel_type": "geometric_ricean",
         "--k_factor_db": 3.0,
         "--plot_path": "MY_code/plots/test_summary_1.png",
     }

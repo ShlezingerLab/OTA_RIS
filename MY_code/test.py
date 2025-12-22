@@ -23,7 +23,11 @@ from flow import (  # noqa: E402
     build_simnet,
     chennel_params,
 )
-from channel_tensors import generate_channel_tensors  # noqa: E402
+from channel_tensors import generate_channel_tensors_by_type  # noqa: E402
+
+
+def _dbm_to_watt(p_dbm: float) -> float:
+    return float(10.0 ** ((float(p_dbm) - 30.0) / 10.0))
 
 
 def resolve_checkpoint_path(checkpoint_path: str) -> str:
@@ -124,6 +128,7 @@ def build_models(
     N_m: int,
     lam: float,
     device: str,
+    cotrl_CSI: bool,
 ) -> tuple[Encoder, Decoder, Controller_DNN, Physical_SIM]:
     """
     Rebuild encoder/decoder/controller/SIM stack exactly as in MNIST/training.py.
@@ -142,6 +147,7 @@ def build_models(
         n_r=N_r,
         n_ms=N_m,
         layer_sizes=layer_sizes,
+        ctrl_full_csi=bool(cotrl_CSI),
     ).to(device)
     encoder = Encoder(N_t).to(device)
     decoder = Decoder(n_rx=N_r, n_tx=N_t, n_m=N_m).to(device)
@@ -209,6 +215,7 @@ def evaluate_one_trial(
     H_2_all: torch.Tensor,
     combine_mode: str,
     device: str,
+    tx_power_dbm: float,
 ) -> float:
     """
     Run a single evaluation trial:
@@ -241,6 +248,9 @@ def evaluate_one_trial(
             # ----- Encoder -----
             s = encoder(images)  # (batch, 1, N_t) complex
             s_c = s.to(torch.complex64) if not torch.is_complex(s) else s
+            tx_amp_scale = _dbm_to_watt(float(tx_power_dbm))
+            if tx_amp_scale != 1.0:
+                s_c = s_c * float(tx_amp_scale)
             batch_size_curr = s.size(0)
 
             # Cyclic indices over the precomputed channels
@@ -252,9 +262,15 @@ def evaluate_one_trial(
             H_1 = H_1_all[idxs].to(device)  # (batch, N_ms, N_t)
             H_2 = H_2_all[idxs].to(device)  # (batch, N_r, N_ms)
 
+            # Path-loss scaling consistent with training.py
+            pl_d = float(getattr(channel_cfg, "path_loss_direct", 1.0))
+            pl_ms = float(getattr(channel_cfg, "path_loss_ms", 1.0))
+            H_D_eff = H_D * pl_d
+            H_2_eff = H_2 * pl_ms
+
             # ----- Channel forward (direct path) -----
             if combine_mode in ["direct", "both"]:
-                y_direct = torch.matmul(H_D, s_c.transpose(1, 2)).transpose(1, 2).squeeze()
+                y_direct = torch.matmul(H_D_eff, s_c.transpose(1, 2)).transpose(1, 2).squeeze()
             else:
                 y_direct = None
 
@@ -263,11 +279,14 @@ def evaluate_one_trial(
                 # Signal at metasurface
                 s_ms = torch.matmul(H_1, s_c.transpose(1, 2)).transpose(1, 2).squeeze()  # (batch, N_ms)
                 # Controller: CSI -> per-layer phases
-                theta_list = controller(H_D, H_1)
+                if getattr(controller, "ctrl_full_csi", True):
+                    theta_list = controller(H_1=H_1, H_D=H_D_eff, H_2=H_2_eff)
+                else:
+                    theta_list = controller(H_1=H_1)
                 # Physical SIM: field + phases -> output field
                 y_ms = physical_sim(s_ms, theta_list)  # (batch, N_ms_out)
                 # Propagate to RX via H_2
-                y_metanet = torch.matmul(H_2, y_ms.unsqueeze(-1)).squeeze(-1)  # (batch, N_r)
+                y_metanet = torch.matmul(H_2_eff, y_ms.unsqueeze(-1)).squeeze(-1)  # (batch, N_r)
             else:
                 y_metanet = None
 
@@ -291,7 +310,7 @@ def evaluate_one_trial(
             y_noisy = y + noise
 
             # ----- Decoder -----
-            logits = decoder(y_noisy, H_D=H_D, H_2=H_2)
+            logits = decoder(y_noisy, H_D=H_D_eff, H_2=H_2_eff)
             probs = torch.softmax(logits, dim=1)
             _, predicted = torch.max(probs.data, 1)
 
@@ -338,15 +357,46 @@ def main(argv=None):
     parser.add_argument("--combine_mode", type=str, default="both",
                         choices=["direct", "metanet", "both"],
                         help="Channel combination mode: direct, metanet (SIM only), or both.")
-    parser.add_argument("--noise_std", type=float, default=1e-6,
-                        help="Noise standard deviation (fixed across all trials).")
+    parser.add_argument(
+        "--cotrl_CSI",
+        nargs="?",
+        const=True,
+        default=True,
+        type=lambda x: str(x).lower() in {"1", "true", "t", "yes", "y", "on"},
+        help=(
+            "Controller CSI knowledge. "
+            "If True: controller observes full CSI (H_D, H_1, H_2). "
+            "If False: controller observes only H_1."
+        ),
+    )
+    # For geometric channels at 28 GHz with distance-based pathloss, magnitudes are tiny; default noise_std
+    # must be tiny as well, otherwise SNR collapses and nothing is learnable.
+    parser.add_argument("--noise_std", type=float, default=None,
+                        help="Noise standard deviation (fixed across all trials). If omitted, choose based on --channel_type.")
     parser.add_argument("--lam", type=float, default=0.125,
                         help="Wavelength parameter for SIM (lambda).")
+    parser.add_argument(
+        "--channel_type",
+        type=str,
+        default="geometric_ricean",
+        choices=["synthetic_rayleigh", "synthetic_ricean", "geometric_rayleigh", "geometric_ricean"],
+        help=(
+            "Channel type selector (single flag). "
+            "synthetic_* uses i.i.d. channels; geometric_* uses CODE_EXAMPLE-like geometry "
+            "(positions, distance-based pathloss, steering-vector LoS for ricean)."
+        ),
+    )
     parser.add_argument("--fading_type", type=str, default="ricean",
                         choices=["rayleigh", "ricean"],
-                        help="Fading type used to generate channels.")
+                        help="[LEGACY] Only used by old code paths. Prefer --channel_type.")
     parser.add_argument("--k_factor_db", type=float, default=3.0,
                         help="Ricean K-factor in dB for direct TX-RX link.")
+    parser.add_argument("--tx_power_dbm", type=float, default=30.0,
+                        help="Transmit power in dBm. Used to scale s before the channel. 30 dBm = 1 W.")
+    parser.add_argument("--geo_pathloss_exp", type=float, default=2.0,
+                        help="Geometric channel pathloss exponent (only affects geometric_* channel_type).")
+    parser.add_argument("--geo_pathloss_gain_db", type=float, default=0.0,
+                        help="Extra gain added to geometric pathloss (dB). Positive reduces attenuation.")
     parser.add_argument("--channel_sampling_size", type=int, default=100,
                         help="Number of precomputed channel triples (H_d, H_1, H_2).")
 
@@ -398,6 +448,12 @@ def main(argv=None):
     )
 
     args = parser.parse_args(argv)
+    if args.noise_std is None:
+        if str(getattr(args, "channel_type", "")).lower().startswith("geometric_"):
+            args.noise_std = 1e-6
+        else:
+            args.noise_std = 1.0
+        print(f"[INFO] --noise_std not provided; using noise_std={args.noise_std:g} for channel_type={args.channel_type}")
 
     # Device selection
     if args.device is None:
@@ -444,16 +500,18 @@ def main(argv=None):
         f"(H_d, H_1, H_2) with fading_type='{args.fading_type}', "
         f"K_d={args.k_factor_db} dB."
     )
-    H_d_all, H_1_all, H_2_all = generate_channel_tensors(
+    H_d_all, H_1_all, H_2_all = generate_channel_tensors_by_type(
+        channel_type=str(getattr(args, "channel_type", "geometric_ricean")),
         N_t=args.N_t,
         N_r=args.N_r,
         N_m=args.N_m,
         num_channels=args.channel_sampling_size,
         device=device,
-        fading_type=args.fading_type,
         k_factor_d_db=args.k_factor_db,
         k_factor_h1_db=13.0,
         k_factor_h2_db=7.0,
+        pathloss_exp=float(getattr(args, "geo_pathloss_exp", 2.0)),
+        geo_pathloss_gain_db=float(getattr(args, "geo_pathloss_gain_db", 0.0)),
     )
 
     def run_eval_one_config(
@@ -488,6 +546,7 @@ def main(argv=None):
                 H_2_all=H_2_all,
                 combine_mode=combine_mode,
                 device=device,
+                tx_power_dbm=float(getattr(args, "tx_power_dbm", 30.0)),
             )
             accuracies.append(acc_t)
             print(f"[INFO] Trial {t + 1}/{args.num_trials}: accuracy = {acc_t * 100:.2f}%")
@@ -520,6 +579,14 @@ def main(argv=None):
         values = [str(v) for v in compare_arg[1:]]
 
         def _cast_value(name: str, raw: str):
+            if name in {"cotrl_CSI"}:
+                return str(raw).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+            if name in {"channel_type"}:
+                return str(raw)
+            if name in {"geo_pathloss_exp", "geo_pathloss_gain_db"}:
+                return float(raw)
+            if name in {"tx_power_dbm"}:
+                return float(raw)
             if name in {"noise_std", "lam", "k_factor_db"}:
                 return float(raw)
             if name in {"subset_size", "num_trials", "batchsize", "N_t", "N_r", "N_m", "channel_sampling_size"}:
@@ -531,7 +598,8 @@ def main(argv=None):
             raise ValueError(
                 f"Unsupported --compare_arg '{name}'. "
                 "Supported: noise_std, lam, k_factor_db, subset_size, num_trials, batchsize, "
-                "N_t, N_r, N_m, channel_sampling_size, combine_mode, fading_type, device, checkpoint."
+                "N_t, N_r, N_m, channel_sampling_size, combine_mode, fading_type, device, checkpoint, cotrl_CSI, channel_type, "
+                "geo_pathloss_exp, geo_pathloss_gain_db, tx_power_dbm."
             )
 
         def _label(name: str, cast_val):
@@ -562,16 +630,18 @@ def main(argv=None):
                 f"(H_d, H_1, H_2) with fading_type='{cfg.fading_type}', "
                 f"K_d={cfg.k_factor_db} dB."
             )
-            H_d_all_i, H_1_all_i, H_2_all_i = generate_channel_tensors(
+            H_d_all_i, H_1_all_i, H_2_all_i = generate_channel_tensors_by_type(
+                channel_type=str(getattr(cfg, "channel_type", "geometric_ricean")),
                 N_t=int(cfg.N_t),
                 N_r=int(cfg.N_r),
                 N_m=int(cfg.N_m),
                 num_channels=int(cfg.channel_sampling_size),
                 device=device,
-                fading_type=str(cfg.fading_type),
                 k_factor_d_db=float(cfg.k_factor_db),
                 k_factor_h1_db=13.0,
                 k_factor_h2_db=7.0,
+                pathloss_exp=float(getattr(cfg, "geo_pathloss_exp", 2.0)),
+                geo_pathloss_gain_db=float(getattr(cfg, "geo_pathloss_gain_db", 0.0)),
             )
 
             encoder_i, decoder_i, controller_i, physical_sim_i = build_models(
@@ -580,6 +650,7 @@ def main(argv=None):
                 N_m=int(cfg.N_m),
                 lam=float(cfg.lam),
                 device=device,
+                cotrl_CSI=bool(getattr(cfg, "cotrl_CSI", True)),
             )
             maybe_load_checkpoint(
                 encoder=encoder_i,
@@ -606,6 +677,7 @@ def main(argv=None):
                     H_2_all=H_2_all_i,
                     combine_mode=str(cfg.combine_mode),
                     device=device,
+                    tx_power_dbm=float(getattr(cfg, "tx_power_dbm", 30.0)),
                 )
                 accuracies.append(acc_t)
                 print(f"[INFO] Trial {t + 1}/{int(cfg.num_trials)}: accuracy = {acc_t * 100:.2f}%")
@@ -629,6 +701,7 @@ def main(argv=None):
                 N_m=args.N_m,
                 lam=args.lam,
                 device=device,
+                cotrl_CSI=bool(getattr(args, "cotrl_CSI", True)),
             )
             maybe_load_checkpoint(
                 encoder=encoder_i,
@@ -657,6 +730,7 @@ def main(argv=None):
             N_m=args.N_m,
             lam=args.lam,
             device=device,
+            cotrl_CSI=bool(getattr(args, "cotrl_CSI", True)),
         )
         maybe_load_checkpoint(
             encoder=encoder,
