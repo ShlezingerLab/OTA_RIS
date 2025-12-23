@@ -45,16 +45,24 @@ if __name__ == "__main__":
     # Example multi-value:
     #   "--compare_combine_modes": ("direct", "metanet", "both")
     IDE_TRAIN_ARGS: dict[str, object] = {
-        "--subset_size": 1000,
-        "--batchsize": 100,
-        "--channel_sampling_size": 200,
-        "--epochs": 50,
-        "--N_t": 10,  # or [10, 15]
-        "--N_m": 36, #TODO: less than 36 is not working well
-        "--N_r": 8,
-        "--combine_mode": ["direct","metanet","both"],
-        "--cotrl_CSI": False,
-        "--channel_type": "synthetic_ricean",
+        # === Apples-to-apples vs CODE_EXAMPLE (RIS) ===
+        # Dimensions (CODE_EXAMPLE/Metasurfaces_Integrated_Neural_Networks_codebase/parameters.py)
+        "--N_t": 8,    # Nt
+        "--N_r": 12,   # Nr
+        "--N_m": 64,   # N = 8*8 RIS elements
+        # Training budget (CODE_EXAMPLE Training.*)
+        "--subset_size": 60000,          # full MNIST train set
+        "--batchsize": 256,
+        "--epochs": 400,
+        "--channel_sampling_size": 10000,  # preload_channels
+        "--lr": 1e-4,
+        "--weight_decay": 1e-7,
+
+        # RIS target: y = y_direct + y_ris (cascaded)
+        "--metasurface_type": "ris",
+        "--combine_mode": "both",
+        "--cotrl_CSI": True,
+        "--channel_type": "geometric_ricean",
         # Defaults (when not explicitly provided on the CLI):
         # - noise_std: None => auto
         #     - geometric_* => 1e-6 (matches CODE_EXAMPLE: noise_sigma_sq = -90 dBm => noise_std ~= 1e-6)
@@ -62,17 +70,17 @@ if __name__ == "__main__":
         # - geo_pathloss_exp: 2.0
         # - geo_pathloss_gain_db: 0.0  (set +40..+80 to mitigate harsh 28 GHz pathloss for easier training)
         # - k_factor_db: 3.0 (direct link; H1/H2 use 13/7 inside training.py)
-        "--noise_std":  1,#1e-6,
+        "--noise_std":  1e-6,
         #TODO: understand this section, and why geo_pathloss_gain_db so important
         # Transmit power (CODE_EXAMPLE-style): scales the transmitted vector `s` before the channel.
         # 30 dBm = 1 W.
-        #"--tx_power_dbm": 30.0,
-        #"--geo_pathloss_exp": 2.0,
-        #"--geo_pathloss_gain_db": 45, #should be 0!
-        #"--k_factor_db": 3.0, #path loss in non-geometric is set to 0 now (k factor like in their example)
+        "--tx_power_dbm": 30.0,
+        "--geo_pathloss_exp": 2.0,
+        "--geo_pathloss_gain_db": 0.0,
+        "--k_factor_db": 3.0,  # direct-link K-factor in dB (H1/H2 use 13/7 inside training.py)
 
-        #"--save_path": "MY_code/models_dict/",
-        #"--plot_path": "MY_code/plots/geo_ricean_metanet_learning.png",
+        "--save_path": "MY_code/models_dict/minn_model_code_example_ris_like.pth",
+        "--plot_path": "MY_code/plots/minn_model_code_example_ris_like.png",
         #"--plot_live": True,
         #"--encoder_distill": [False, True],
         #"--teacher_path": "teacher/minn_model_teacher_encoder_distill=False"

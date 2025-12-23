@@ -95,7 +95,8 @@ plot_acc: bool = False,
 plot_path: str | None = None,
 plot_live: bool = False,
 show_plot_end: bool = True,
-tx_power_dbm: float = 30.0):
+tx_power_dbm: float = 30.0,
+metasurface_type: str = "sim"):
     """
     MINN training loop:
     Encoder --> Channel (SimRISChannel/RayleighChannel) --> Decoder
@@ -114,9 +115,18 @@ tx_power_dbm: float = 30.0):
     if combine_mode in ["metanet", "both"]:
         controller.to(device)
         params += [p for p in controller.parameters() if p.requires_grad]
-        physical_sim.to(device)
-        for p in physical_sim.parameters():
-            p.requires_grad = False
+        ms_type = str(metasurface_type).lower()
+        if ms_type == "sim":
+            if physical_sim is None:
+                raise ValueError("metasurface_type='sim' requires physical_sim (Physical_SIM).")
+            physical_sim.to(device)
+            for p in physical_sim.parameters():
+                p.requires_grad = False
+        elif ms_type == "ris":
+            # RIS physical layer is computed analytically inside the training loop.
+            pass
+        else:
+            raise ValueError("metasurface_type must be one of: 'ris', 'sim'")
     if encoder_distiller is None:
         encoder.to(device)
         params += [p for p in encoder.parameters() if p.requires_grad]
@@ -207,7 +217,24 @@ tx_power_dbm: float = 30.0):
                     theta_list = controller(H_1=H_1, H_D=H_D_eff, H_2=H_2_eff)
                 else:
                     theta_list = controller(H_1=H_1)
-                y_ms = physical_sim(s_ms, theta_list)  # (batch, N_ms_out)
+                ms_type = str(metasurface_type).lower()
+                if ms_type == "sim":
+                    if physical_sim is None:
+                        raise ValueError("metasurface_type='sim' requires physical_sim (Physical_SIM).")
+                    y_ms = physical_sim(s_ms, theta_list)  # (batch, N_ms_out)
+                elif ms_type == "ris":
+                    # Match CODE_EXAMPLE RIS path:
+                    #   phi = exp(-j * theta), y_ms = phi ⊙ (H_1 s), y_ris = H_2 y_ms
+                    if len(theta_list) != 1:
+                        raise ValueError(
+                            f"RIS expects controller to output 1 theta vector (got {len(theta_list)}). "
+                            "Construct Controller_DNN with layer_sizes=[N_m] for RIS."
+                        )
+                    theta = theta_list[0]
+                    phi = torch.exp(-1j * theta)
+                    y_ms = s_ms * phi  # (batch, N_m)
+                else:
+                    raise ValueError("metasurface_type must be one of: 'ris', 'sim'")
                 y_metanet = torch.matmul(H_2_eff, y_ms.unsqueeze(-1)).squeeze(-1)  # (batch, N_r)
                 if combine_mode == "metanet":
                     y = y_metanet
@@ -335,6 +362,17 @@ if __name__ == '__main__':
     # Channel configuration
     parser.add_argument('--combine_mode', type=str, default='both', choices=['direct', 'metanet', 'both'],
                         help='Channel combination mode: direct, simnet, or both')
+    parser.add_argument(
+        '--metasurface_type',
+        type=str,
+        default='sim',
+        choices=['ris', 'sim'],
+        help=(
+            "Metasurface physical model used for the meta path when --combine_mode is metanet/both. "
+            "'sim' uses the 3-layer Physical_SIM (SimNet). "
+            "'ris' uses a single-layer RIS: y_ris = H_2 (exp(-j*theta) ⊙ (H_1 s))."
+        ),
+    )
     parser.add_argument(
         '--cotrl_CSI',
         nargs='?',
@@ -532,11 +570,20 @@ if __name__ == '__main__':
         )
 
         # ===== DNN stack =====
-        simnet = build_simnet(int(cfg.N_m), lam=float(cfg.lam)).to(device)
-        for p in simnet.parameters():
-            p.requires_grad = False
-        layer_sizes = [layer.num_elems for layer in simnet.ris_layers]
-        physical_sim = Physical_SIM(simnet).to(device)
+        ms_type = str(getattr(cfg, "metasurface_type", "sim")).lower()
+        if ms_type == "sim":
+            simnet = build_simnet(int(cfg.N_m), lam=float(cfg.lam)).to(device)
+            for p in simnet.parameters():
+                p.requires_grad = False
+            layer_sizes = [layer.num_elems for layer in simnet.ris_layers]
+            physical_sim = Physical_SIM(simnet).to(device)
+        elif ms_type == "ris":
+            # No SimNet for RIS; controller outputs a single theta vector of size N_m.
+            simnet = None
+            layer_sizes = [int(cfg.N_m)]
+            physical_sim = None
+        else:
+            raise ValueError("metasurface_type must be one of: 'ris', 'sim'")
         controller = Controller_DNN(
             n_t=int(cfg.N_t),
             n_r=int(cfg.N_r),
@@ -582,6 +629,7 @@ if __name__ == '__main__':
             H_2_all=H_2_all,
             encoder_distiller=encoder_distiller,
             tx_power_dbm=float(getattr(cfg, "tx_power_dbm", 30.0)),
+            metasurface_type=str(getattr(cfg, "metasurface_type", "sim")),
             # For compare runs, we plot once at the end; disable internal plotting.
             plot_acc=False,
             plot_path=None,
