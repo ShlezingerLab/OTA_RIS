@@ -51,13 +51,12 @@ if __name__ == "__main__":
         "--N_r": 12,   # Nr
         "--N_m": 64,   # N = 8*8 RIS elements
         # Training budget (CODE_EXAMPLE Training.*)
-        "--subset_size": 60000,          # full MNIST train set
-        "--batchsize": 256,
-        "--epochs": 400,
-        "--channel_sampling_size": 10000,  # preload_channels
+        "--subset_size":1000 ,          # 60000
+        "--batchsize":100 ,            #256
+        "--epochs": 15 ,               #400
+        "--channel_sampling_size": 100,  # 10000
         "--lr": 1e-4,
         "--weight_decay": 1e-7,
-
         # RIS target: y = y_direct + y_ris (cascaded)
         "--metasurface_type": "ris",
         "--combine_mode": "both",
@@ -76,14 +75,35 @@ if __name__ == "__main__":
         # 30 dBm = 1 W.
         "--tx_power_dbm": 30.0,
         "--geo_pathloss_exp": 2.0,
-        "--geo_pathloss_gain_db": 0.0,
+        "--geo_pathloss_gain_db": 60.0, #TODO: It has to be ~60
         "--k_factor_db": 3.0,  # direct-link K-factor in dB (H1/H2 use 13/7 inside training.py)
-
-        "--save_path": "MY_code/models_dict/minn_model_code_example_ris_like.pth",
-        "--plot_path": "MY_code/plots/minn_model_code_example_ris_like.png",
+        #"--save_path": "MY_code/models_dict/minn_model_code_example_ris_like.pth",
+        #"--plot_path": "MY_code/plots/minn_model_code_example_ris_like.png",
         #"--plot_live": True,
-        #"--encoder_distill": [False, True],
-        #"--teacher_path": "teacher/minn_model_teacher_encoder_distill=False"
+
+        # === 0-Phase Training Workflow with CNN Teacher ===
+        # Uses train_minn_phases() for cleaner phase separation
+
+        # Phase 0: Train CNN classifier to use as teacher (run once)
+        #"--train_classifier": True,
+        #"--classifier_path": "MY_code/models_dict/cnn_classifier.pth",
+        #"--epochs": 20,
+        #"--subset_size": 10000,
+
+        # Phase 1: Train encoder ONLY with CNN teacher (uses train_minn_phases)
+        # "--encoder_distill": True,
+        # "--teacher_path": "MY_code/models_dict/cnn_classifier.pth",
+        # "--save_path": "MY_code/models_dict/encoder_distilled.pth",
+        # "--epochs": 200,
+
+        # COMPARISON: Phase 2 (with encoder) vs Standard (end-to-end)
+        "--encoder_distill": False,
+        "--load_encoder": ["MY_code/models_dict/encoder_distilled.pth", None],
+        # First run: Phase 2 with frozen pre-trained encoder (train_minn_phases)
+        # Second run: Standard end-to-end training (train_minn)
+        # Generates comparison plot showing both approaches
+        #"--save_path": "MY_code/models_dict/minn_model_phase2.pth",
+        "--epochs": 30,
     }
 
     IDE_TEST_ARGS: dict[str, object] = {
@@ -167,21 +187,23 @@ if __name__ == "__main__":
             return "compare"
         return "students" if bool(v) else "teacher"
 
-    DEFAULT_TEACHER_STORE_NAME = "teacher/minn_model_teacher"
+    DEFAULT_CNN_CLASSIFIER_PATH = "MY_code/models_dict/cnn_classifier.pth"
     DEFAULT_STUDENT_STORE_NAME = "students/minn_model_student"
+    DEFAULT_BASE_MODEL_STORE_NAME = "minn_model"
 
     def _default_teacher_path_for_fd(arg_dict: dict[str, object]) -> str:
         # Only meaningful when encoder_distill is enabled; allow overriding via IDE_TRAIN_ARGS.
+        # Returns path to CNN classifier to use as teacher.
         v = arg_dict.get("--teacher_path")
-        return str(v) if isinstance(v, str) and v else DEFAULT_TEACHER_STORE_NAME
+        return str(v) if isinstance(v, str) and v else DEFAULT_CNN_CLASSIFIER_PATH
 
     def _model_store_name_for_save(arg_dict: dict[str, object]) -> str:
-        # Save teacher model when not distilling; save student model when distilling.
+        # Save student model when distilling; save base model when not distilling.
         v = arg_dict.get("--encoder_distill")
-        # If it's a list, we are in "compare" intent; default to student naming so users don't overwrite teacher by accident.
+        # If it's a list, we are in "compare" intent; default to student naming so users don't overwrite base by accident.
         if isinstance(v, list):
             return DEFAULT_STUDENT_STORE_NAME
-        return DEFAULT_STUDENT_STORE_NAME if bool(v) else DEFAULT_TEACHER_STORE_NAME
+        return DEFAULT_STUDENT_STORE_NAME if bool(v) else DEFAULT_BASE_MODEL_STORE_NAME
 
     def _resolve_train_save_path(
         save_path_value: str,
@@ -460,6 +482,39 @@ if __name__ == "__main__":
     argv = sys.argv[1:]
     if not argv:
         config = IDE_TRAIN_ARGS if IDE_COMMAND == "train" else IDE_TEST_ARGS
+
+        # Special case: classifier training mode - use simple arg passing
+        # Check if --train_classifier is True (not a list for comparison)
+        train_classifier_val = config.get("--train_classifier")
+        if train_classifier_val is True or (isinstance(train_classifier_val, list) and any(train_classifier_val)):
+            if isinstance(train_classifier_val, list):
+                print("[WARNING] --train_classifier should be True (not a list). Using first truthy value.")
+                # For lists, we'll just run with the first truthy value
+                config = dict(config)
+                config["--train_classifier"] = next((v for v in train_classifier_val if v), True)
+
+            simple_args = []
+            for k, v in config.items():
+                if v is None or v is False:
+                    continue
+                if k == "--train_classifier" and v is True:
+                    simple_args.append("--train_classifier")
+                    continue
+                if isinstance(v, bool):
+                    if v:
+                        simple_args.append(k)
+                    continue
+                if isinstance(v, tuple):
+                    simple_args.append(k)
+                    simple_args += [str(x) for x in v]
+                    continue
+                if isinstance(v, list):
+                    # Skip lists in classifier mode (not supported)
+                    continue
+                simple_args += [k, str(v)]
+            rc = main([IDE_COMMAND, *simple_args])
+            raise SystemExit(rc)
+
         rc = 0
         for run_args in _build_cli_runs(
             config,

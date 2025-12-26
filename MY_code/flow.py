@@ -1176,10 +1176,54 @@ class chennel_params():
         self.path_loss_direct = 10 ** (-path_loss_direct_db / 20.0)  # Convert dB to linear scale
         self.path_loss_ms = 10 ** (-path_loss_ms_db / 20.0)  # Convert dB to linear scale
 
+class FeatureConnector(nn.Module):
+    """
+    Align student features to teacher features.
+    Handles both channel and spatial dimension mismatches.
+    """
+    def __init__(self, s_channels: int, t_channels: int):
+        super().__init__()
+        self.s_channels = s_channels
+        self.t_channels = t_channels
+
+        # Channel alignment
+        if s_channels != t_channels:
+            self.channel_align = nn.Sequential(
+                nn.Conv2d(s_channels, t_channels, kernel_size=1, stride=1, padding=0, bias=False),
+                nn.BatchNorm2d(t_channels),
+            )
+        else:
+            self.channel_align = nn.Identity()
+
+    def forward(self, s_feat: torch.Tensor, t_feat: torch.Tensor) -> torch.Tensor:
+        """
+        Align student feature to match teacher feature shape.
+
+        Args:
+            s_feat: Student feature (B, C_s, H_s, W_s)
+            t_feat: Teacher feature (B, C_t, H_t, W_t) - used for spatial reference
+
+        Returns:
+            aligned: Aligned student feature (B, C_t, H_t, W_t)
+        """
+        # Align channels first
+        s_aligned = self.channel_align(s_feat)
+
+        # Align spatial dimensions if needed
+        if s_aligned.shape[2:] != t_feat.shape[2:]:
+            # Use adaptive pooling or interpolation to match spatial size
+            s_aligned = F.adaptive_avg_pool2d(s_aligned, t_feat.shape[2:])
+
+        return s_aligned
+
+
 def build_feature_connector(t_channels: int, s_channels: int) -> nn.Module:
     """
     Map student feature channels -> teacher feature channels.
     Uses 1x1 conv + BN (like `distilallation/`) when channels differ.
+
+    Note: This is kept for backward compatibility, but FeatureConnector is preferred
+    for handling spatial mismatches.
     """
     if t_channels == s_channels:
         return nn.Identity()
@@ -1198,6 +1242,224 @@ class DistillConfig:
     distill_s: bool = True
     lambda_conv: float = 1.0
     lambda_s: float = 1.0
+
+
+class MNISTClassifier(nn.Module):
+    """
+    5-layer CNN classifier for MNIST digit recognition.
+
+    Architecture:
+    - Conv1: 1 -> 32 channels (3x3 kernel, stride 1, padding 1)
+    - Conv2: 32 -> 64 channels (3x3 kernel, stride 1, padding 1) + MaxPool
+    - Conv3: 64 -> 128 channels (3x3 kernel, stride 1, padding 1)
+    - Conv4: 128 -> 256 channels (3x3 kernel, stride 1, padding 1) + MaxPool
+    - Conv5: 256 -> 512 channels (3x3 kernel, stride 1, padding 1)
+    - Fully connected layers to 10 classes
+
+    Input: (batch, 1, 28, 28)
+    Output: (batch, 10) logits
+    """
+
+    def __init__(self, num_classes: int = 10):
+        super().__init__()
+        self.num_classes = num_classes
+
+        # Layer 1: 1 -> 32
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1)
+        self.bn1 = nn.BatchNorm2d(32)
+        self.relu1 = nn.ReLU()
+
+        # Layer 2: 32 -> 64 + MaxPool
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.relu2 = nn.ReLU()
+        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)  # 28x28 -> 14x14
+
+        # Layer 3: 64 -> 128
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
+        self.bn3 = nn.BatchNorm2d(128)
+        self.relu3 = nn.ReLU()
+
+        # Layer 4: 128 -> 256 + MaxPool
+        self.conv4 = nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1)
+        self.bn4 = nn.BatchNorm2d(256)
+        self.relu4 = nn.ReLU()
+        self.pool4 = nn.MaxPool2d(kernel_size=2, stride=2)  # 14x14 -> 7x7
+
+        # Layer 5: 256 -> 512
+        self.conv5 = nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1)
+        self.bn5 = nn.BatchNorm2d(512)
+        self.relu5 = nn.ReLU()
+
+        # Global average pooling + classifier
+        self.global_pool = nn.AdaptiveAvgPool2d(1)  # -> (batch, 512, 1, 1)
+        self.fc1 = nn.Linear(512, 256)
+        self.fc_relu = nn.ReLU()
+        self.dropout = nn.Dropout(0.5)
+        self.fc2 = nn.Linear(256, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass.
+
+        Args:
+            x: Input tensor (batch, 1, 28, 28)
+
+        Returns:
+            logits: Output logits (batch, num_classes)
+        """
+        # Layer 1
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu1(x)
+
+        # Layer 2 + pool
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = self.relu2(x)
+        x = self.pool2(x)
+
+        # Layer 3
+        x = self.conv3(x)
+        x = self.bn3(x)
+        x = self.relu3(x)
+
+        # Layer 4 + pool
+        x = self.conv4(x)
+        x = self.bn4(x)
+        x = self.relu4(x)
+        x = self.pool4(x)
+
+        # Layer 5
+        x = self.conv5(x)
+        x = self.bn5(x)
+        x = self.relu5(x)
+
+        # Classifier
+        x = self.global_pool(x)
+        x = x.view(x.size(0), -1)  # (batch, 512)
+        x = self.fc1(x)
+        x = self.fc_relu(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+
+        return x
+
+    def extract_features(self, x: torch.Tensor, preReLU: bool = True):
+        """
+        Extract intermediate features from first 2 conv layers.
+
+        Args:
+            x: Input tensor (batch, 1, 28, 28)
+            preReLU: If True, return features before ReLU; otherwise after ReLU
+
+        Returns:
+            feats: List of 2 feature tensors [feat1, feat2]
+            output: Final classifier output (batch, num_classes)
+        """
+        feats = []
+
+        # Layer 1
+        x = self.conv1(x)
+        x = self.bn1(x)
+        feats.append(x if preReLU else self.relu1(x))
+        x = self.relu1(x)
+
+        # Layer 2 + pool
+        x = self.conv2(x)
+        x = self.bn2(x)
+        feats.append(x if preReLU else self.relu2(x))
+        x = self.relu2(x)
+        x = self.pool2(x)
+
+        # Continue with remaining layers
+        x = self.conv3(x)
+        x = self.bn3(x)
+        x = self.relu3(x)
+
+        x = self.conv4(x)
+        x = self.bn4(x)
+        x = self.relu4(x)
+        x = self.pool4(x)
+
+        x = self.conv5(x)
+        x = self.bn5(x)
+        x = self.relu5(x)
+
+        x = self.global_pool(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc1(x)
+        x = self.fc_relu(x)
+        x = self.dropout(x)
+        output = self.fc2(x)
+
+        return feats, output
+
+
+class CNNTeacherExtractor(nn.Module):
+    """
+    Extracts and freezes the first 2 CNN layers from a trained MNISTClassifier
+    to use as a teacher for encoder feature distillation.
+
+    This class wraps the first 2 conv layers of the classifier and provides
+    a compatible interface with EncoderFeatureDistiller.
+    """
+
+    def __init__(self, classifier: MNISTClassifier):
+        super().__init__()
+        self.conv1 = classifier.conv1
+        self.bn1 = classifier.bn1
+        self.relu1 = classifier.relu1
+
+        self.conv2 = classifier.conv2
+        self.bn2 = classifier.bn2
+        self.relu2 = classifier.relu2
+
+        # Freeze all parameters
+        for param in self.parameters():
+            param.requires_grad = False
+
+        self.eval()
+
+    def extract_feature(self, x: torch.Tensor, preReLU: bool = True):
+        """
+        Extract features from first 2 conv layers.
+
+        Args:
+            x: Input tensor (batch, 1, 28, 28)
+            preReLU: If True, return features before ReLU; otherwise after ReLU
+
+        Returns:
+            feats: List of 2 feature tensors [feat1 (32 ch), feat2 (64 ch)]
+            dummy_output: Dummy output (zeros) to match expected interface
+        """
+        feats = []
+
+        # Layer 1
+        x1 = self.conv1(x)
+        x1 = self.bn1(x1)
+        feats.append(x1 if preReLU else self.relu1(x1))
+        x1 = self.relu1(x1)
+
+        # Layer 2
+        x2 = self.conv2(x1)
+        x2 = self.bn2(x2)
+        feats.append(x2 if preReLU else self.relu2(x2))
+
+        # Return dummy output to match encoder interface
+        # EncoderFeatureDistiller expects (feats, output), but we only use feats
+        dummy_output = torch.zeros(x.size(0), 1, 1, dtype=torch.complex64, device=x.device)
+
+        return feats, dummy_output
+
+    def get_channel_num(self) -> list[int]:
+        """Return channel numbers for the 2 conv layers."""
+        return [32, 64]
+
+    def forward(self, x: torch.Tensor):
+        """Forward pass (not used for distillation, just for compatibility)."""
+        feats, _ = self.extract_feature(x, preReLU=True)
+        return feats[-1]
 
 
 class EncoderFeatureDistiller(nn.Module):
@@ -1236,14 +1498,22 @@ class EncoderFeatureDistiller(nn.Module):
                 raise ValueError("Both teacher and student encoders must implement get_channel_num() to distill conv feats.")
             t_channels = self.teacher.get_channel_num()
             s_channels = self.student.get_channel_num()
+
+            # Allow flexible matching: use min number of layers
+            # CNN teacher has 2 layers, encoder has 3 - match first 2
+            self.num_distill_layers = min(len(t_channels), len(s_channels))
             if len(t_channels) != len(s_channels):
-                raise ValueError(f"Teacher/student feature levels mismatch: {len(t_channels)} vs {len(s_channels)}")
+                print(f"[INFO] Teacher has {len(t_channels)} layers, student has {len(s_channels)} layers. "
+                      f"Will distill first {self.num_distill_layers} layers only.")
+            t_channels = t_channels[:self.num_distill_layers]
+            s_channels = s_channels[:self.num_distill_layers]
 
             self.connectors = nn.ModuleList(
-                [build_feature_connector(t, s) for t, s in zip(t_channels, s_channels)]
+                [FeatureConnector(s, t) for t, s in zip(t_channels, s_channels)]
             )
         else:
             self.connectors = nn.ModuleList()
+            self.num_distill_layers = 0
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # Teacher features are always detached; keep teacher in eval/frozen outside.
@@ -1255,9 +1525,11 @@ class EncoderFeatureDistiller(nn.Module):
         loss_fd = x.new_tensor(0.0)
 
         if self.distill_conv:
-            feat_num = len(t_feats)
+            # Use only the overlapping layers (teacher may have fewer layers than student)
+            feat_num = min(len(t_feats), len(s_feats), len(self.connectors))
             for i in range(feat_num):
-                s_aligned = self.connectors[i](s_feats[i])
+                # Pass teacher feature to connector for spatial alignment
+                s_aligned = self.connectors[i](s_feats[i], t_feats[i])
                 loss_i = F.mse_loss(s_aligned, t_feats[i], reduction="mean")
                 # same weighting pattern as distilallation (later layers get higher weight)
                 loss_fd = loss_fd + self.lambda_conv * (loss_i / (2 ** (feat_num - i - 1)))

@@ -98,7 +98,7 @@ show_plot_end: bool = True,
 tx_power_dbm: float = 30.0,
 metasurface_type: str = "sim"):
     """
-    MINN training loop:
+    MINN training loop (ORIGINAL VERSION):
     Encoder --> Channel (SimRISChannel/RayleighChannel) --> Decoder
     Classification task (MNIST, 10 classes)
     Uses CrossEntropy loss by default. If `encoder_distiller` is provided, trains with
@@ -346,8 +346,403 @@ metasurface_type: str = "sim"):
         "plot_path": plot_path,
     }
 
+
+def train_minn_phases(channel, encoder, decoder, controller, physical_sim, train_loader, num_epochs=10, lr=1e-3,
+weight_decay=0.0, device="cpu", combine_mode="direct",
+H_d_all=None, H_1_all=None, H_2_all=None,
+encoder_distiller: EncoderFeatureDistiller | None = None,
+plot_acc: bool = False,
+plot_path: str | None = None,
+plot_live: bool = False,
+show_plot_end: bool = True,
+tx_power_dbm: float = 30.0,
+metasurface_type: str = "sim"):
+    """
+    2-PHASE MINN training loop:
+
+    Phase 1 (encoder_distiller is not None): Train ONLY encoder with CNN teacher distillation
+      - Encoder learns from feature distillation loss (MSE with CNN teacher features)
+      - Decoder/controller are NOT trained, channel operations are skipped
+      - Output: Trained encoder with good feature representations
+      - No classification accuracy (only distillation loss)
+
+    Phase 2 (encoder_distiller is None): Train decoder + controller with frozen encoder
+      - Encoder is frozen and used as feature extractor
+      - Full pipeline: Encoder --> Channel --> Decoder
+      - Decoder/controller learn from classification loss
+      - Encoder parameters are NOT updated
+
+    Supports channel-aware mode: if decoder is channel-aware, passes H(t) to decoder.
+    """
+    params = []
+
+    if encoder_distiller is None:
+        # Phase 2: Train decoder + controller (encoder is frozen)
+        print("[INFO] Phase 2: Training decoder + controller (encoder frozen)")
+        decoder.to(device)
+        params += [p for p in decoder.parameters() if p.requires_grad]
+        if combine_mode in ["metanet", "both"]:
+            controller.to(device)
+            params += [p for p in controller.parameters() if p.requires_grad]
+            ms_type = str(metasurface_type).lower()
+            if ms_type == "sim":
+                if physical_sim is None:
+                    raise ValueError("metasurface_type='sim' requires physical_sim (Physical_SIM).")
+                physical_sim.to(device)
+                for p in physical_sim.parameters():
+                    p.requires_grad = False
+            elif ms_type == "ris":
+                # RIS physical layer is computed analytically inside the training loop.
+                pass
+            else:
+                raise ValueError("metasurface_type must be one of: 'ris', 'sim'")
+        encoder.to(device)
+        # Freeze encoder in Phase 2
+        encoder.eval()
+        for p in encoder.parameters():
+            p.requires_grad = False
+    else:
+        # Phase 1: Train ONLY encoder with distillation
+        print("[INFO] Phase 1: Training encoder with CNN teacher distillation (decoder/controller skipped)")
+        encoder_distiller.to(device)
+        # Ensure teacher is frozen; only train student + alignment connectors.
+        encoder_distiller.teacher.eval()
+        for p in encoder_distiller.teacher.parameters():
+            p.requires_grad = False
+        params += [p for p in encoder_distiller.student.parameters() if p.requires_grad]
+        params += [p for p in encoder_distiller.connectors.parameters() if p.requires_grad]
+
+    optimizer = optim.Adam(params, lr=lr, weight_decay=weight_decay)
+    criterion = nn.CrossEntropyLoss()
+    num_channels = H_d_all.size(0) if H_d_all is not None else 0
+    channel_cursor = 0
+    tx_amp_scale = _dbm_to_watt(tx_power_dbm)
+
+    epoch_accs: list[float] = []
+    epoch_total_losses: list[float] = []
+    epoch_ce_losses: list[float] = []
+    epoch_fd_losses: list[float] = []
+
+    # Plotting setup
+    if plot_acc:
+        if (not plot_live) and (not show_plot_end):
+            import matplotlib
+            matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        fig, (ax_acc, ax_loss) = plt.subplots(nrows=2, ncols=1, figsize=(7, 7), sharex=True)
+        if plot_live:
+            plt.ion()
+        if plot_path is None:
+            plot_path = "MY_code/plots/training_curves.png"
+
+    for epoch in range(num_epochs):
+        running_loss = 0.0
+        running_ce = 0.0
+        running_fd = 0.0
+        correct = 0
+        total = 0
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
+        for images, labels in pbar:
+            images = images.to(device)
+            labels = labels.to(device)
+
+            if encoder_distiller is not None:
+                # Phase 1: Only compute encoder distillation loss
+                s, loss_fd = encoder_distiller(images)
+                loss = loss_fd
+
+                # Skip channel/decoder/controller - no classification in Phase 1
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                running_loss += loss.item()
+                running_fd += loss_fd.item()
+                total += labels.size(0)
+
+                pbar.set_postfix({
+                    'loss_fd': f"{loss_fd.item():.4f}",
+                })
+                continue  # Skip rest of loop (channel/decoder operations)
+
+            # Phase 2: Full pipeline training
+            s = encoder(images)
+            s_c = s.to(torch.complex64) if not torch.is_complex(s) else s
+            if tx_amp_scale != 1.0:
+                s_c = s_c * float(tx_amp_scale)
+            batch_size = s.size(0)
+            idxs = (torch.arange(batch_size, device=device) + channel_cursor) % num_channels
+            channel_cursor = (channel_cursor + batch_size) % num_channels
+            H_D = H_d_all[idxs].to(device)
+            H_1 = H_1_all[idxs].to(device)
+            H_2 = H_2_all[idxs].to(device)
+
+            pl_d = float(getattr(channel, "path_loss_direct", 1.0))
+            pl_ms = float(getattr(channel, "path_loss_ms", 1.0))
+            H_D_eff = H_D * pl_d
+            H_2_eff = H_2 * pl_ms
+
+            if combine_mode in ["direct", "both"]:
+                y_direct = torch.matmul(H_D_eff, s_c.transpose(1, 2)).squeeze(-1)
+                if combine_mode == "direct":
+                    y = y_direct
+            if combine_mode in ["metanet", "both"]:
+                s_ms = torch.matmul(H_1, s_c.transpose(1, 2)).squeeze(-1)
+                if getattr(controller, "ctrl_full_csi", True):
+                    theta_list = controller(H_1=H_1, H_D=H_D_eff, H_2=H_2_eff)
+                else:
+                    theta_list = controller(H_1=H_1)
+                ms_type = str(metasurface_type).lower()
+                if ms_type == "sim":
+                    y_ms = physical_sim(s_ms, theta_list)
+                elif ms_type == "ris":
+                    if len(theta_list) != 1:
+                        raise ValueError(f"RIS expects 1 theta vector (got {len(theta_list)})")
+                    theta = theta_list[0]
+                    phi = torch.exp(-1j * theta)
+                    y_ms = s_ms * phi
+                y_metanet = torch.matmul(H_2_eff, y_ms.unsqueeze(-1)).squeeze(-1)
+                if combine_mode == "metanet":
+                    y = y_metanet
+            if combine_mode == "both":
+                y = y_direct + y_metanet
+
+            nr, ni = (
+                torch.randn_like(y.real) * (channel.noise_std / math.sqrt(2)),
+                torch.randn_like(y.imag) * (channel.noise_std / math.sqrt(2)),
+            )
+            noise = torch.complex(nr, ni)
+            y = y + noise
+
+            if combine_mode == "direct":
+                logits = decoder(y, H_D=H_D_eff)
+            elif combine_mode == "metanet":
+                logits = decoder(y, H_2=H_2_eff)
+            else:
+                logits = decoder(y, H_D=H_D_eff, H_2=H_2_eff)
+
+            loss_ce = criterion(logits, labels)
+            loss = loss_ce
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item()
+            running_ce += loss_ce.item()
+            probs = torch.softmax(logits, dim=1)
+            _, predicted = torch.max(probs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+            pbar.set_postfix({
+                'loss': f"{loss.item():.4f}",
+                'acc': f"{100 * correct / total:.2f}%"
+            })
+
+        epoch_loss = running_loss / len(train_loader)
+        epoch_ce = running_ce / len(train_loader)
+        epoch_fd = running_fd / len(train_loader)
+        epoch_accuracy = 100 * correct / total if total > 0 else 0.0
+        epoch_total_losses.append(float(epoch_loss))
+        epoch_ce_losses.append(float(epoch_ce))
+        epoch_fd_losses.append(float(epoch_fd))
+        epoch_accs.append(float(epoch_accuracy))
+
+        if encoder_distiller is not None:
+            print(f"Epoch {epoch+1}/{num_epochs} | Loss_FD: {epoch_fd:.4f}")
+        else:
+            print(f"Epoch {epoch+1}/{num_epochs} | Loss: {epoch_loss:.4f} | Acc: {epoch_accuracy:.2f}%")
+
+        if plot_acc:
+            xs = list(range(1, len(epoch_accs) + 1))
+
+            ax_acc.clear()
+            if encoder_distiller is not None:
+                ax_acc.plot(xs, epoch_fd_losses, label="loss_fd")
+                ax_acc.grid(True)
+                ax_acc.set_ylabel("loss_fd")
+                ax_acc.set_title("Encoder Distillation (Phase 1)")
+            else:
+                ax_acc.plot(xs, epoch_accs, label="acc (%)")
+                ax_acc.grid(True)
+                ax_acc.set_ylim(0.0, 100.0)
+                ax_acc.set_ylabel("acc (%)")
+                ax_acc.set_title("Training curves (Phase 2)")
+            ax_acc.legend(loc="best")
+
+            ax_loss.clear()
+            if encoder_distiller is not None:
+                ax_loss.plot(xs, epoch_total_losses, label="loss_total (FD)")
+            else:
+                ax_loss.plot(xs, epoch_total_losses, label="loss_total")
+                ax_loss.plot(xs, epoch_ce_losses, label="loss_ce")
+            ax_loss.grid(True)
+            ax_loss.set_xlabel("epoch")
+            ax_loss.set_ylabel("loss")
+            ax_loss.legend(loc="best")
+            fig.tight_layout()
+
+            if plot_path:
+                os.makedirs(os.path.dirname(plot_path) or ".", exist_ok=True)
+                fig.savefig(plot_path)
+
+            if plot_live:
+                try:
+                    plt.show(block=False)
+                    plt.pause(0.001)
+                except Exception:
+                    pass
+
+    print("Training finished!")
+
+    if plot_acc and show_plot_end:
+        try:
+            import matplotlib.pyplot as plt
+            if plot_live:
+                plt.ioff()
+            plt.show()
+        except Exception:
+            pass
+
+    return {
+        "epoch": list(range(1, len(epoch_accs) + 1)),
+        "acc": epoch_accs,
+        "loss_total": epoch_total_losses,
+        "loss_ce": epoch_ce_losses,
+        "loss_fd": epoch_fd_losses,
+        "plot_path": plot_path,
+    }
+
+
+def train_classifier(classifier, train_loader, num_epochs=20, lr=1e-3, weight_decay=0.0, device="cpu",
+                     plot_acc: bool = False, plot_path: str | None = None,
+                     plot_live: bool = False, show_plot_end: bool = True):
+    """
+    Train a standard CNN classifier on MNIST.
+
+    Args:
+        classifier: MNISTClassifier instance
+        train_loader: DataLoader for training data
+        num_epochs: Number of training epochs
+        lr: Learning rate
+        weight_decay: Weight decay for optimizer
+        device: Device to train on ('cuda' or 'cpu')
+        plot_acc: Whether to plot training curves
+        plot_path: Path to save plot
+        plot_live: Whether to update plot live during training
+        show_plot_end: Whether to show plot at end of training
+
+    Returns:
+        history: Dictionary with training history (epoch, acc, loss, plot_path)
+    """
+    classifier.to(device)
+    optimizer = optim.Adam(classifier.parameters(), lr=lr, weight_decay=weight_decay)
+    criterion = nn.CrossEntropyLoss()
+
+    epoch_accs: list[float] = []
+    epoch_losses: list[float] = []
+
+    # Plotting setup
+    if plot_acc:
+        if (not plot_live) and (not show_plot_end):
+            import matplotlib
+            matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        fig, (ax_acc, ax_loss) = plt.subplots(nrows=2, ncols=1, figsize=(7, 7), sharex=True)
+        if plot_live:
+            plt.ion()
+        if plot_path is None:
+            plot_path = "MY_code/plots/classifier_training_curves.png"
+
+    for epoch in range(num_epochs):
+        classifier.train()
+        running_loss = 0.0
+        correct = 0
+        total = 0
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
+
+        for images, labels in pbar:
+            images = images.to(device)
+            labels = labels.to(device)
+
+            # Forward pass
+            logits = classifier(images)
+            loss = criterion(logits, labels)
+
+            # Backward pass
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            # Statistics
+            running_loss += loss.item()
+            _, predicted = torch.max(logits.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+            pbar.set_postfix({
+                'loss': f"{loss.item():.4f}",
+                'acc': f"{100 * correct / total:.2f}%"
+            })
+
+        epoch_loss = running_loss / len(train_loader)
+        epoch_accuracy = 100 * correct / total
+        epoch_losses.append(float(epoch_loss))
+        epoch_accs.append(float(epoch_accuracy))
+        print(f"Epoch {epoch+1}/{num_epochs} | Loss: {epoch_loss:.4f} | Acc: {epoch_accuracy:.2f}%")
+
+        if plot_acc:
+            xs = list(range(1, len(epoch_accs) + 1))
+
+            ax_acc.clear()
+            ax_acc.plot(xs, epoch_accs, label="acc (%)")
+            ax_acc.grid(True)
+            ax_acc.set_ylim(0.0, 100.0)
+            ax_acc.set_ylabel("acc (%)")
+            ax_acc.set_title("Classifier Training Curves")
+            ax_acc.legend(loc="best")
+
+            ax_loss.clear()
+            ax_loss.plot(xs, epoch_losses, label="loss")
+            ax_loss.grid(True)
+            ax_loss.set_xlabel("epoch")
+            ax_loss.set_ylabel("loss")
+            ax_loss.legend(loc="best")
+            fig.tight_layout()
+
+            if plot_path:
+                os.makedirs(os.path.dirname(plot_path) or ".", exist_ok=True)
+                fig.savefig(plot_path)
+
+            if plot_live:
+                try:
+                    plt.show(block=False)
+                    plt.pause(0.001)
+                except Exception:
+                    pass
+
+    print("Classifier training finished!")
+
+    if plot_acc and show_plot_end:
+        try:
+            import matplotlib.pyplot as plt
+            if plot_live:
+                plt.ioff()
+            plt.show()
+        except Exception:
+            pass
+
+    return {
+        "epoch": list(range(1, len(epoch_accs) + 1)),
+        "acc": epoch_accs,
+        "loss": epoch_losses,
+        "plot_path": plot_path,
+    }
+
+
 if __name__ == '__main__':
-    from flow import Encoder, Decoder, build_simnet, Controller_DNN, Physical_SIM  # adapt imports
+    from flow import Encoder, Decoder, build_simnet, Controller_DNN, Physical_SIM, MNISTClassifier, CNNTeacherExtractor  # adapt imports
     parser = argparse.ArgumentParser(description='Train MINN on MNIST dataset')
     # Data configuration
     parser.add_argument('--subset_size', type=int, default=1000, help='Number of samples to use from training set')
@@ -466,17 +861,40 @@ if __name__ == '__main__':
         type=str,
         default=None,
         help=(
-            'Teacher model store name under MY_code/models_dict (WITHOUT .pth). '
-            'Only used when --encoder_distill is enabled. Example: teacher/minn_model_teacher'
+            'CNN classifier checkpoint path for distillation teacher. '
+            'Only used when --encoder_distill is enabled. '
+            'If not set, defaults to MY_code/models_dict/cnn_classifier.pth'
+        ),
+    )
+    # CNN Classifier training mode
+    parser.add_argument(
+        '--train_classifier',
+        nargs='?',
+        const=True,
+        default=False,
+        type=_parse_bool,
+        help=(
+            "Train a standalone CNN classifier on MNIST (not the full encoder-channel-decoder system). "
+            "Use this to train a teacher network whose early layers can be used for encoder distillation."
         ),
     )
     parser.add_argument(
-        '--teacher_ckpt',
+        '--classifier_path',
         type=str,
         default=None,
         help=(
-            'Teacher checkpoint path (expects a dict with key "encoder"). '
-            'If not set, defaults to MY_code/models_dict/{teacher_path}.pth'
+            'Path to save/load the trained CNN classifier checkpoint. '
+            'If not set, defaults to MY_code/models_dict/cnn_classifier.pth'
+        ),
+    )
+    parser.add_argument(
+        '--load_encoder',
+        type=str,
+        default=None,
+        help=(
+            'Path to a trained encoder checkpoint to load for Phase 2 training. '
+            'Only used when --encoder_distill is False (Phase 2). '
+            'If not set, encoder is initialized randomly.'
         ),
     )
     args = parser.parse_args()
@@ -489,8 +907,8 @@ if __name__ == '__main__':
             args.noise_std = 1.0
         print(f"[INFO] --noise_std not provided; using noise_std={args.noise_std:g} for channel_type={args.channel_type}")
 
-    DEFAULT_TEACHER_STORE_NAME = "teacher/minn_model_teacher"
     DEFAULT_STUDENT_STORE_NAME = "students/minn_model_student"
+    DEFAULT_CNN_CLASSIFIER_PATH = "MY_code/models_dict/cnn_classifier.pth"
 
     def _safe_token(s: str) -> str:
         allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-=")
@@ -504,7 +922,7 @@ if __name__ == '__main__':
         return bool(p) and (p.endswith(("/", "\\")) or (os.path.isdir(p) and os.path.splitext(p)[1] == ""))
 
     def _save_model(*, save_path_arg: str | None, model_store_name: str, suffix: str | None,
-                    encoder, decoder, controller) -> None:
+                    encoder, decoder, controller, encoder_distiller=None) -> None:
         if save_path_arg == "":
             print("[INFO] Skipping model save because --save_path was set to an empty string.")
             return
@@ -516,11 +934,21 @@ if __name__ == '__main__':
         save_dir = os.path.dirname(save_path)
         if save_dir:
             os.makedirs(save_dir, exist_ok=True)
-        torch.save(
-            {'encoder': encoder.state_dict(), 'decoder': decoder.state_dict(), 'controller': controller.state_dict()},
-            save_path,
-        )
-        print(f"[INFO] Model saved to {save_path}")
+
+        # Phase 1 (distillation): Save only encoder
+        if encoder_distiller is not None:
+            torch.save(
+                {'encoder': encoder.state_dict()},
+                save_path,
+            )
+            print(f"[INFO] Encoder (Phase 1) saved to {save_path}")
+        else:
+            # Phase 2: Save full model
+            torch.save(
+                {'encoder': encoder.state_dict(), 'decoder': decoder.state_dict(), 'controller': controller.state_dict()},
+                save_path,
+            )
+            print(f"[INFO] Model (Phase 2) saved to {save_path}")
 
     # If user provided encoder_distill as a list, treat it as a compare run.
     if isinstance(args.encoder_distill, list):
@@ -530,15 +958,50 @@ if __name__ == '__main__':
         # Base value (will be overridden per compare run).
         args.encoder_distill = False
 
-    # Resolve teacher checkpoint path only when distillation is enabled.
-    if args.encoder_distill and (args.teacher_ckpt is None):
-        teacher_store = args.teacher_path or DEFAULT_TEACHER_STORE_NAME
-        args.teacher_ckpt = f"MY_code/models_dict/{teacher_store}.pth"
+    # Resolve CNN classifier path for teacher (only used when distillation is enabled)
+    if args.encoder_distill and (args.teacher_path is None):
+        args.teacher_path = DEFAULT_CNN_CLASSIFIER_PATH
     # Set device
     if args.device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     else:
         device = args.device
+
+    # ===== Classifier training mode =====
+    if args.train_classifier:
+        print("\n=== Training CNN Classifier ===")
+        transform = transforms.Compose([transforms.ToTensor()])
+        train_dataset = datasets.MNIST(root="./data", train=True, transform=transform, download=True)
+        indices = np.random.choice(len(train_dataset), int(args.subset_size), replace=False)
+        train_subset = Subset(train_dataset, indices)
+        train_loader = DataLoader(train_subset, batch_size=int(args.batchsize), shuffle=True)
+
+        classifier = MNISTClassifier(num_classes=10).to(device)
+        print_model_size(classifier, "CNN Classifier")
+
+        history = train_classifier(
+            classifier=classifier,
+            train_loader=train_loader,
+            num_epochs=int(args.epochs),
+            lr=float(args.lr),
+            weight_decay=float(args.weight_decay),
+            device=device,
+            plot_acc=(not args.no_plot_acc),
+            plot_path=args.plot_path if args.plot_path != "" else None,
+            plot_live=args.plot_live,
+            show_plot_end=(not args.no_show_plot_end),
+        )
+
+        # Save classifier
+        classifier_path = args.classifier_path or "MY_code/models_dict/cnn_classifier.pth"
+        save_dir = os.path.dirname(classifier_path)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+        torch.save({'classifier': classifier.state_dict()}, classifier_path)
+        print(f"[INFO] Classifier saved to {classifier_path}")
+
+        raise SystemExit(0)
+
     def _run_one(cfg) -> dict:
         # ===== Data subset =====
         transform = transforms.Compose([transforms.ToTensor()])
@@ -594,25 +1057,47 @@ if __name__ == '__main__':
         decoder = Decoder(n_rx=int(cfg.N_r), n_tx=int(cfg.N_t), n_m=int(cfg.N_m)).to(device)
         encoder = Encoder(int(cfg.N_t)).to(device)
 
-        encoder_distiller = None
-        model_store_name = DEFAULT_TEACHER_STORE_NAME
-        if bool(cfg.encoder_distill):
-            model_store_name = DEFAULT_STUDENT_STORE_NAME
-            teacher_ckpt = cfg.teacher_ckpt
-            if teacher_ckpt is None:
-                teacher_store = cfg.teacher_path or DEFAULT_TEACHER_STORE_NAME
-                teacher_ckpt = f"MY_code/models_dict/{teacher_store}.pth"
-            teacher_encoder = Encoder(int(cfg.N_t)).to(device)
-            ckpt = torch.load(teacher_ckpt, map_location=device)
-            teacher_encoder.load_state_dict(ckpt["encoder"], strict=True)
-            teacher_encoder.eval()
-            for p in teacher_encoder.parameters():
-                p.requires_grad = False
-            encoder_distiller = EncoderFeatureDistiller(
-                teacher_encoder, encoder, pre_relu=True, distill_conv=True, distill_s=True, lambda_conv=1.0, lambda_s=1.0
-            ).to(device)
+        # Load trained encoder for Phase 2 (if specified)
+        if (not bool(cfg.encoder_distill)) and hasattr(cfg, 'load_encoder') and cfg.load_encoder:
+            print(f"[INFO] Loading trained encoder from {cfg.load_encoder} for Phase 2")
+            encoder_ckpt = torch.load(cfg.load_encoder, map_location=device)
+            encoder.load_state_dict(encoder_ckpt["encoder"], strict=True)
+            print("[INFO] Encoder loaded successfully (will be frozen during training)")
 
-        history = train_minn(
+        encoder_distiller = None
+
+        if bool(cfg.encoder_distill):
+            # Phase 1: Train encoder with distillation
+            model_store_name = "encoder_distilled"
+
+            # Load CNN classifier and extract first 2 layers as teacher
+            print("[INFO] Phase 1: Using CNN classifier as teacher for encoder distillation")
+            classifier_ckpt = cfg.teacher_path or DEFAULT_CNN_CLASSIFIER_PATH
+            classifier = MNISTClassifier(num_classes=10)
+            ckpt = torch.load(classifier_ckpt, map_location=device)
+            classifier.load_state_dict(ckpt["classifier"], strict=True)
+            classifier.eval()
+
+            # Extract first 2 layers as teacher
+            teacher_extractor = CNNTeacherExtractor(classifier).to(device)
+
+            # Note: CNN teacher only provides conv features (first 2 layers), not output `s` distillation
+            # So we disable distill_s for CNN teacher
+            encoder_distiller = EncoderFeatureDistiller(
+                teacher_extractor, encoder, pre_relu=True, distill_conv=True, distill_s=False,
+                lambda_conv=1.0, lambda_s=0.0
+            ).to(device)
+            print(f"[INFO] Loaded CNN teacher from {classifier_ckpt}")
+        else:
+            # Phase 2: Train decoder + controller
+            model_store_name = "minn_model_phase2"
+
+        # Choose appropriate training function
+        # Use 2-phase training if encoder_distill is True (phase 1) or if loading encoder (phase 2)
+        use_phase_training = bool(cfg.encoder_distill) or (hasattr(cfg, 'load_encoder') and cfg.load_encoder)
+        train_fn = train_minn_phases if use_phase_training else train_minn
+
+        history = train_fn(
             channel_params,
             encoder,
             decoder,
@@ -641,13 +1126,17 @@ if __name__ == '__main__':
         suffix = None
         if getattr(cfg, "_save_suffix", None):
             suffix = str(cfg._save_suffix)
+
+        # For phase training, save encoder from distiller; otherwise from encoder directly
+        encoder_to_save = encoder_distiller.student if encoder_distiller else encoder
         _save_model(
             save_path_arg=cfg.save_path,
             model_store_name=model_store_name,
             suffix=suffix,
-            encoder=encoder,
+            encoder=encoder_to_save,
             decoder=decoder,
             controller=controller,
+            encoder_distiller=encoder_distiller,
         )
         return history
 
@@ -675,10 +1164,14 @@ if __name__ == '__main__':
                 return int(float(raw))
             if name in {"combine_mode", "fading_type"}:
                 return str(raw)
+            if name in {"load_encoder", "teacher_path", "classifier_path"}:
+                # Handle None/null/empty as actual None, otherwise return the string path
+                return None if raw.lower() in {"none", "null", ""} else str(raw)
             raise ValueError(
                 f"Unsupported compare_arg '{name}'. Supported: combine_mode, fading_type, noise_std, "
                 "lam, k_factor_db, lr, weight_decay, subset_size, batchsize, epochs, channel_sampling_size, N_t, N_r, N_m, "
-                "encoder_distill, cotrl_CSI, channel_type, geo_pathloss_exp, geo_pathloss_gain_db, tx_power_dbm."
+                "encoder_distill, cotrl_CSI, channel_type, geo_pathloss_exp, geo_pathloss_gain_db, tx_power_dbm, "
+                "load_encoder, teacher_path, classifier_path."
             )
 
         # Headless-safe backend when we only save (no show-at-end)
