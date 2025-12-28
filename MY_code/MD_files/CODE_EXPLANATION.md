@@ -1,129 +1,97 @@
-## MNIST MINN Code Explanation (current)
+## MNIST MINN Code Explanation
 
 This document explains the **current** MNIST “MINN / OTA-RIS” pipeline implemented under `MY_code/`.
 
-### Overview (what runs today)
+### Overview
 
-The training/evaluation scripts (`training.py`, `test.py`) implement an end-to-end pipeline:
+The training/evaluation scripts implement an end-to-end communication-and-inference pipeline:
 
-- **Encoder (`flow.py::Encoder`)**: MNIST image → complex transmit vector \(s\) with shape **(B, 1, N_t)** (power-normalized).
-- **Channel (implemented inside `training.py` / `test.py`)**: uses precomputed channel triples \((H_D, H_1, H_2)\) and a **controller-driven metasurface**:
+- **Encoder (`flow.py::Encoder`)**: MNIST image → complex transmit vector \(s\) with shape **(B, 1, N_t)**.
+- **Channel**: Uses precomputed channel triples \((H_D, H_1, H_2)\) from `channel_tensors.py`:
   - **Direct path**: \(y_d = H_D s\)
-  - **Metasurface path**: \(s_{ms} = H_1 s\) → controller predicts per-layer phases → **`Physical_SIM`** applies those phases and fixed SIM propagation → \(y_{ms}\) → \(y_m = H_2 y_{ms}\)
-  - **Combine** with `combine_mode ∈ {direct, metanet, both}`
-  - **Add AWGN once** (complex Gaussian) using `noise_std`
-- **Decoder (`flow.py::Decoder`)**: consumes \(y\) (complex) plus optional \(H_D\) and/or \(H_2\) and outputs logits for 10 classes.
+  - **Metasurface path**: \(s_{ms} = H_1 s\) → controller predicts phases → **`Physical_SIM`** applies phases → \(y_{ms}\) → \(y_m = H_2 y_{ms}\)
+  - **Combine**: Modes include `direct`, `metanet`, or `both`.
+  - **Noise**: AWGN is added at the receiver.
+- **Decoder (`flow.py::Decoder`)**: Consumes received signal \(y\) and optionally CSI (\(H_D, H_2\)) to output classification logits.
 
-Optional: **encoder feature distillation** trains a student encoder from a frozen teacher (`flow.py::EncoderFeatureDistiller`).
+---
 
-### File map (what matters)
+### File Map
 
 ```
 MY_code/
-├── flow.py                 # Encoder/Decoder + controller + physical SIM + (optional) SimRISChannel utilities
-├── channel_tensors.py       # Precompute (H_d, H_1, H_2): synthetic_* or geometric_* channel models
-├── training.py              # Main training CLI (supports compare runs + encoder distillation)
-├── test.py                  # Main evaluation CLI (multi-trial mean±std + comparisons + plotting)
-├── CLI_interface.py         # Small dispatcher (train/test) for IDE convenience
-└── unnecessary/             # Older “article-aligned” scripts kept for reference
+├── flow.py                 # Core models (Encoder, Decoder, Controller, SIM, Teacher)
+├── channel_tensors.py       # Channel generation (Synthetic and Geometric models)
+├── training.py              # Training loops (Staged, 2-Phase, Alternating, Original)
+├── test.py                  # Evaluation (Multi-trial, Comparisons, Plotting)
+├── CLI_interface.py         # Dispatcher for IDE convenience
+├── test_channel_aware_teacher.py # Validation for the channel-aware teacher logic
+└── models_dict/             # Saved model checkpoints (.pth)
 ```
+
+---
+
+### Training Strategies (`training.py`)
+
+The pipeline supports several training methodologies, selectable via CLI flags:
+
+#### 1. Staged Training (Recommended)
+Enabled via `--stage <N>`. Follows a 4-stage procedure:
+- **Stage 1**: Train a standalone `MNISTClassifier` using `--train_classifier`.
+- **Stage 2**: Train the **Encoder** via feature distillation from the Teacher's Layers 1-2.
+- **Stage 3**: Train the **Controller** via feature distillation from the Teacher's Layers 3-4 (matching received signal \(y\) to teacher features).
+- **Stage 4**: Train the **Decoder** while keeping the Encoder and Controller frozen.
+
+#### 2. Two-Phase Training
+- **Phase 1**: Enable `--encoder_distill`. Trains only the student encoder to mimic a frozen teacher.
+- **Phase 2**: Run with `--load_encoder <path>`. Trains the decoder and controller while keeping the encoder frozen.
+
+#### 3. Alternating Training
+Enabled via `--alternating_train`.
+- Each epoch is split: one half trains the Decoder/Controller (frozen Encoder), the other half trains the Encoder (frozen Decoder/Controller).
+
+---
+
+### Channel Models (`channel_tensors.py`)
+
+Select via `--channel_type`:
+- **`synthetic_rayleigh | synthetic_ricean`**: i.i.d. matrices.
+- **`geometric_rayleigh | geometric_ricean`**: Distance-based pathloss and geometry-driven LoS (Ricean).
+  - Key knob: `--geo_pathloss_gain_db` (defaults to 0.0). Increase (e.g., +40 to +80) if signals are too weak for training.
+
+---
+
+### Advanced Features
+
+#### Channel-Aware Teacher
+The teacher `MNISTClassifier` can include an internal `RayleighChannelLayer` during its own training (`--teacher_use_channel`). This forces the teacher to learn features robust to MIMO fading, which the student encoder then inherits during distillation.
+
+#### Controller & Decoder CSI
+- **`Controller_DNN`**: If `--cotrl_CSI True`, it sees \((H_D, H_1, H_2)\). If `False`, it sees only \(H_1\).
+- **`Decoder`**: Can accept \(H_D\) and \(H_2\) as extra inputs to improve inference under varying channels.
+
+---
 
 ### Quickstart (CLI)
 
-Run training:
-
+**Train Teacher (Stage 1):**
 ```bash
-python MY_code/training.py --epochs 5 --subset_size 2000 --combine_mode both
+python MY_code/training.py --train_classifier --epochs 20
 ```
 
-Run testing (randomly sampled MNIST test subsets across multiple trials):
-
+**Staged Training (Stage 2 - Encoder):**
 ```bash
-python MY_code/test.py --checkpoint teacher/minn_model_teacher.pth --num_trials 10 --plot
+python MY_code/training.py --stage 2 --epochs 10 --teacher_path MY_code/models_dict/cnn_classifier.pth
 ```
 
-IDE convenience wrapper:
-
+**Evaluation with Comparison:**
 ```bash
-python MY_code/CLI_interface.py train --epochs 5
-python MY_code/CLI_interface.py test  --checkpoint teacher/minn_model_teacher.pth
+python MY_code/test.py --compare_arg noise_std 1e-6 1e-5 1e-4 --checkpoint my_model.pth --plot
 ```
 
-### Core tensor shapes
+---
 
-- **Images**: `(B, 1, 28, 28)`
-- **Encoder output**: `s ∈ C^(B, 1, N_t)` (complex)
-- **Channels** (precomputed “channel dataset”):
-  - `H_D`: `(C, N_r, N_t)` complex
-  - `H_1`: `(C, N_m, N_t)` complex
-  - `H_2`: `(C, N_r, N_m)` complex
-- **Received**: `y ∈ C^(B, N_r)`
-- **Decoder input**: concatenated real/imag of `y` and (optionally) flattened real/imag of `H_D` / `H_2`
-- **Decoder output**: logits `(B, 10)`
-
-### Channels: synthetic vs geometric (`channel_tensors.py`)
-
-`training.py` and `test.py` call `channel_tensors.generate_channel_tensors_by_type(...)` with:
-
-- **`channel_type=synthetic_rayleigh|synthetic_ricean`**
-  - i.i.d. Rayleigh / Ricean matrices (normalized by \(\sqrt{N_t}\))
-- **`channel_type=geometric_rayleigh|geometric_ricean`**
-  - CODE_EXAMPLE-like geometry: fixed TX/RIS/RX positions + distance-based pathloss + steering-vector LoS (Ricean)
-  - Key knobs:
-    - `--geo_pathloss_exp` (default 2.0)
-    - `--geo_pathloss_gain_db` (default 0.0): **positive reduces attenuation** (often needed to make training feasible)
-
-K-factors (defaults used by the scripts):
-
-- **Direct \(H_D\)**: `--k_factor_db` (default 3 dB)
-- **TX→MS \(H_1\)**: fixed 13 dB in the training/test scripts
-- **MS→RX \(H_2\)**: fixed 7 dB in the training/test scripts
-
-### Metasurface path: controller + physical SIM (`flow.py`)
-
-- **`build_simnet(N_m, lam)`** builds a 3-layer SIM using `CODE_EXAMPLE.simnet`:
-  - `N_m` must be a **perfect square** (layers are \(sqrt(N_m)×sqrt(N_m)\))
-  - In `training.py`/`test.py` the SIM is **fixed** (`requires_grad=False`)
-- **`Controller_DNN`** maps CSI → a list of per-layer phase parameters:
-  - If `--cotrl_CSI True`: controller sees `(H_D, H_1, H_2)`
-  - If `--cotrl_CSI False`: controller sees only `H_1`
-- **`Physical_SIM`** applies per-sample phase profiles without mutating SimNet parameters (safer for autograd than `.data` tricks).
-
-### Training: `training.py::train_minn`
-
-Key mechanics:
-
-- **Channel usage**: channel matrices are precomputed once (size `--channel_sampling_size=C`) and consumed with a cyclic cursor so each minibatch uses different indices.
-- **Transmit power scaling**: `--tx_power_dbm` is converted to Watts and used as a scalar amplitude multiplier on `s` **before** channel application (CODE_EXAMPLE-style).
-- **Pathloss factors**:
-  - The training script currently constructs `chennel_params(path_loss_direct_db=0, path_loss_ms_db=0)` (so effective multipliers are ~1).
-  - Geometric pathloss is handled inside `channel_tensors.py`; if signals are too small, raise `--geo_pathloss_gain_db` and/or lower `--noise_std`.
-- **Loss**:
-  - Base loss is **CrossEntropy** on decoder logits.
-  - If `--encoder_distill` is enabled, adds **feature distillation loss** (MSE on aligned conv features + optional MSE on the complex `s` representation).
-
-### Evaluation: `test.py`
-
-`test.py` reproduces the same forward pipeline as training, but:
-
-- Runs **multiple trials**; each trial samples a random MNIST test subset of size `--subset_size`
-- Reports **mean ± std** accuracy across trials
-- Supports comparisons (single plot summarizing multiple configs):
-  - `--compare_combine_modes ...`
-  - `--compare_noise_stds ...`
-  - `--compare_checkpoints ...`
-  - `--compare_arg <name> <v1> <v2> ...`
-
-### Common pitfalls
-
-- **`N_m` must be a perfect square**: `--N_m 9, 16, 25, 36, ...`
-- **Geometric channels are tiny by default**: if `channel_type` starts with `geometric_`, `training.py`/`test.py` default `noise_std` to `1e-6` (if not provided). If learning stalls:
-  - decrease `--noise_std`
-  - increase `--geo_pathloss_gain_db` (try `+40..+80`)
-- **Device consistency**: always keep tensors/models on the same `--device`. `CODE_EXAMPLE` modules rely on proper module registration; the current training path uses `Physical_SIM` and keeps SIM fixed to avoid device/grad surprises.
-
-### Legacy / reference scripts
-
-Older “article-aligned” utilities live under `MY_code/unnecessary/` (kept for reference; not the main pipeline today):
-
-- `train_article.py`, `evaluate.py`, `reproduce_fig5.py`, `article_config.py`, etc.
+### Common Pitfalls
+- **N_m must be a perfect square**: e.g., 9, 16, 25...
+- **Geometric pathloss**: If training doesn't converge, check if `--noise_std` is too high or `--geo_pathloss_gain_db` is too low.
+- **Device consistency**: Ensure `--device` is consistent across teacher loading and student training.

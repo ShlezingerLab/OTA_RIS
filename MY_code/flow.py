@@ -290,6 +290,105 @@ class ChannelPool:
         H_batch = torch.stack([channels[i] for i in idx], dim=0)
         return H_batch
 
+
+class RayleighChannelLayer(nn.Module):
+    """
+    Rayleigh fading channel layer for CNN feature maps.
+
+    Applies MIMO Rayleigh fading to intermediate CNN features to force
+    the network to learn channel-robust representations.
+
+    Operation:
+    - Input: (B, C, H, W) real-valued feature maps
+    - Per spatial location (h, w), treat C channels as antennas
+    - Apply (C, C) complex Rayleigh MIMO channel
+    - Add complex Gaussian noise
+    - Output: (B, C, H, W) real-valued (magnitude or real part)
+
+    Args:
+        num_channels: Number of input channels (C)
+        noise_std: Standard deviation of AWGN (default: 1e-2 for ~20 dB SNR)
+        output_mode: 'real' (real part only) or 'magnitude' (absolute value)
+    """
+
+    def __init__(
+        self,
+        num_channels: int,
+        noise_std: float = 1e-2,
+        output_mode: str = "magnitude",
+    ):
+        super().__init__()
+        self.num_channels = num_channels
+        self.noise_std = noise_std
+        self.output_mode = output_mode
+
+        if output_mode not in ["real", "magnitude"]:
+            raise ValueError(f"output_mode must be 'real' or 'magnitude', got '{output_mode}'")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply Rayleigh fading channel to feature maps.
+
+        Args:
+            x: Input features (B, C, H, W)
+
+        Returns:
+            y: Output features (B, C, H, W)
+        """
+        B, C, H, W = x.shape
+        device = x.device
+
+        # Convert real features to complex (treat as real part)
+        x_complex = x.to(torch.complex64)  # (B, C, H, W)
+
+        # Reshape to (B, H, W, C) for easier per-location processing
+        x_complex = x_complex.permute(0, 2, 3, 1)  # (B, H, W, C)
+
+        # Generate Rayleigh channel matrix (C, C) - same for all spatial locations in this batch
+        # For simplicity and efficiency, use a single channel matrix per sample
+        # H_rayleigh: (B, C, C) complex
+        H_real = torch.randn(B, C, C, device=device) / math.sqrt(2)
+        H_imag = torch.randn(B, C, C, device=device) / math.sqrt(2)
+        H_rayleigh = torch.complex(H_real, H_imag)
+
+        # Normalize by sqrt(C) for power conservation
+        H_rayleigh = H_rayleigh / math.sqrt(C)
+
+        # Apply channel: y = H @ x for each spatial location
+        # x_complex: (B, H, W, C), we need to apply (B, C, C) @ (B, C) for each (h,w)
+        # Reshape x_complex to (B*H*W, C, 1) for batch matmul
+        x_flat = x_complex.reshape(B * H * W, C, 1)  # (B*H*W, C, 1)
+
+        # Expand H_rayleigh to match spatial dimensions
+        # We'll apply the same H to all spatial locations, then reshape
+        # Repeat H for each spatial location: (B, C, C) -> (B*H*W, C, C)
+        H_expanded = H_rayleigh.unsqueeze(1).unsqueeze(1).repeat(1, H, W, 1, 1)  # (B, H, W, C, C)
+        H_expanded = H_expanded.reshape(B * H * W, C, C)  # (B*H*W, C, C)
+
+        # Matrix multiplication: (B*H*W, C, C) @ (B*H*W, C, 1) -> (B*H*W, C, 1)
+        y_flat = torch.bmm(H_expanded, x_flat)  # (B*H*W, C, 1)
+
+        # Add complex Gaussian noise
+        noise_real = torch.randn_like(y_flat.real) * self.noise_std
+        noise_imag = torch.randn_like(y_flat.imag) * self.noise_std
+        noise = torch.complex(noise_real, noise_imag)
+        y_flat = y_flat + noise
+
+        # Reshape back to (B, H, W, C)
+        y_complex = y_flat.reshape(B, H, W, C)
+
+        # Permute back to (B, C, H, W)
+        y_complex = y_complex.permute(0, 3, 1, 2)  # (B, C, H, W)
+
+        # Convert to real output
+        if self.output_mode == "magnitude":
+            y = torch.abs(y_complex)  # Magnitude
+        else:  # "real"
+            y = y_complex.real  # Real part only
+
+        return y
+
+
 class Encoder(nn.Module):
     """
     MNIST encoder used by the MINN training loop.
@@ -1176,6 +1275,28 @@ class chennel_params():
         self.path_loss_direct = 10 ** (-path_loss_direct_db / 20.0)  # Convert dB to linear scale
         self.path_loss_ms = 10 ** (-path_loss_ms_db / 20.0)  # Convert dB to linear scale
 
+class SignalToFeatureConnector(nn.Module):
+    """
+    Map complex received signal y (B, Nr) to teacher features (B, C, H, W).
+    Used in Stage 3 to distill teacher's later layers into the controller-guided channel output.
+    """
+    def __init__(self, n_r: int, target_channels: int, target_h: int, target_w: int):
+        super().__init__()
+        # Input size is 2 * n_r (real + imag)
+        self.fc = nn.Sequential(
+            nn.Linear(2 * n_r, 512),
+            nn.ReLU(),
+            nn.Linear(512, target_channels * target_h * target_w),
+        )
+        self.target_shape = (target_channels, target_h, target_w)
+
+    def forward(self, y: torch.Tensor) -> torch.Tensor:
+        # y is complex (B, Nr)
+        y_ri = torch.cat([y.real, y.imag], dim=-1)
+        out = self.fc(y_ri)
+        return out.view(-1, *self.target_shape)
+
+
 class FeatureConnector(nn.Module):
     """
     Align student features to teacher features.
@@ -1251,6 +1372,7 @@ class MNISTClassifier(nn.Module):
     Architecture:
     - Conv1: 1 -> 32 channels (3x3 kernel, stride 1, padding 1)
     - Conv2: 32 -> 64 channels (3x3 kernel, stride 1, padding 1) + MaxPool
+    - [OPTIONAL] RayleighChannelLayer (if use_channel=True)
     - Conv3: 64 -> 128 channels (3x3 kernel, stride 1, padding 1)
     - Conv4: 128 -> 256 channels (3x3 kernel, stride 1, padding 1) + MaxPool
     - Conv5: 256 -> 512 channels (3x3 kernel, stride 1, padding 1)
@@ -1258,11 +1380,24 @@ class MNISTClassifier(nn.Module):
 
     Input: (batch, 1, 28, 28)
     Output: (batch, 10) logits
+
+    Args:
+        num_classes: Number of output classes (default: 10)
+        use_channel: If True, insert Rayleigh channel layer after Layer 2
+        channel_noise_std: Noise level for channel layer (default: 1e-2)
+        channel_output_mode: 'magnitude' or 'real' for channel layer output
     """
 
-    def __init__(self, num_classes: int = 10):
+    def __init__(
+        self,
+        num_classes: int = 10,
+        use_channel: bool = False,
+        channel_noise_std: float = 1e-2,
+        channel_output_mode: str = "magnitude",
+    ):
         super().__init__()
         self.num_classes = num_classes
+        self.use_channel = use_channel
 
         # Layer 1: 1 -> 32
         self.conv1 = nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1)
@@ -1274,6 +1409,16 @@ class MNISTClassifier(nn.Module):
         self.bn2 = nn.BatchNorm2d(64)
         self.relu2 = nn.ReLU()
         self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)  # 28x28 -> 14x14
+
+        # Optional channel layer (inserted between Layer 2 and Layer 3)
+        if use_channel:
+            self.channel_layer = RayleighChannelLayer(
+                num_channels=64,
+                noise_std=channel_noise_std,
+                output_mode=channel_output_mode,
+            )
+        else:
+            self.channel_layer = None
 
         # Layer 3: 64 -> 128
         self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
@@ -1319,6 +1464,10 @@ class MNISTClassifier(nn.Module):
         x = self.relu2(x)
         x = self.pool2(x)
 
+        # Optional channel layer
+        if self.channel_layer is not None:
+            x = self.channel_layer(x)
+
         # Layer 3
         x = self.conv3(x)
         x = self.bn3(x)
@@ -1347,14 +1496,14 @@ class MNISTClassifier(nn.Module):
 
     def extract_features(self, x: torch.Tensor, preReLU: bool = True):
         """
-        Extract intermediate features from first 2 conv layers.
+        Extract intermediate features from first 5 conv layers.
 
         Args:
             x: Input tensor (batch, 1, 28, 28)
             preReLU: If True, return features before ReLU; otherwise after ReLU
 
         Returns:
-            feats: List of 2 feature tensors [feat1, feat2]
+            feats: List of 5 feature tensors [feat1, feat2, feat3, feat4, feat5]
             output: Final classifier output (batch, num_classes)
         """
         feats = []
@@ -1368,24 +1517,38 @@ class MNISTClassifier(nn.Module):
         # Layer 2 + pool
         x = self.conv2(x)
         x = self.bn2(x)
-        feats.append(x if preReLU else self.relu2(x))
+        x_out = x if preReLU else self.relu2(x)
         x = self.relu2(x)
         x = self.pool2(x)
 
-        # Continue with remaining layers
+        # Optional channel layer (applied during feature extraction for distillation)
+        if self.channel_layer is not None:
+            x = self.channel_layer(x)
+
+        # Append second feature AFTER pooling and optional channel (aligns with extractor)
+        feats.append(x)
+
+        # Layer 3
         x = self.conv3(x)
         x = self.bn3(x)
+        feats.append(x if preReLU else self.relu3(x))
         x = self.relu3(x)
 
+        # Layer 4 + pool
         x = self.conv4(x)
         x = self.bn4(x)
+        x_out_4 = x if preReLU else self.relu4(x)
         x = self.relu4(x)
         x = self.pool4(x)
+        feats.append(x) # post pool for layer 4
 
+        # Layer 5
         x = self.conv5(x)
         x = self.bn5(x)
+        feats.append(x if preReLU else self.relu5(x))
         x = self.relu5(x)
 
+        # Classifier
         x = self.global_pool(x)
         x = x.view(x.size(0), -1)
         x = self.fc1(x)
@@ -1403,6 +1566,9 @@ class CNNTeacherExtractor(nn.Module):
 
     This class wraps the first 2 conv layers of the classifier and provides
     a compatible interface with EncoderFeatureDistiller.
+
+    If the classifier has a channel layer, it is included and applied during
+    feature extraction so the student learns from channel-robust features.
     """
 
     def __init__(self, classifier: MNISTClassifier):
@@ -1414,6 +1580,10 @@ class CNNTeacherExtractor(nn.Module):
         self.conv2 = classifier.conv2
         self.bn2 = classifier.bn2
         self.relu2 = classifier.relu2
+        self.pool2 = classifier.pool2
+
+        # Include channel layer if present in the classifier
+        self.channel_layer = classifier.channel_layer if hasattr(classifier, 'channel_layer') else None
 
         # Freeze all parameters
         for param in self.parameters():
@@ -1424,6 +1594,9 @@ class CNNTeacherExtractor(nn.Module):
     def extract_feature(self, x: torch.Tensor, preReLU: bool = True):
         """
         Extract features from first 2 conv layers.
+
+        If classifier has a channel layer, it is applied to the features so
+        the student learns channel-robust representations.
 
         Args:
             x: Input tensor (batch, 1, 28, 28)
@@ -1441,10 +1614,21 @@ class CNNTeacherExtractor(nn.Module):
         feats.append(x1 if preReLU else self.relu1(x1))
         x1 = self.relu1(x1)
 
-        # Layer 2
+        # Layer 2 + pool
         x2 = self.conv2(x1)
         x2 = self.bn2(x2)
-        feats.append(x2 if preReLU else self.relu2(x2))
+        # Store pre-channel version of x2 if needed, but for now we want student to mimic post-channel features
+        x2_out = x2 if preReLU else self.relu2(x2)
+        x2_pool = self.pool2(x2_out)
+
+        # Apply channel layer if present (FIX A: Student mimics robust features)
+        if self.channel_layer is not None:
+            # Apply channel to the feature map
+            x2_final = self.channel_layer(x2_pool)
+        else:
+            x2_final = x2_pool
+
+        feats.append(x2_final)
 
         # Return dummy output to match encoder interface
         # EncoderFeatureDistiller expects (feats, output), but we only use feats
@@ -1460,6 +1644,48 @@ class CNNTeacherExtractor(nn.Module):
         """Forward pass (not used for distillation, just for compatibility)."""
         feats, _ = self.extract_feature(x, preReLU=True)
         return feats[-1]
+
+
+class ControllerDistiller(nn.Module):
+    """
+    Distillation wrapper for Stage 3: Train Controller using Teacher Layers 3 & 4.
+    Matches the received signal y (post-channel) to teacher features.
+    """
+    def __init__(self, teacher: MNISTClassifier, n_r: int, layer_configs: list[tuple[int, int, int]]):
+        super().__init__()
+        self.teacher = teacher
+        # layer_configs should be [(channels, h, w), ...] for target layers
+        self.connectors = nn.ModuleList([
+            SignalToFeatureConnector(n_r, *cfg) for cfg in layer_configs
+        ])
+
+        # Freeze teacher
+        for p in self.teacher.parameters():
+            p.requires_grad = False
+        self.teacher.eval()
+
+    def forward(self, images: torch.Tensor, y_received: torch.Tensor, layer_indices: list[int] = [2, 3]):
+        """
+        Compute distillation loss between received signal and teacher features.
+
+        Args:
+            images: Input images (B, 1, 28, 28)
+            y_received: Complex received signal (B, Nr)
+            layer_indices: Indices of features in teacher.extract_features() to match.
+                           Default [2, 3] corresponds to Layers 3 and 4.
+        """
+        with torch.no_grad():
+            t_feats, _ = self.teacher.extract_features(images, preReLU=True)
+
+        loss_distill = 0
+        for i, idx in enumerate(layer_indices):
+            # Target teacher feature
+            t_feat = t_feats[idx]
+            # Map y to same space
+            y_mapped = self.connectors[i](y_received)
+            loss_distill += F.mse_loss(y_mapped, t_feat)
+
+        return loss_distill
 
 
 class EncoderFeatureDistiller(nn.Module):

@@ -35,7 +35,7 @@ def resolve_checkpoint_path(checkpoint_path: str) -> str:
     Convenience path resolution:
     - Absolute paths are returned as-is.
     - Paths already starting with 'MY_code/models_dict/' are returned as-is.
-    - Otherwise, treat as relative to 'MY_code/models_dict/' (e.g. 'teacher/x.pth').
+    - Otherwise, treat as relative to 'MY_code/models_dict/' (e.g. 'x.pth').
     """
     if not checkpoint_path:
         return checkpoint_path
@@ -51,17 +51,14 @@ def label_from_checkpoint_path(checkpoint_path: str) -> str:
     """
     Short, readable label for plots.
     Example:
-      MY_code/models_dict/teacher/minn_model_teacher_x.pth -> teacher/minn_model_teacher_x
+      MY_code/models_dict/minn_model_teacher_x.pth -> minn_model_teacher_x
     """
     p = checkpoint_path.replace("\\", "/")
     if p.startswith("MY_code/models_dict/"):
         p = p[len("MY_code/models_dict/"):]
-    # Keep one directory of context (teacher/... or students/...)
-    parent = os.path.basename(os.path.dirname(p))
+    # Return just the filename without extension
     base = os.path.basename(p)
     root, _ext = os.path.splitext(base)
-    if parent and parent not in {".", ""}:
-        return f"{parent}/{root}"
     return root
 
 
@@ -433,7 +430,7 @@ def main(argv=None):
         default=None,
         help=(
             "If set, evaluate each checkpoint listed and plot them together. "
-            "Each value may be absolute, 'MY_code/models_dict/...', or relative like 'teacher/x.pth'."
+            "Each value may be absolute, 'MY_code/models_dict/...', or relative like 'x.pth'."
         ),
     )
     parser.add_argument(
@@ -442,7 +439,7 @@ def main(argv=None):
         default=None,
         help=(
             "Generic comparison: provide an argument name followed by values. "
-            "Example: --compare_arg noise_std 1e-6 1e-5 1e-4  OR  --compare_arg checkpoint teacher/a.pth teacher/b.pth. "
+            "Example: --compare_arg noise_std 1e-6 1e-5 1e-4  OR  --compare_arg checkpoint a.pth b.pth. "
             "This is mutually exclusive with --compare_combine_modes/--compare_noise_stds/--compare_checkpoints."
         ),
     )

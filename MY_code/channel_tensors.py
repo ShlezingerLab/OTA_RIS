@@ -175,7 +175,7 @@ def _ULA_steering_vector(tx_position: np.ndarray, rx_position: np.ndarray, num_a
     n = np.arange(int(num_antennas), dtype=float)
     theta, _phi = _ray_to_elevation_azimuth(tx_position, rx_position)
     cos_theta = math.cos(theta)
-    a = np.exp(-1j * 2.0 * math.pi * n * float(elem_dist) * cos_theta / float(wavelength))
+    a = np.exp(-1j * 2.0 * math.pi * n * float(elem_dist) * math.cos(theta) / float(wavelength))
     if normalized:
         denom = np.linalg.norm(np.absolute(a))
         if denom > 0:
@@ -263,7 +263,7 @@ def _mimo_geometric_channel(
     kappa = _k_linear_from_db(ricean_factor_db)
     tx_sv = tx_resp(np.asarray(tx_position), np.asarray(rx_position), int(n_tx_antennas), tx_elem_spacing, wavelength, True)
     rx_sv = rx_resp(np.asarray(rx_position), np.asarray(tx_position), int(n_rx_antennas), rx_elem_spacing, wavelength, True)
-    a = np.outer(tx_sv, rx_sv) * math.sqrt(float(n_tx_antennas) * float(n_rx_antennas))
+    a = np.outer(tx_sv.conj(), rx_sv) * math.sqrt(float(n_tx_antennas) * float(n_rx_antennas))
     los = math.sqrt(kappa / (kappa + 1.0)) * a
     nlos_scaled = math.sqrt(1.0 / (kappa + 1.0)) * nlos
     h = math.sqrt(pl) * (los + nlos_scaled)

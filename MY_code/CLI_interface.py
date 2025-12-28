@@ -40,78 +40,79 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     IDE_COMMAND = "train"
-    # Example sweep:
-    #   "--N_t": [10, 15]
-    # Example multi-value:
-    #   "--compare_combine_modes": ("direct", "metanet", "both")
+    IDE_TRAIN_STAGE = 2  # 0: CNN, 1: Encoder, 2: Controller, 3: Decoder, 4: E2E, 5: Debug (Enc+Dec)
+
     IDE_TRAIN_ARGS: dict[str, object] = {
-        # === Apples-to-apples vs CODE_EXAMPLE (RIS) ===
-        # Dimensions (CODE_EXAMPLE/Metasurfaces_Integrated_Neural_Networks_codebase/parameters.py)
         "--N_t": 8,    # Nt
         "--N_r": 12,   # Nr
-        "--N_m": 64,   # N = 8*8 RIS elements
-        # Training budget (CODE_EXAMPLE Training.*)
-        "--subset_size":1000 ,          # 60000
-        "--batchsize":100 ,            #256
-        "--epochs": 15 ,               #400
+        "--N_m": 64,
+        "--subset_size": 1000,          # 60000
+        "--batchsize": 100,            # 256
         "--channel_sampling_size": 100,  # 10000
-        "--lr": 1e-4,
+        "--lr": 1e-3,
         "--weight_decay": 1e-7,
-        # RIS target: y = y_direct + y_ris (cascaded)
         "--metasurface_type": "ris",
-        "--combine_mode": "both",
+        "--combine_mode": "metanet",
         "--cotrl_CSI": True,
         "--channel_type": "geometric_ricean",
-        # Defaults (when not explicitly provided on the CLI):
-        # - noise_std: None => auto
-        #     - geometric_* => 1e-6 (matches CODE_EXAMPLE: noise_sigma_sq = -90 dBm => noise_std ~= 1e-6)
-        #     - synthetic_* => 1.0 (legacy behavior)
-        # - geo_pathloss_exp: 2.0
-        # - geo_pathloss_gain_db: 0.0  (set +40..+80 to mitigate harsh 28 GHz pathloss for easier training)
-        # - k_factor_db: 3.0 (direct link; H1/H2 use 13/7 inside training.py)
         "--noise_std":  1e-6,
-        #TODO: understand this section, and why geo_pathloss_gain_db so important
-        # Transmit power (CODE_EXAMPLE-style): scales the transmitted vector `s` before the channel.
-        # 30 dBm = 1 W.
-        "--tx_power_dbm": 30.0,
+        "--tx_power_dbm": 30.0, # 30 dBm = 1 W
         "--geo_pathloss_exp": 2.0,
-        "--geo_pathloss_gain_db": 60.0, #TODO: It has to be ~60
+        "--geo_pathloss_gain_db": 70.0, # TODO: It has to be ~60
         "--k_factor_db": 3.0,  # direct-link K-factor in dB (H1/H2 use 13/7 inside training.py)
-        #"--save_path": "MY_code/models_dict/minn_model_code_example_ris_like.pth",
-        #"--plot_path": "MY_code/plots/minn_model_code_example_ris_like.png",
-        #"--plot_live": True,
-
-        # === 0-Phase Training Workflow with CNN Teacher ===
-        # Uses train_minn_phases() for cleaner phase separation
-
-        # Phase 0: Train CNN classifier to use as teacher (run once)
-        #"--train_classifier": True,
-        #"--classifier_path": "MY_code/models_dict/cnn_classifier.pth",
-        #"--epochs": 20,
-        #"--subset_size": 10000,
-
-        # Phase 1: Train encoder ONLY with CNN teacher (uses train_minn_phases)
-        # "--encoder_distill": True,
-        # "--teacher_path": "MY_code/models_dict/cnn_classifier.pth",
-        # "--save_path": "MY_code/models_dict/encoder_distilled.pth",
-        # "--epochs": 200,
-
-        # COMPARISON: Phase 2 (with encoder) vs Standard (end-to-end)
-        "--encoder_distill": False,
-        "--load_encoder": ["MY_code/models_dict/encoder_distilled.pth", None],
-        # First run: Phase 2 with frozen pre-trained encoder (train_minn_phases)
-        # Second run: Standard end-to-end training (train_minn)
-        # Generates comparison plot showing both approaches
-        #"--save_path": "MY_code/models_dict/minn_model_phase2.pth",
-        "--epochs": 30,
+        "--epochs": 150,
     }
 
+    # Select the stage configuration based on IDE_TRAIN_STAGE
+    STAGED_CONFIGS = {
+        0: { # PHASE 0: Train CNN Classifier (Teacher)
+            "--train_classifier": True,
+            # #"--teacher_use_channel": True,
+            # #"--teacher_channel_output_mode": "magnitude",
+            # #"--teacher_channel_noise_std": 1e-2,
+            "--classifier_path": "models_dict/cnn_classifier_teacher.pth",
+            "--plot_path": "plots/phase0_cnn.png",
+        },
+        1: { # PHASE 1: Train Encoder via Distillation (Stage 2)
+            "--stage": 2,
+            "--teacher_path": "models_dict/cnn_classifier_teacher.pth",
+            "--save_path": "models_dict/phase1_encoder.pth",
+            "--plot_path": "plots/phase1_encoder.png",
+        },
+        2: { # PHASE 2: Train Controller via Distillation (Stage 3)
+            "--stage": 3,
+            "--teacher_path": "models_dict/cnn_classifier_teacher.pth",
+            "--load_path": "models_dict/phase1_encoder.pth",
+            "--save_path": "models_dict/phase2_ctrl.pth",
+            "--plot_path": "plots/phase2_ctrl.png",
+        },
+        3: { # PHASE 3: Train Decoder (Stage 4)
+            "--stage": 4,
+            "--load_path": "models_dict/phase2_ctrl.pth",
+            "--save_path": "models_dict/phase3_decoder.pth",
+            "--plot_path": "plots/phase3_decoder.png",
+        },
+        5: { # NEW: Phase 4: Debug mode - Train Encoder and Decoder (Controller frozen)
+            "--stage": 5,
+            "--load_path": "models_dict/phase2_ctrl.pth",
+            "--save_path": "models_dict/phase4_debug.pth",
+            "--plot_path": "plots/phase4_debug.png",
+        },
+        4: { # Default / End-to-End training
+            "--encoder_distill": False,
+            "--plot_path": "plots/E2E.png",
+        }
+    }
+
+    if IDE_TRAIN_STAGE in STAGED_CONFIGS:
+        IDE_TRAIN_ARGS.update(STAGED_CONFIGS[IDE_TRAIN_STAGE])
+######################################################################
     IDE_TEST_ARGS: dict[str, object] = {
         "--compare_checkpoints": (
-            "teacher/minn_model_teacher_encoder_distill=False.pth",
-            "students/minn_model_student_encoder_distill=True.pth",
+            "minn_model_teacher_encoder_distill=False.pth",
+            "minn_model_student_encoder_distill=True.pth",
         ),
-        #"--checkpoint": "teacher/minn_model_teacher_fading_type=rayleigh_meta.pth",
+        #"--checkpoint": "minn_model_teacher_fading_type=rayleigh_meta.pth",
         "--num_trials": 10,
         "--subset_size": 1000,
         "--batchsize": 100,
@@ -124,7 +125,7 @@ if __name__ == "__main__":
         "--noise_std": 1,
         "--channel_type": "geometric_ricean",
         "--k_factor_db": 3.0,
-        "--plot_path": "MY_code/plots/test_summary_1.png",
+        "--plot_path": "plots/test_summary_1.png",
     }
 
     def _safe_token(s: str) -> str:
@@ -170,25 +171,14 @@ if __name__ == "__main__":
         """
         if not p:
             return p
-        norm = p.replace("\\", "/")
-        if _is_abs_path(p) or norm.startswith("MY_code/models_dict/"):
-            return p
-        return os.path.join("MY_code", "models_dict", p)
+        if not os.path.isabs(p):
+            # Prepend the script's directory for relative paths
+            here = os.path.dirname(os.path.abspath(__file__))
+            return os.path.join(here, "models_dict", p)
+        return p
 
-    def _role_subdir_for_train(arg_dict: dict[str, object]) -> str:
-        """
-        Per user convention:
-          - teacher when encoder distillation is disabled
-          - students when enabled
-          - compare when encoder_distill is provided as a list (compare mode)
-        """
-        v = arg_dict.get("--encoder_distill")
-        if isinstance(v, list):
-            return "compare"
-        return "students" if bool(v) else "teacher"
-
-    DEFAULT_CNN_CLASSIFIER_PATH = "MY_code/models_dict/cnn_classifier.pth"
-    DEFAULT_STUDENT_STORE_NAME = "students/minn_model_student"
+    DEFAULT_CNN_CLASSIFIER_PATH = "models_dict/cnn_classifier.pth"
+    DEFAULT_STUDENT_STORE_NAME = "minn_model_student"
     DEFAULT_BASE_MODEL_STORE_NAME = "minn_model"
 
     def _default_teacher_path_for_fd(arg_dict: dict[str, object]) -> str:
@@ -198,6 +188,11 @@ if __name__ == "__main__":
         return str(v) if isinstance(v, str) and v else DEFAULT_CNN_CLASSIFIER_PATH
 
     def _model_store_name_for_save(arg_dict: dict[str, object]) -> str:
+        # If staged training is enabled, use stage name
+        stage = arg_dict.get("--stage")
+        if stage is not None:
+            return f"minn_model_stage{stage}"
+
         # Save student model when distilling; save base model when not distilling.
         v = arg_dict.get("--encoder_distill")
         # If it's a list, we are in "compare" intent; default to student naming so users don't overwrite base by accident.
@@ -212,11 +207,18 @@ if __name__ == "__main__":
         sweep_val: object | None,
     ) -> str:
         """
-        If save_path is a directory (e.g. 'MY_code/models_dict/'), save under:
-          {save_dir}/{teacher|minn_model_teacher}.pth   (no FD)
-          {save_dir}/{students|minn_model_student}.pth (FD)
+        If save_path is a directory, save under:
+          {save_dir}/{minn_model|minn_model_student}.pth
         Otherwise, treat it as a file path and (optionally) suffix it.
         """
+        if save_path_value == "":
+            return ""
+
+        if not os.path.isabs(save_path_value):
+            # Prepend the script's directory for relative paths
+            here = os.path.dirname(os.path.abspath(__file__))
+            save_path_value = os.path.join(here, save_path_value)
+
         if _is_dir_like_path(save_path_value):
             store_name = _model_store_name_for_save(arg_dict)
             resolved = os.path.join(save_path_value, f"{store_name}.pth")
@@ -234,27 +236,21 @@ if __name__ == "__main__":
         sweep_val: object | None,
     ) -> str:
         """
-        Resolve plot_path into a teacher/students subdir (based on --encoder_distill), and
-        apply sweep suffixing when needed.
-
-        Examples:
-          MY_code/plots/training_curves.png
-            -> MY_code/plots/teacher/training_curves_N_r=8.png
-          MY_code/plots/
-            -> MY_code/plots/teacher/training_curves_N_r=8.png
+        Resolve plot_path into a full path, and apply sweep suffixing when needed.
         """
         if plot_path_value == "":
             return ""
 
-        role = _role_subdir_for_train(arg_dict)
+        if not os.path.isabs(plot_path_value):
+            # Prepend the script's directory for relative paths
+            here = os.path.dirname(os.path.abspath(__file__))
+            plot_path_value = os.path.join(here, plot_path_value)
 
         if _is_dir_like_path(plot_path_value):
             # Directory intent: use a default filename.
-            resolved = os.path.join(plot_path_value, role, "training_curves.png")
+            resolved = os.path.join(plot_path_value, "training_curves.png")
         else:
-            d = os.path.dirname(plot_path_value) or "."
-            b = os.path.basename(plot_path_value)
-            resolved = os.path.join(d, role, b)
+            resolved = plot_path_value
 
         if sweep_key is not None:
             resolved = _suffix_save_path(resolved, sweep_key, sweep_val)
@@ -267,17 +263,30 @@ if __name__ == "__main__":
         default_filename: str,
     ) -> str:
         """
-        Resolve plot_path without adding teacher/students subdirs; used for IDE_TEST_ARGS.
+        Resolve plot_path without adding subdirs; used for IDE_TEST_ARGS.
         Only adds a filename if plot_path is directory-like, and applies sweep suffixing.
         """
         if plot_path_value == "":
             return ""
+
+        if not os.path.isabs(plot_path_value):
+            # Prepend the script's directory for relative paths
+            here = os.path.dirname(os.path.abspath(__file__))
+            plot_path_value = os.path.join(here, plot_path_value)
+
         resolved = plot_path_value
         if _is_dir_like_path(resolved):
             resolved = os.path.join(resolved, default_filename)
         if sweep_key is not None:
             resolved = _suffix_save_path(resolved, sweep_key, sweep_val)
         return resolved
+
+    def _resolve_generic_path(p: str) -> str:
+        if not p or os.path.isabs(p):
+            return p
+        # Prepend the script's directory for relative paths
+        here = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(here, p)
 
     def _build_cli_runs(
         arg_dict: dict[str, object],
@@ -297,10 +306,15 @@ if __name__ == "__main__":
             compare_vals: list[object] | None,
         ) -> bool:
             """
-            Determine whether encoder distillation should be considered enabled for:
-              - teacher_path injection
-              - role-based plot/save path resolution
+            Determine whether encoder distillation should be considered enabled for teacher_path injection.
             """
+            # Check for stages 2 and 3 (Distillation stages)
+            stage_val = arg_dict.get("--stage")
+            if isinstance(stage_val, list):
+                if any(v in [2, 3] for v in stage_val): return True
+            elif stage_val in [2, 3]:
+                return True
+
             raw = arg_dict.get("--encoder_distill")
             if isinstance(raw, list):
                 # Collapsed compare run: treat as enabled if ANY compared value is truthy.
@@ -384,7 +398,7 @@ if __name__ == "__main__":
                 compare_vals=compare_vals,
             ):
                 if "--teacher_path" not in arg_dict:
-                    args += ["--teacher_path", _default_teacher_path_for_fd(arg_dict_run)]
+                    args += ["--teacher_path", _resolve_generic_path(_default_teacher_path_for_fd(arg_dict_run))]
             else:
                 # Ensure we do not pass teacher_path when not distilling (treat as None).
                 # (If it was accidentally present in the dict, remove it from the args list.)
@@ -392,6 +406,15 @@ if __name__ == "__main__":
                     try:
                         i = args.index("--teacher_path")
                         del args[i:i+2]
+                    except Exception:
+                        pass
+
+            # Resolve other common path arguments to absolute paths
+            for path_arg in ["--teacher_path", "--load_path", "--classifier_path"]:
+                if path_arg in args:
+                    try:
+                        idx = args.index(path_arg)
+                        args[idx + 1] = _resolve_generic_path(args[idx + 1])
                     except Exception:
                         pass
 
@@ -456,7 +479,7 @@ if __name__ == "__main__":
                     except Exception:
                         pass
             else:
-                # No sweep: still resolve directory-style save_path into teacher/students + default filename.
+                # No sweep: still resolve directory-style save_path into default filename.
                 if "--save_path" in arg_dict and isinstance(arg_dict.get("--save_path"), str):
                     try:
                         i = args.index("--save_path")
@@ -464,17 +487,17 @@ if __name__ == "__main__":
                         args[i + 1] = _resolve_train_save_path(base, arg_dict_run, None, None)
                     except Exception:
                         pass
-                # No sweep: resolve plot_path (train: add role subdir; test: keep path, but support dir-like values).
-                if "--plot_path" in arg_dict and isinstance(arg_dict.get("--plot_path"), str):
-                    try:
-                        i = args.index("--plot_path")
-                        base = args[i + 1]
-                        if plot_role_subdir:
-                            args[i + 1] = _resolve_train_plot_path(base, arg_dict_run, None, None)
-                        else:
-                            args[i + 1] = _resolve_plain_plot_path(base, None, None, default_plot_filename)
-                    except Exception:
-                        pass
+            # No sweep: resolve plot_path (train: support dir-like values; test: support dir-like values).
+            if "--plot_path" in arg_dict and isinstance(arg_dict.get("--plot_path"), str):
+                try:
+                    i = args.index("--plot_path")
+                    base = args[i + 1]
+                    if plot_role_subdir:
+                        args[i + 1] = _resolve_train_plot_path(base, arg_dict_run, None, None)
+                    else:
+                        args[i + 1] = _resolve_plain_plot_path(base, None, None, default_plot_filename)
+                except Exception:
+                    pass
 
             runs.append(args)
         return runs
