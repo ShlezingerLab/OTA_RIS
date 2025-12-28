@@ -40,7 +40,7 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     IDE_COMMAND = "train"
-    IDE_TRAIN_STAGE = 2  # 0: CNN, 1: Encoder, 2: Controller, 3: Decoder, 4: E2E, 5: Debug (Enc+Dec)
+    IDE_TRAIN_STAGE = 5  # 0: CNN, 1: Encoder, 2: Controller, 3: Decoder, 4: E2E, 5: Debug (Enc+Dec)
 
     IDE_TRAIN_ARGS: dict[str, object] = {
         "--N_t": 8,    # Nt
@@ -84,7 +84,9 @@ if __name__ == "__main__":
             "--teacher_path": "models_dict/cnn_classifier_teacher.pth",
             "--load_path": "models_dict/phase1_encoder.pth",
             "--save_path": "models_dict/phase2_ctrl.pth",
-            "--plot_path": "plots/phase2_ctrl.png",
+            "--grad_approx": True, # Toggle here to use gradient approximation
+            "--grad_approx_sigma": 0.1,
+            "--plot_path": "plots/phase2_ctrl_app.png",
         },
         3: { # PHASE 3: Train Decoder (Stage 4)
             "--stage": 4,

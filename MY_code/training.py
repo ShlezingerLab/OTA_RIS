@@ -621,7 +621,8 @@ def train_minn_staged(channel, encoder, decoder, controller, physical_sim, train
                       encoder_distiller: EncoderFeatureDistiller | None = None,
                       controller_distiller: ControllerDistiller | None = None,
                       tx_power_dbm=30.0, metasurface_type="sim",
-                      plot_acc=False, plot_path=None, plot_live=False, show_plot_end=True):
+                      plot_acc=False, plot_path=None, plot_live=False, show_plot_end=True,
+                      grad_approx: bool = False, grad_approx_sigma: float = 0.1):
     """
     STAGED training loop for the 4-stage procedure:
     Stage 2: Train Encoder via distillation from Teacher Layers 1-2.
@@ -769,11 +770,28 @@ def train_minn_staged(channel, encoder, decoder, controller, physical_sim, train
                 else:
                     theta_list = controller(H_1=H_1)
 
+                # STOCHASTIC RELAXATION (if enabled for Stage 3)
+                log_probs = None
+                if stage == 3 and grad_approx:
+                    sampled_theta_list = []
+                    log_probs = 0
+                    for theta_mean in theta_list:
+                        # Dist: N(theta_mean, grad_approx_sigma^2)
+                        dist = torch.distributions.Normal(theta_mean, grad_approx_sigma)
+                        theta_sampled = dist.sample() # Sampling theta = theta_mean + sigma * z
+                        log_p = dist.log_prob(theta_sampled).sum(dim=-1)
+                        log_probs = log_probs + log_p #create gaussian vector distribution
+                        # Detach sampled theta to block standard gradient from physical_sim
+                        sampled_theta_list.append(theta_sampled.detach())
+                    theta_list_for_phys = sampled_theta_list
+                else:
+                    theta_list_for_phys = theta_list
+
                 ms_type = str(metasurface_type).lower()
                 if ms_type == "sim":
-                    y_ms = physical_sim(s_ms, theta_list)
+                    y_ms = physical_sim(s_ms, theta_list_for_phys)
                 elif ms_type == "ris":
-                    theta = theta_list[0]
+                    theta = theta_list_for_phys[0]
                     phi = torch.exp(-1j * theta)
                     y_ms = s_ms * phi
                 y_metanet = torch.matmul(H_2_eff, y_ms.unsqueeze(-1)).squeeze(-1)
@@ -790,14 +808,32 @@ def train_minn_staged(channel, encoder, decoder, controller, physical_sim, train
 
             if stage == 3:
                 # Distillation Loss for Stage 3
-                loss_fd = controller_distiller(images, y)
-                loss = loss_fd
+                if grad_approx:
+                    # REINFORCE gradient estimate for controller
+                    # 1. Distiller loss per sample (reduction='none')
+                    loss_fd_per_sample = controller_distiller(images, y, reduction='none')
+
+                    # 2. Surrogate loss for controller: E[L.detach() * log_prob]
+                    # We want to minimize E[L], so the gradient is E[L * grad log pi]
+                    loss_policy = (loss_fd_per_sample.detach() * log_probs).mean()
+
+                    # 3. Connector loss (standard backprop)
+                    loss_connectors = loss_fd_per_sample.mean()
+
+                    # Total surrogate loss
+                    loss = loss_connectors + loss_policy
+
+                    running_fd += loss_connectors.item()
+                else:
+                    loss_fd = controller_distiller(images, y)
+                    loss = loss_fd
+                    running_fd += loss_fd.item()
+
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
                 running_loss += loss.item()
-                running_fd += loss_fd.item()
-                pbar.set_postfix({'loss_fd': f"{loss_fd.item():.4f}"})
+                pbar.set_postfix({'loss_fd': f"{loss.item():.4f}"})
             else: # stage == 4 or stage == 5
                 # Classification Loss for Stage 4 & 5
                 if combine_mode == "direct": logits = decoder(y, H_D=H_D_eff)
@@ -1356,6 +1392,8 @@ if __name__ == '__main__':
     )
     # Training configuration
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
+    parser.add_argument('--grad_approx', action='store_true', help='Use gradient approximation (REINFORCE) for controller training in Stage 3')
+    parser.add_argument('--grad_approx_sigma', type=float, default=0.1, help='Sigma (noise std) for gradient approximation stochastic relaxation')
     parser.add_argument('--weight_decay', type=float, default=0, help='Weight decay for optimizer')
     parser.add_argument('--device', type=str, default=None, help='Device to use (cuda/cpu). If None, auto-detect')
     parser.add_argument('--save_path', type=str, default=None,
@@ -1745,12 +1783,6 @@ if __name__ == '__main__':
                     # Layer configs for teacher layers 3 and 4: (channels, h, w)
                     layer_configs = [(128, 14, 14), (256, 7, 7)]
                     controller_distiller = ControllerDistiller(teacher, int(cfg.N_r), layer_configs).to(device)
-
-            train_fn = train_minn_staged
-            extra_kwargs = {
-                "stage": stage,
-                "controller_distiller": controller_distiller,
-            }
         elif bool(cfg.encoder_distill):
             # Phase 1: Train encoder with distillation (Legacy path)
             model_store_name = "encoder_distilled"
@@ -1808,6 +1840,8 @@ if __name__ == '__main__':
             train_fn = train_minn_staged
             extra_kwargs["stage"] = int(cfg.stage)
             extra_kwargs["controller_distiller"] = controller_distiller
+            extra_kwargs["grad_approx"] = bool(getattr(cfg, "grad_approx", False))
+            extra_kwargs["grad_approx_sigma"] = float(getattr(cfg, "grad_approx_sigma", 0.1))
         elif getattr(cfg, "alternating_train", False):
             train_fn = train_minn_alter
             print("[INFO] Using alternating training strategy (0.5 epoch per phase)")
@@ -1869,7 +1903,7 @@ if __name__ == '__main__':
         values = [str(v) for v in args.compare_arg[1:]]
 
         def _cast(name: str, raw: str):
-            if name in {"encoder_distill", "cotrl_CSI", "alternating_train"}:
+            if name in {"encoder_distill", "cotrl_CSI", "alternating_train", "grad_approx"}:
                 return _parse_bool(raw)
             if name in {"channel_type"}:
                 return str(raw)
@@ -1877,7 +1911,7 @@ if __name__ == '__main__':
                 return float(raw)
             if name in {"tx_power_dbm"}:
                 return float(raw)
-            if name in {"noise_std", "lam", "k_factor_db", "lr", "weight_decay"}:
+            if name in {"noise_std", "lam", "k_factor_db", "lr", "weight_decay", "grad_approx_sigma"}:
                 return float(raw)
             if name in {"subset_size", "batchsize", "epochs", "channel_sampling_size", "N_t", "N_r", "N_m", "stage"}:
                 return int(float(raw))
@@ -1890,7 +1924,7 @@ if __name__ == '__main__':
                 f"Unsupported compare_arg '{name}'. Supported: combine_mode, fading_type, noise_std, "
                 "lam, k_factor_db, lr, weight_decay, subset_size, batchsize, epochs, channel_sampling_size, N_t, N_r, N_m, "
                 "encoder_distill, cotrl_CSI, channel_type, geo_pathloss_exp, geo_pathloss_gain_db, tx_power_dbm, "
-                "load_encoder, teacher_path, classifier_path, stage, load_path."
+                "load_encoder, teacher_path, classifier_path, stage, load_path, grad_approx, grad_approx_sigma."
             )
 
         # Headless-safe backend when we only save (no show-at-end)

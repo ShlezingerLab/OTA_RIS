@@ -1664,7 +1664,7 @@ class ControllerDistiller(nn.Module):
             p.requires_grad = False
         self.teacher.eval()
 
-    def forward(self, images: torch.Tensor, y_received: torch.Tensor, layer_indices: list[int] = [2, 3]):
+    def forward(self, images: torch.Tensor, y_received: torch.Tensor, layer_indices: list[int] = [2, 3], reduction: str = 'mean'):
         """
         Compute distillation loss between received signal and teacher features.
 
@@ -1673,6 +1673,7 @@ class ControllerDistiller(nn.Module):
             y_received: Complex received signal (B, Nr)
             layer_indices: Indices of features in teacher.extract_features() to match.
                            Default [2, 3] corresponds to Layers 3 and 4.
+            reduction: 'mean' or 'none'. If 'none', returns loss per sample (B,).
         """
         with torch.no_grad():
             t_feats, _ = self.teacher.extract_features(images, preReLU=True)
@@ -1683,8 +1684,15 @@ class ControllerDistiller(nn.Module):
             t_feat = t_feats[idx]
             # Map y to same space
             y_mapped = self.connectors[i](y_received)
-            loss_distill += F.mse_loss(y_mapped, t_feat)
 
+            # F.mse_loss with reduction='none' returns (B, C, H, W)
+            l = F.mse_loss(y_mapped, t_feat, reduction='none')
+            # Reduce over all dims except batch
+            l = l.view(l.size(0), -1).mean(dim=1)
+            loss_distill += l
+
+        if reduction == 'mean':
+            return loss_distill.mean()
         return loss_distill
 
 
