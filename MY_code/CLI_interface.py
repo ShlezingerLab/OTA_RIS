@@ -40,7 +40,7 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     IDE_COMMAND = "train"
-    IDE_TRAIN_STAGE = 5  # 0: CNN, 1: Encoder, 2: Controller, 3: Decoder, 4: E2E, 5: Debug (Enc+Dec)
+    IDE_TRAIN_STAGE = 6  # 1: Encoder, 2: Controller, 3: Decoder, 4: E2E, 5: Debug (Enc+Dec), 6: Full (4+1-3)
 
     IDE_TRAIN_ARGS: dict[str, object] = {
         "--N_t": 8,    # Nt
@@ -58,9 +58,9 @@ if __name__ == "__main__":
         "--noise_std":  1e-6,
         "--tx_power_dbm": 30.0, # 30 dBm = 1 W
         "--geo_pathloss_exp": 2.0,
-        "--geo_pathloss_gain_db": 70.0, # TODO: It has to be ~60
+        "--geo_pathloss_gain_db": 60.0, # TODO: It has to be ~60
         "--k_factor_db": 3.0,  # direct-link K-factor in dB (H1/H2 use 13/7 inside training.py)
-        "--epochs": 150,
+        "--epochs": 30,
     }
 
     # Select the stage configuration based on IDE_TRAIN_STAGE
@@ -102,7 +102,8 @@ if __name__ == "__main__":
         },
         4: { # Default / End-to-End training
             "--encoder_distill": False,
-            "--plot_path": "plots/E2E.png",
+            "--save_path": "models_dict/phase4_e2e.pth",
+            "--plot_path": "plots/phase4_e2e.png",
         }
     }
 
@@ -506,54 +507,76 @@ if __name__ == "__main__":
 
     argv = sys.argv[1:]
     if not argv:
-        config = IDE_TRAIN_ARGS if IDE_COMMAND == "train" else IDE_TEST_ARGS
-
-        # Special case: classifier training mode - use simple arg passing
-        # Check if --train_classifier is True (not a list for comparison)
-        train_classifier_val = config.get("--train_classifier")
-        if train_classifier_val is True or (isinstance(train_classifier_val, list) and any(train_classifier_val)):
-            if isinstance(train_classifier_val, list):
-                print("[WARNING] --train_classifier should be True (not a list). Using first truthy value.")
-                # For lists, we'll just run with the first truthy value
-                config = dict(config)
-                config["--train_classifier"] = next((v for v in train_classifier_val if v), True)
-
-            simple_args = []
-            for k, v in config.items():
-                if v is None or v is False:
-                    continue
-                if k == "--train_classifier" and v is True:
-                    simple_args.append("--train_classifier")
-                    continue
-                if isinstance(v, bool):
-                    if v:
-                        simple_args.append(k)
-                    continue
-                if isinstance(v, tuple):
-                    simple_args.append(k)
-                    simple_args += [str(x) for x in v]
-                    continue
-                if isinstance(v, list):
-                    # Skip lists in classifier mode (not supported)
-                    continue
-                simple_args += [k, str(v)]
-            rc = main([IDE_COMMAND, *simple_args])
-            raise SystemExit(rc)
+        # Determine which stages to run
+        if IDE_COMMAND == "train" and IDE_TRAIN_STAGE == 6:
+            stages_to_run = [4, 1, 2, 3]  # E2E -> Enc Distill -> Ctrl Distill -> Decoder
+        else:
+            stages_to_run = [IDE_TRAIN_STAGE]
 
         rc = 0
-        for run_args in _build_cli_runs(
-            config,
-            disable_default_plot_path=(IDE_COMMAND == "train"),
-            disable_default_save_path=(IDE_COMMAND == "train"),
-            plot_implies_show=(IDE_COMMAND == "test"),
-            plot_role_subdir=(IDE_COMMAND == "train"),
-            default_plot_filename=("training_curves.png" if IDE_COMMAND == "train" else "test_summary.png"),
-            checkpoint_is_under_models_dict=(IDE_COMMAND == "test"),
-            collapse_sweep_to_compare_arg=(IDE_COMMAND in {"test", "train"}),
-        ):
-            rc = main([IDE_COMMAND, *run_args])
+        for stage in stages_to_run:
+            print(f"\n>>> [IDE] Starting Training Stage: {stage} ...")
+
+            # Re-initialize config for this specific stage
+            config = dict(IDE_TRAIN_ARGS)
+            if stage in STAGED_CONFIGS:
+                config.update(STAGED_CONFIGS[stage])
+            elif IDE_COMMAND == "test":
+                config = IDE_TEST_ARGS
+
+            # Special case for Stage 6: use E2E encoder as teacher for Phase 1
+            if IDE_TRAIN_STAGE == 6 and stage == 1:
+                print("[IDE] Stage 6: Injecting E2E model as teacher for Phase 1 distillation")
+                config["--teacher_path"] = "models_dict/phase4_e2e.pth"
+
+            # Special case: classifier training mode (Stage 0)
+            train_classifier_val = config.get("--train_classifier")
+            if train_classifier_val is True or (isinstance(train_classifier_val, list) and any(train_classifier_val)):
+                if isinstance(train_classifier_val, list):
+                    print("[WARNING] --train_classifier should be True (not a list). Using first truthy value.")
+                    config = dict(config)
+                    config["--train_classifier"] = next((v for v in train_classifier_val if v), True)
+
+                simple_args = []
+                for k, v in config.items():
+                    if v is None or v is False:
+                        continue
+                    if k == "--train_classifier" and v is True:
+                        simple_args.append("--train_classifier")
+                        continue
+                    if isinstance(v, bool):
+                        if v:
+                            simple_args.append(k)
+                        continue
+                    if isinstance(v, tuple):
+                        simple_args.append(k)
+                        simple_args += [str(x) for x in v]
+                        continue
+                    if isinstance(v, list):
+                        continue
+                    simple_args += [k, str(v)]
+
+                rc = main([IDE_COMMAND, *simple_args])
+            else:
+                # Normal staged or E2E training
+                for run_args in _build_cli_runs(
+                    config,
+                    disable_default_plot_path=(IDE_COMMAND == "train"),
+                    disable_default_save_path=(IDE_COMMAND == "train"),
+                    plot_implies_show=(IDE_COMMAND == "test"),
+                    plot_role_subdir=(IDE_COMMAND == "train"),
+                    default_plot_filename=("training_curves.png" if IDE_COMMAND == "train" else "test_summary.png"),
+                    checkpoint_is_under_models_dict=(IDE_COMMAND == "test"),
+                    collapse_sweep_to_compare_arg=(IDE_COMMAND in {"test", "train"}),
+                ):
+                    rc = main([IDE_COMMAND, *run_args])
+                    if rc != 0:
+                        break
+
             if rc != 0:
+                print(f"[ERROR] Stage {stage} failed with exit code {rc}. Aborting.")
                 break
+
         raise SystemExit(rc)
 
     raise SystemExit(main(argv))

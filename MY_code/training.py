@@ -1763,26 +1763,57 @@ if __name__ == '__main__':
 
             # Setup teacher/distillers for stages 2 and 3
             if stage in [2, 3]:
-                classifier_ckpt = cfg.teacher_path or DEFAULT_CNN_CLASSIFIER_PATH
-                if not os.path.exists(classifier_ckpt):
-                    raise RuntimeError(f"Teacher model not found at {classifier_ckpt}. Run Stage 1 (train_classifier) first.")
+                teacher_ckpt_path = cfg.teacher_path or DEFAULT_CNN_CLASSIFIER_PATH
+                if not os.path.exists(teacher_ckpt_path):
+                    raise RuntimeError(f"Teacher model not found at {teacher_ckpt_path}. Run Stage 1 (train_classifier) first.")
 
                 # Load teacher
-                teacher = MNISTClassifier(num_classes=10, use_channel=False).to(device)
-                teacher_ckpt = torch.load(classifier_ckpt, map_location=device)
-                teacher.load_state_dict(teacher_ckpt["classifier"], strict=False)
-                teacher.eval()
+                teacher_ckpt = torch.load(teacher_ckpt_path, map_location=device)
 
-                if stage == 2:
-                    extractor = CNNTeacherExtractor(teacher).to(device)
-                    encoder_distiller = EncoderFeatureDistiller(
-                        extractor, encoder, pre_relu=True, distill_conv=True, distill_s=False
-                    ).to(device)
+                if "classifier" in teacher_ckpt:
+                    # Traditional CNN teacher
+                    teacher_model = MNISTClassifier(num_classes=10, use_channel=False).to(device)
+                    teacher_model.load_state_dict(teacher_ckpt["classifier"], strict=False)
+                    teacher_model.eval()
 
-                if stage == 3:
-                    # Layer configs for teacher layers 3 and 4: (channels, h, w)
-                    layer_configs = [(128, 14, 14), (256, 7, 7)]
-                    controller_distiller = ControllerDistiller(teacher, int(cfg.N_r), layer_configs).to(device)
+                    if stage == 2:
+                        teacher_extractor = CNNTeacherExtractor(teacher_model).to(device)
+                        encoder_distiller = EncoderFeatureDistiller(
+                            teacher_extractor, encoder, pre_relu=True, distill_conv=True, distill_s=False
+                        ).to(device)
+
+                    if stage == 3:
+                        layer_configs = [(128, 14, 14), (256, 7, 7)]
+                        controller_distiller = ControllerDistiller(teacher_model, int(cfg.N_r), layer_configs).to(device)
+
+                elif "encoder" in teacher_ckpt:
+                    # E2E Encoder as teacher (Stage 2 only)
+                    print(f"[INFO] Stage {stage}: Using E2E encoder from {teacher_ckpt_path} as teacher")
+                    teacher_encoder = Encoder(Nt=int(cfg.N_t)).to(device)
+                    teacher_encoder.load_state_dict(teacher_ckpt["encoder"], strict=False)
+                    teacher_encoder.eval()
+
+                    if stage == 2:
+                        # Direct Encoder-to-Encoder distillation
+                        encoder_distiller = EncoderFeatureDistiller(
+                            teacher_encoder, encoder, pre_relu=True, distill_conv=True, distill_s=True
+                        ).to(device)
+
+                    if stage == 3:
+                        # Controller distillation still needs a classifier for high-level target features
+                        print(f"[WARNING] E2E checkpoint used for Stage 3 teacher. Controller distillation requires an MNISTClassifier teacher for target features.")
+                        if os.path.exists(DEFAULT_CNN_CLASSIFIER_PATH):
+                            print(f"[INFO] Falling back to {DEFAULT_CNN_CLASSIFIER_PATH} for Stage 3 teacher features.")
+                            fallback_ckpt = torch.load(DEFAULT_CNN_CLASSIFIER_PATH, map_location=device)
+                            teacher_model = MNISTClassifier(num_classes=10, use_channel=False).to(device)
+                            teacher_model.load_state_dict(fallback_ckpt["classifier"], strict=False)
+                            teacher_model.eval()
+                            layer_configs = [(128, 14, 14), (256, 7, 7)]
+                            controller_distiller = ControllerDistiller(teacher_model, int(cfg.N_r), layer_configs).to(device)
+                        else:
+                            raise RuntimeError(f"E2E checkpoint cannot be used for Stage 3 (Controller) distillation, and no default CNN teacher found at {DEFAULT_CNN_CLASSIFIER_PATH}")
+                else:
+                    raise RuntimeError(f"Unknown checkpoint format at {teacher_ckpt_path}. Expected 'classifier' or 'encoder' key.")
         elif bool(cfg.encoder_distill):
             # Phase 1: Train encoder with distillation (Legacy path)
             model_store_name = "encoder_distilled"

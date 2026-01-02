@@ -24,7 +24,7 @@ MY_code/
 ├── channel_tensors.py       # Channel generation (Synthetic and Geometric models)
 ├── training.py              # Training loops (Staged, 2-Phase, Alternating, Original)
 ├── test.py                  # Evaluation (Multi-trial, Comparisons, Plotting)
-├── CLI_interface.py         # Dispatcher for IDE convenience
+├── CLI_interface.py         # Automated dispatcher and IDE convenience
 ├── test_channel_aware_teacher.py # Validation for the channel-aware teacher logic
 └── models_dict/             # Saved model checkpoints (.pth)
 ```
@@ -49,6 +49,12 @@ Enabled via `--stage <N>`. Follows a 4-stage procedure:
 #### 3. Alternating Training
 Enabled via `--alternating_train`.
 - Each epoch is split: one half trains the Decoder/Controller (frozen Encoder), the other half trains the Encoder (frozen Decoder/Controller).
+
+#### 4. Automated Multi-Stage Training (`CLI_interface.py`)
+Provides a high-level wrapper to run sequential phases automatically:
+- **Phase 0**: Train Teacher (Stage 1).
+- **Phase 4-1-3 (Improved Pipeline)**: Runs E2E training (Stage 4), then uses the resulting encoder as a teacher for Phase 1 distillation, followed by Phase 2 (Controller) and Phase 3 (Decoder). This approach solves the feature mismatch problem (see [TEACHER_ANALYSIS.md](TEACHER_ANALYSIS.md)).
+- Configure via `IDE_TRAIN_STAGE = 6` in `CLI_interface.py`.
 
 ---
 
@@ -87,6 +93,13 @@ python MY_code/training.py --stage 2 --epochs 10 --teacher_path MY_code/models_d
 **Evaluation with Comparison:**
 ```bash
 python MY_code/test.py --compare_arg noise_std 1e-6 1e-5 1e-4 --checkpoint my_model.pth --plot
+```
+
+**Automated Full Pipeline (Phases 1-3):**
+1. Set `IDE_TRAIN_STAGE = 6` in `MY_code/CLI_interface.py`.
+2. Run:
+```bash
+python MY_code/CLI_interface.py
 ```
 
 ---
