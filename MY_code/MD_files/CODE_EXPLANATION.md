@@ -19,14 +19,16 @@ The training/evaluation scripts implement an end-to-end communication-and-infere
 ### File Map
 
 ```
-MY_code/
-├── flow.py                 # Core models (Encoder, Decoder, Controller, SIM, Teacher)
-├── channel_tensors.py       # Channel generation (Synthetic and Geometric models)
-├── training.py              # Training loops (Staged, 2-Phase, Alternating, Original)
-├── test.py                  # Evaluation (Multi-trial, Comparisons, Plotting)
-├── CLI_interface.py         # Automated dispatcher and IDE convenience
-├── test_channel_aware_teacher.py # Validation for the channel-aware teacher logic
-└── models_dict/             # Saved model checkpoints (.pth)
+OTA_RIS/
+├── CLI_interface.py         # Automated dispatcher and IDE convenience (Entry point)
+├── playground.py            # Simple legacy entry point
+└── MY_code/
+    ├── flow.py              # Core models (Encoder, Decoder, Controller, SIM, Teacher)
+    ├── channel_tensors.py    # Channel generation (Synthetic and Geometric models)
+    ├── training.py           # Training loops (Staged, 2-Phase, Alternating, Original)
+    ├── test.py               # Evaluation (Multi-trial, Comparisons, Plotting)
+    ├── test_channel_aware_teacher.py # Validation logic
+    └── models_dict/          # Saved model checkpoints (.pth)
 ```
 
 ---
@@ -36,25 +38,38 @@ MY_code/
 The pipeline supports several training methodologies, selectable via CLI flags:
 
 #### 1. Staged Training (Recommended)
-Enabled via `--stage <N>`. Follows a 4-stage procedure:
-- **Stage 1**: Train a standalone `MNISTClassifier` using `--train_classifier`.
-- **Stage 2**: Train the **Encoder** via feature distillation from the Teacher's Layers 1-2.
-- **Stage 3**: Train the **Controller** via feature distillation from the Teacher's Layers 3-4 (matching received signal \(y\) to teacher features).
-- **Stage 4**: Train the **Decoder** while keeping the Encoder and Controller frozen.
+Enabled via `--stage <N>`. Follows a 4-phase procedure (0-3):
+- **Stage 0**: Train a standalone `MNISTClassifier` (Teacher) using `--train_classifier`.
+- **Stage 1**: Train the **Encoder** via feature distillation from the Teacher's early layers. Uses `--save_encoder`.
+- **Stage 2**: Train the **Controller** via feature distillation from the Teacher's late layers. Uses `--load_encoder` and `--save_ctrl`.
+- **Stage 3**: Train the **Decoder** while keeping the Encoder and Controller frozen. Uses `--load_encoder`, `--load_ctrl`, and `--save_decoder`. *Note: Stage 3 can combine encoders and controllers trained from different teacher types (e.g., CNN-based encoder with E2E-based controller).*
 
-#### 2. Two-Phase Training
+#### 2. Automated Full Pipeline (`CLI_interface.py`)
+
+Provides a high-level wrapper to run sequential phases automatically:
+- **Phase 0**: Train Teacher(s). Now supports training multiple teacher types (`cnn`, `e2e`, `e2e_proxy`) in a single execution by setting a list in `teacher_type_train`.
+- **Multi-Teacher Combinations**: Can run Stages 1-3 for multiple combinations of encoder/controller teachers. For example, if you set a list of types for `encoder_teacher_type` and `controller_teacher_type`, the script will iterate through all combinations.
+- **Automatic Suffixing**: Checkpoints and plots are automatically suffixed (e.g., `_enc=e2e_ctrl=cnn.pth`) to prevent overwriting during multi-run sweeps.
+- **Combined Stage 3 Plots**: When running multiple teacher combinations, Stage 3 automatically collapses them into a single run using `--compare_arg` to produce a single comparison plot (`*_comparison.png`).
+- **Full Run (Stages 1-3)**: Runs the complete distillation-based pipeline sequentially.
+- Configure via `IDE_TRAIN_STAGE = 4` in `CLI_interface.py`.
+
+#### 3. Two-Phase Training (Legacy)
 - **Phase 1**: Enable `--encoder_distill`. Trains only the student encoder to mimic a frozen teacher.
 - **Phase 2**: Run with `--load_encoder <path>`. Trains the decoder and controller while keeping the encoder frozen.
 
-#### 3. Alternating Training
+#### 4. Alternating Training (Experimental)
 Enabled via `--alternating_train`.
 - Each epoch is split: one half trains the Decoder/Controller (frozen Encoder), the other half trains the Encoder (frozen Decoder/Controller).
 
-#### 4. Automated Multi-Stage Training (`CLI_interface.py`)
-Provides a high-level wrapper to run sequential phases automatically:
-- **Phase 0**: Train Teacher (Stage 1).
-- **Phase 4-1-3 (Improved Pipeline)**: Runs E2E training (Stage 4), then uses the resulting encoder as a teacher for Phase 1 distillation, followed by Phase 2 (Controller) and Phase 3 (Decoder). This approach solves the feature mismatch problem (see [TEACHER_ANALYSIS.md](TEACHER_ANALYSIS.md)).
-- Configure via `IDE_TRAIN_STAGE = 6` in `CLI_interface.py`.
+---
+
+### Teacher Types
+
+The pipeline currently supports three main teacher paradigms for distillation:
+1. **`cnn`**: A standard MNIST CNN classifier. Features are distilled from its intermediate layers.
+2. **`e2e`**: An end-to-end model trained without distillation. The student mimics its learned communication/classification features.
+3. **`e2e_proxy`**: A variant of the E2E model (often using a proxy or simplified channel during its own training) used as a teacher for more complex deployment scenarios.
 
 ---
 
@@ -70,24 +85,26 @@ Select via `--channel_type`:
 ### Advanced Features
 
 #### Channel-Aware Teacher
-The teacher `MNISTClassifier` can include an internal `RayleighChannelLayer` during its own training (`--teacher_use_channel`). This forces the teacher to learn features robust to MIMO fading, which the student encoder then inherits during distillation.
+The teacher `MNISTClassifier` can include internal `RayleighChannelLayer`s during its own training (`--teacher_use_channel`). It utilizes a **multi-layer** approach, inserting fading layers after the first two and first four convolution blocks. This forces the teacher to learn features robust to MIMO fading and noise, which the student encoder and controller then inherit during distillation.
 
-#### Controller & Decoder CSI
-- **`Controller_DNN`**: If `--cotrl_CSI True`, it sees \((H_D, H_1, H_2)\). If `False`, it sees only \(H_1\).
+#### Controller & Decoder CSI / Signal
+- **`Controller_DNN`**:
+  - **CSI**: If `--cotrl_CSI True`, it sees \((H_D, H_1, H_2)\). If `False`, it sees only \(H_1\).
+  - **Signal**: If `--cotrl_signal True`, it also receives the transmit signal at the metasurface \(s_{ms}\) as input. This allows the controller to optimize phases based on the actual content being transmitted, not just the channel.
 - **`Decoder`**: Can accept \(H_D\) and \(H_2\) as extra inputs to improve inference under varying channels.
 
 ---
 
 ### Quickstart (CLI)
 
-**Train Teacher (Stage 1):**
+**Train Robust Teacher (Stage 0):**
 ```bash
-python MY_code/training.py --train_classifier --epochs 20
+python MY_code/training.py --train_classifier --epochs 20 --teacher_use_channel --teacher_channel_noise_std 0.1
 ```
 
-**Staged Training (Stage 2 - Encoder):**
+**Staged Training (Stage 1 - Encoder):**
 ```bash
-python MY_code/training.py --stage 2 --epochs 10 --teacher_path MY_code/models_dict/cnn_classifier.pth
+python MY_code/training.py --stage 1 --epochs 10 --teacher_path MY_code/models_dict/cnn_classifier.pth --save_encoder models_dict/phase1_encoder.pth
 ```
 
 **Evaluation with Comparison:**
@@ -95,11 +112,11 @@ python MY_code/training.py --stage 2 --epochs 10 --teacher_path MY_code/models_d
 python MY_code/test.py --compare_arg noise_std 1e-6 1e-5 1e-4 --checkpoint my_model.pth --plot
 ```
 
-**Automated Full Pipeline (Phases 1-3):**
-1. Set `IDE_TRAIN_STAGE = 6` in `MY_code/CLI_interface.py`.
+**Automated Full Pipeline (Stages 1-3):**
+1. Set `IDE_TRAIN_STAGE = 4` in `CLI_interface.py`.
 2. Run:
 ```bash
-python MY_code/CLI_interface.py
+python CLI_interface.py
 ```
 
 ---

@@ -22,6 +22,7 @@ from flow import (  # noqa: E402
     Physical_SIM,
     build_simnet,
     chennel_params,
+    PowerfulDecoder,
 )
 from channel_tensors import generate_channel_tensors_by_type  # noqa: E402
 
@@ -126,6 +127,8 @@ def build_models(
     lam: float,
     device: str,
     cotrl_CSI: bool,
+    cotrl_signal: bool = False,
+    decoder_type: str = "base",
 ) -> tuple[Encoder, Decoder, Controller_DNN, Physical_SIM]:
     """
     Rebuild encoder/decoder/controller/SIM stack exactly as in MNIST/training.py.
@@ -145,9 +148,15 @@ def build_models(
         n_ms=N_m,
         layer_sizes=layer_sizes,
         ctrl_full_csi=bool(cotrl_CSI),
+        cotrl_signal=bool(cotrl_signal),
     ).to(device)
     encoder = Encoder(N_t).to(device)
-    decoder = Decoder(n_rx=N_r, n_tx=N_t, n_m=N_m).to(device)
+
+    dec_type = str(decoder_type).lower()
+    if dec_type == "powerful":
+        decoder = PowerfulDecoder(n_rx=N_r, n_tx=N_t, n_m=N_m).to(device)
+    else:
+        decoder = Decoder(n_rx=N_r, n_tx=N_t, n_m=N_m).to(device)
 
     return encoder, decoder, controller, physical_sim
 
@@ -276,7 +285,13 @@ def evaluate_one_trial(
                 # Signal at metasurface
                 s_ms = torch.matmul(H_1, s_c.transpose(1, 2)).transpose(1, 2).squeeze()  # (batch, N_ms)
                 # Controller: CSI -> per-layer phases
-                if getattr(controller, "ctrl_full_csi", True):
+                if getattr(controller, "cotrl_signal", False):
+                    # Signal input requested
+                    if getattr(controller, "ctrl_full_csi", True):
+                        theta_list = controller(H_1=H_1, H_D=H_D_eff, H_2=H_2_eff, s_ms=s_ms)
+                    else:
+                        theta_list = controller(H_1=H_1, s_ms=s_ms)
+                elif getattr(controller, "ctrl_full_csi", True):
                     theta_list = controller(H_1=H_1, H_D=H_D_eff, H_2=H_2_eff)
                 else:
                     theta_list = controller(H_1=H_1)
@@ -365,6 +380,21 @@ def main(argv=None):
             "If True: controller observes full CSI (H_D, H_1, H_2). "
             "If False: controller observes only H_1."
         ),
+    )
+    parser.add_argument(
+        "--cotrl_signal",
+        nargs="?",
+        const=True,
+        default=False,
+        type=lambda x: str(x).lower() in {"1", "true", "t", "yes", "y", "on"},
+        help="Whether to pass the transmit signal s_ms as input to the controller DNN.",
+    )
+    parser.add_argument(
+        "--decoder_type",
+        type=str,
+        choices=["base", "powerful"],
+        default="base",
+        help="Decoder architecture type: base or powerful.",
     )
     # For geometric channels at 28 GHz with distance-based pathloss, magnitudes are tiny; default noise_std
     # must be tiny as well, otherwise SNR collapses and nothing is learnable.
@@ -588,7 +618,7 @@ def main(argv=None):
                 return float(raw)
             if name in {"subset_size", "num_trials", "batchsize", "N_t", "N_r", "N_m", "channel_sampling_size"}:
                 return int(float(raw))
-            if name in {"combine_mode", "fading_type", "device"}:
+            if name in {"combine_mode", "fading_type", "device", "decoder_type"}:
                 return str(raw)
             if name in {"checkpoint"}:
                 return resolve_checkpoint_path(str(raw))
@@ -648,6 +678,8 @@ def main(argv=None):
                 lam=float(cfg.lam),
                 device=device,
                 cotrl_CSI=bool(getattr(cfg, "cotrl_CSI", True)),
+                cotrl_signal=bool(getattr(cfg, "cotrl_signal", False)),
+                decoder_type=str(getattr(cfg, "decoder_type", "base")),
             )
             maybe_load_checkpoint(
                 encoder=encoder_i,
@@ -699,6 +731,8 @@ def main(argv=None):
                 lam=args.lam,
                 device=device,
                 cotrl_CSI=bool(getattr(args, "cotrl_CSI", True)),
+                cotrl_signal=bool(getattr(args, "cotrl_signal", False)),
+                decoder_type=str(getattr(args, "decoder_type", "base")),
             )
             maybe_load_checkpoint(
                 encoder=encoder_i,
@@ -728,6 +762,8 @@ def main(argv=None):
             lam=args.lam,
             device=device,
             cotrl_CSI=bool(getattr(args, "cotrl_CSI", True)),
+            cotrl_signal=bool(getattr(args, "cotrl_signal", False)),
+            decoder_type=str(getattr(args, "decoder_type", "base")),
         )
         maybe_load_checkpoint(
             encoder=encoder,

@@ -213,7 +213,13 @@ metasurface_type: str = "sim"):
             if combine_mode in ["metanet", "both"]:
                 # (batch, N_ms, N_t) @ (batch, N_t, 1) -> (batch, N_ms, 1) -> (batch, N_ms)
                 s_ms = torch.matmul(H_1, s_c.transpose(1, 2)).squeeze(-1)
-                if getattr(controller, "ctrl_full_csi", True):
+                if getattr(controller, "cotrl_signal", False):
+                    # Signal input requested
+                    if getattr(controller, "ctrl_full_csi", True):
+                        theta_list = controller(H_1=H_1, H_D=H_D_eff, H_2=H_2_eff, s_ms=s_ms)
+                    else:
+                        theta_list = controller(H_1=H_1, s_ms=s_ms)
+                elif getattr(controller, "ctrl_full_csi", True):
                     theta_list = controller(H_1=H_1, H_D=H_D_eff, H_2=H_2_eff)
                 else:
                     theta_list = controller(H_1=H_1)
@@ -488,7 +494,13 @@ metasurface_type: str = "sim"):
                     y = y_direct
             if combine_mode in ["metanet", "both"]:
                 s_ms = torch.matmul(H_1, s_c.transpose(1, 2)).squeeze(-1)
-                if getattr(controller, "ctrl_full_csi", True):
+                if getattr(controller, "cotrl_signal", False):
+                    # Signal input requested
+                    if getattr(controller, "ctrl_full_csi", True):
+                        theta_list = controller(H_1=H_1, H_D=H_D_eff, H_2=H_2_eff, s_ms=s_ms)
+                    else:
+                        theta_list = controller(H_1=H_1, s_ms=s_ms)
+                elif getattr(controller, "ctrl_full_csi", True):
                     theta_list = controller(H_1=H_1, H_D=H_D_eff, H_2=H_2_eff)
                 else:
                     theta_list = controller(H_1=H_1)
@@ -616,7 +628,7 @@ metasurface_type: str = "sim"):
 
 
 def train_minn_staged(channel, encoder, decoder, controller, physical_sim, train_loader,
-                      stage: int = 2, num_epochs=10, lr=1e-3, weight_decay=0.0, device="cpu",
+                      stage: int = 1, num_epochs=10, lr=1e-3, weight_decay=0.0, device="cpu",
                       combine_mode="direct", H_d_all=None, H_1_all=None, H_2_all=None,
                       encoder_distiller: EncoderFeatureDistiller | None = None,
                       controller_distiller: ControllerDistiller | None = None,
@@ -625,16 +637,17 @@ def train_minn_staged(channel, encoder, decoder, controller, physical_sim, train
                       grad_approx: bool = False, grad_approx_sigma: float = 0.1):
     """
     STAGED training loop for the 4-stage procedure:
-    Stage 2: Train Encoder via distillation from Teacher Layers 1-2.
-    Stage 3: Train Controller via distillation from Teacher Layers 3-4.
-    Stage 4: Train Decoder with frozen Encoder and Controller.
+    Stage 1: Train Encoder via distillation from Teacher Layers 1-2.
+    Stage 2: Train Controller via distillation from Teacher Layers 3-4.
+    Stage 3: Train Decoder with frozen Encoder and Controller.
+    Stage 4: Train Encoder and Decoder (Controller frozen).
     """
     params = []
 
-    if stage == 2:
-        print(f"[INFO] Stage 2: Training Encoder via distillation (Layers 1-2)")
+    if stage == 1:
+        print(f"[INFO] Stage 1: Training Encoder via distillation (Layers 1-2)")
         if encoder_distiller is None:
-            raise ValueError("Stage 2 requires encoder_distiller.")
+            raise ValueError("Stage 1 requires encoder_distiller.")
         encoder_distiller.to(device)
         params += [p for p in encoder_distiller.student.parameters() if p.requires_grad]
         params += [p for p in encoder_distiller.connectors.parameters() if p.requires_grad]
@@ -643,10 +656,10 @@ def train_minn_staged(channel, encoder, decoder, controller, physical_sim, train
         for p in list(decoder.parameters()) + list(controller.parameters()):
             p.requires_grad = False
 
-    elif stage == 3:
-        print(f"[INFO] Stage 3: Training Controller via distillation (Layers 3-4)")
+    elif stage == 2:
+        print(f"[INFO] Stage 2: Training Controller via distillation (Layers 3-4)")
         if controller_distiller is None:
-            raise ValueError("Stage 3 requires controller_distiller.")
+            raise ValueError("Stage 2 requires controller_distiller.")
         controller_distiller.to(device)
         controller.to(device)
         # Train controller AND distillation connectors
@@ -660,8 +673,8 @@ def train_minn_staged(channel, encoder, decoder, controller, physical_sim, train
             physical_sim.to(device)
             for p in physical_sim.parameters(): p.requires_grad = False
 
-    elif stage == 4:
-        print(f"[INFO] Stage 4: Training Decoder (Encoder and Controller frozen)")
+    elif stage == 3:
+        print(f"[INFO] Stage 3: Training Decoder (Encoder and Controller frozen)")
         decoder.to(device)
         params += [p for p in decoder.parameters() if p.requires_grad]
         # Freeze encoder and controller
@@ -673,8 +686,8 @@ def train_minn_staged(channel, encoder, decoder, controller, physical_sim, train
         if physical_sim is not None:
             physical_sim.to(device)
             for p in physical_sim.parameters(): p.requires_grad = False
-    elif stage == 5:
-        print(f"[INFO] Stage 5: Training Encoder and Decoder (Controller frozen)")
+    elif stage == 4:
+        print(f"[INFO] Stage 4: Training Encoder and Decoder (Controller frozen)")
         encoder.train()
         decoder.train()
         encoder.to(device)
@@ -690,7 +703,7 @@ def train_minn_staged(channel, encoder, decoder, controller, physical_sim, train
             physical_sim.to(device)
             for p in physical_sim.parameters(): p.requires_grad = False
     else:
-        raise ValueError(f"Invalid stage: {stage}. Must be 2, 3, 4 or 5.")
+        raise ValueError(f"Invalid stage: {stage}. Must be 1, 2, 3 or 4.")
 
     optimizer = optim.Adam(params, lr=lr, weight_decay=weight_decay)
     criterion = nn.CrossEntropyLoss()
@@ -722,8 +735,8 @@ def train_minn_staged(channel, encoder, decoder, controller, physical_sim, train
             images = images.to(device)
             labels = labels.to(device)
 
-            # --- STAGE 2: Encoder Distillation (No Channel) ---
-            if stage == 2:
+            # --- STAGE 1: Encoder Distillation (No Channel) ---
+            if stage == 1:
                 s, loss_fd = encoder_distiller(images)
                 loss = loss_fd
                 optimizer.zero_grad()
@@ -734,11 +747,11 @@ def train_minn_staged(channel, encoder, decoder, controller, physical_sim, train
                 pbar.set_postfix({'loss_fd': f"{loss_fd.item():.4f}"})
                 continue
 
-            # --- STAGE 3, 4 & 5: Needs Channel ---
-            if stage in [3, 4]:
+            # --- STAGE 2, 3 & 4: Needs Channel ---
+            if stage in [2, 3]:
                 with torch.no_grad():
                     s = encoder(images)
-            else: # stage 5
+            else: # stage 4
                 s = encoder(images)
             s_c = s.to(torch.complex64) if not torch.is_complex(s) else s
             if tx_amp_scale != 1.0:
@@ -765,14 +778,20 @@ def train_minn_staged(channel, encoder, decoder, controller, physical_sim, train
                 y = y_direct
             if combine_mode in ["metanet", "both"]:
                 s_ms = torch.matmul(H_1, s_c.transpose(1, 2)).squeeze(-1)
-                if getattr(controller, "ctrl_full_csi", True):
+                if getattr(controller, "cotrl_signal", False):
+                    # Signal input requested
+                    if getattr(controller, "ctrl_full_csi", True):
+                        theta_list = controller(H_1=H_1, H_D=H_D_eff, H_2=H_2_eff, s_ms=s_ms)
+                    else:
+                        theta_list = controller(H_1=H_1, s_ms=s_ms)
+                elif getattr(controller, "ctrl_full_csi", True):
                     theta_list = controller(H_1=H_1, H_D=H_D_eff, H_2=H_2_eff)
                 else:
                     theta_list = controller(H_1=H_1)
 
-                # STOCHASTIC RELAXATION (if enabled for Stage 3)
+                # STOCHASTIC RELAXATION (if enabled for Stage 2)
                 log_probs = None
-                if stage == 3 and grad_approx:
+                if stage == 2 and grad_approx:
                     sampled_theta_list = []
                     log_probs = 0
                     for theta_mean in theta_list:
@@ -806,12 +825,18 @@ def train_minn_staged(channel, encoder, decoder, controller, physical_sim, train
             noise = torch.complex(nr, ni)
             y = y + noise
 
-            if stage == 3:
-                # Distillation Loss for Stage 3
+            if stage == 2:
+                # Distillation Loss for Stage 2
                 if grad_approx:
                     # REINFORCE gradient estimate for controller
                     # 1. Distiller loss per sample (reduction='none')
-                    loss_fd_per_sample = controller_distiller(images, y, reduction='none')
+                    # Pass extra arguments for potential direct controller distillation
+                    loss_fd_per_sample = controller_distiller(
+                        images=images, y_received=y, reduction='none',
+                        H_1=H_1, H_D=H_D_eff, H_2=H_2_eff,
+                        s_ms=s_ms,
+                        student_controller=controller
+                    )
 
                     # 2. Surrogate loss for controller: E[L.detach() * log_prob]
                     # We want to minimize E[L], so the gradient is E[L * grad log pi]
@@ -825,7 +850,12 @@ def train_minn_staged(channel, encoder, decoder, controller, physical_sim, train
 
                     running_fd += loss_connectors.item()
                 else:
-                    loss_fd = controller_distiller(images, y)
+                    loss_fd = controller_distiller(
+                        images=images, y_received=y,
+                        H_1=H_1, H_D=H_D_eff, H_2=H_2_eff,
+                        s_ms=s_ms,
+                        student_controller=controller
+                    )
                     loss = loss_fd
                     running_fd += loss_fd.item()
 
@@ -834,8 +864,8 @@ def train_minn_staged(channel, encoder, decoder, controller, physical_sim, train
                 optimizer.step()
                 running_loss += loss.item()
                 pbar.set_postfix({'loss_fd': f"{loss.item():.4f}"})
-            else: # stage == 4 or stage == 5
-                # Classification Loss for Stage 4 & 5
+            else: # stage == 3 or stage == 4
+                # Classification Loss for Stage 3 & 4
                 if combine_mode == "direct": logits = decoder(y, H_D=H_D_eff)
                 elif combine_mode == "metanet": logits = decoder(y, H_2=H_2_eff)
                 else: logits = decoder(y, H_D=H_D_eff, H_2=H_2_eff)
@@ -1037,13 +1067,25 @@ def train_minn_alter(channel, encoder, decoder, controller, physical_sim, train_
                 # Controller logic
                 if i < half_mark:
                     # Phase 1: Controller is trainable
-                    if getattr(controller, "ctrl_full_csi", True):
+                    if getattr(controller, "cotrl_signal", False):
+                        # Signal input requested
+                        if getattr(controller, "ctrl_full_csi", True):
+                            theta_list = controller(H_1=H_1, H_D=H_D_eff, H_2=H_2_eff, s_ms=s_ms)
+                        else:
+                            theta_list = controller(H_1=H_1, s_ms=s_ms)
+                    elif getattr(controller, "ctrl_full_csi", True):
                         theta_list = controller(H_1=H_1, H_D=H_D_eff, H_2=H_2_eff)
                     else:
                         theta_list = controller(H_1=H_1)
                 else:
                     # Phase 2: Controller is frozen (requires_grad=False handles this)
-                    if getattr(controller, "ctrl_full_csi", True):
+                    if getattr(controller, "cotrl_signal", False):
+                        # Signal input requested
+                        if getattr(controller, "ctrl_full_csi", True):
+                            theta_list = controller(H_1=H_1, H_D=H_D_eff, H_2=H_2_eff, s_ms=s_ms)
+                        else:
+                            theta_list = controller(H_1=H_1, s_ms=s_ms)
+                    elif getattr(controller, "ctrl_full_csi", True):
                         theta_list = controller(H_1=H_1, H_D=H_D_eff, H_2=H_2_eff)
                     else:
                         theta_list = controller(H_1=H_1)
@@ -1313,7 +1355,7 @@ def train_classifier(classifier, train_loader, num_epochs=20, lr=1e-3, weight_de
 
 
 if __name__ == '__main__':
-    from flow import Encoder, Decoder, build_simnet, Controller_DNN, Physical_SIM, MNISTClassifier, CNNTeacherExtractor  # adapt imports
+    from flow import Encoder, Decoder, build_simnet, Controller_DNN, Physical_SIM, MNISTClassifier, CNNTeacherExtractor, E2EProxyTeacher  # adapt imports
     parser = argparse.ArgumentParser(description='Train MINN on MNIST dataset')
     # Data configuration
     parser.add_argument('--subset_size', type=int, default=1000, help='Number of samples to use from training set')
@@ -1350,6 +1392,14 @@ if __name__ == '__main__':
             "If True: controller observes full CSI (H_D, H_1, H_2) similar to the reference implementation. "
             "If False: controller observes only H_1 (TX->MS)."
         ),
+    )
+    parser.add_argument(
+        '--cotrl_signal',
+        nargs='?',
+        const=True,
+        default=False,
+        type=_parse_bool,
+        help="Whether to pass the transmit signal s_ms as input to the controller DNN.",
     )
     # NOTE: For geometric channels at 28 GHz with distance-based pathloss, magnitudes are tiny (often ~1e-5),
     # so noise_std=1 would imply effectively zero SNR and nothing will learn. We therefore default noise_std
@@ -1492,6 +1542,12 @@ if __name__ == '__main__':
         ),
     )
     parser.add_argument(
+        '--bottleneck_dim',
+        type=int,
+        default=None,
+        help='If set, use a bottleneck architecture for the teacher (MNISTClassifier) with this dimension.'
+    )
+    parser.add_argument(
         '--load_encoder',
         type=str,
         default=None,
@@ -1514,10 +1570,16 @@ if __name__ == '__main__':
         ),
     )
     # Staged training configuration
-    parser.add_argument('--stage', type=int, choices=[2, 3, 4, 5], default=None,
-                        help='Staged training stage (2: Encoder, 3: Controller, 4: Decoder, 5: Enc+Dec)')
+    parser.add_argument('--stage', type=int, choices=[1, 2, 3, 4], default=None,
+                        help='Staged training stage (1: Encoder, 2: Controller, 3: Decoder, 4: Enc+Dec)')
+    parser.add_argument('--decoder_type', type=str, choices=['base', 'powerful'], default='base',
+                        help='Decoder architecture type: base (simple MLP) or powerful (deep robust MLP)')
+    parser.add_argument('--teacher_type', type=str, choices=['cnn', 'e2e', 'e2e_proxy'], default=None,
+                        help='Type of teacher model to use for distillation.')
     parser.add_argument('--load_path', type=str, default=None,
                         help='Generic path to load models from for staged training.')
+    parser.add_argument('--load_ctrl', type=str, default=None,
+                        help='Path to a trained controller checkpoint to load for Stage 3 training.')
     args = parser.parse_args()
     if args.noise_std is None:
         # CODE_EXAMPLE uses noise_sigma_sq = -90 dBm => noise power ~1e-12 W => noise_std ~1e-6
@@ -1604,22 +1666,37 @@ if __name__ == '__main__':
 
     # ===== Classifier training mode =====
     if args.train_classifier:
-        print("\n=== Training CNN Classifier ===")
+        print("\n=== Training Teacher ===")
         transform = transforms.Compose([transforms.ToTensor()])
         train_dataset = datasets.MNIST(root="./data", train=True, transform=transform, download=True)
         indices = np.random.choice(len(train_dataset), int(args.subset_size), replace=False)
         train_subset = Subset(train_dataset, indices)
         train_loader = DataLoader(train_subset, batch_size=int(args.batchsize), shuffle=True)
 
-        classifier = MNISTClassifier(
-            num_classes=10,
-            use_channel=bool(args.teacher_use_channel),
-            channel_noise_std=float(args.teacher_channel_noise_std),
-            channel_output_mode=str(args.teacher_channel_output_mode),
-        ).to(device)
-        print_model_size(classifier, "CNN Classifier")
+        tt = str(getattr(args, "teacher_type", "cnn")).lower()
+        if tt == "e2e_proxy":
+            print(f"[INFO] Training E2E Proxy Teacher: Nt={args.N_t}, Nr={args.N_r}, noise_std={args.noise_std}")
+            classifier = E2EProxyTeacher(
+                nt=int(args.N_t),
+                nr=int(args.N_r),
+                k_factor_db=float(getattr(args, "k_factor_db", 10.0)),
+                noise_std=float(args.noise_std)
+            ).to(device)
+            save_key = "e2e_proxy"
+        else:
+            print(f"[INFO] Training CNN Classifier Teacher: use_channel={args.teacher_use_channel}")
+            classifier = MNISTClassifier(
+                num_classes=10,
+                use_channel=bool(args.teacher_use_channel),
+                bottleneck_dim=args.bottleneck_dim,
+                channel_noise_std=float(args.teacher_channel_noise_std),
+                channel_output_mode=str(args.teacher_channel_output_mode),
+            ).to(device)
+            save_key = "classifier"
 
-        if args.teacher_use_channel:
+        print_model_size(classifier, f"Teacher ({tt})")
+
+        if tt == "cnn" and args.teacher_use_channel:
             print(f"[INFO] Teacher using channel layer: noise_std={args.teacher_channel_noise_std}, "
                   f"output_mode={args.teacher_channel_output_mode}")
 
@@ -1636,17 +1713,35 @@ if __name__ == '__main__':
             show_plot_end=(not args.no_show_plot_end),
         )
 
-        # Save classifier
-        classifier_path = args.classifier_path or "MY_code/models_dict/cnn_classifier.pth"
+        # Save teacher
+        classifier_path = args.classifier_path or f"MY_code/models_dict/teacher_{tt}.pth"
         save_dir = os.path.dirname(classifier_path)
         if save_dir:
             os.makedirs(save_dir, exist_ok=True)
-        torch.save({'classifier': classifier.state_dict()}, classifier_path)
-        print(f"[INFO] Classifier saved to {classifier_path}")
+        torch.save({save_key: classifier.state_dict()}, classifier_path)
+        print(f"[INFO] Teacher saved to {classifier_path}")
 
         raise SystemExit(0)
 
     def _run_one(cfg) -> dict:
+        # Resolve teacher_path and load_path if teacher_type is specified
+        if getattr(cfg, "teacher_type", None):
+            tt = str(cfg.teacher_type).lower()
+            # If teacher_path is not explicitly set or is default, resolve it based on type
+            current_tp = getattr(cfg, "teacher_path", None)
+            if current_tp is None or current_tp == DEFAULT_CNN_CLASSIFIER_PATH:
+                if tt == "cnn":
+                    cfg.teacher_path = "models_dict/cnn_classifier_teacher.pth"
+                elif tt == "e2e_proxy":
+                    cfg.teacher_path = "models_dict/teacher_e2e_proxy.pth"
+                else:
+                    cfg.teacher_path = "models_dict/phase4_e2e.pth"
+
+            # If load_path is specified, auto-suffix it to match the previous stage's output for this teacher_type
+            current_lp = getattr(cfg, "load_path", None)
+            if current_lp and f"teacher_type=" not in current_lp:
+                cfg.load_path = _suffix_path(current_lp, f"_teacher_type={tt}")
+
         # ===== Data subset =====
         transform = transforms.Compose([transforms.ToTensor()])
         train_dataset = datasets.MNIST(root="./data", train=True, transform=transform, download=True)
@@ -1697,8 +1792,15 @@ if __name__ == '__main__':
             n_ms=int(cfg.N_m),
             layer_sizes=layer_sizes,
             ctrl_full_csi=bool(cfg.cotrl_CSI),
+            cotrl_signal=bool(getattr(cfg, "cotrl_signal", False)),
         ).to(device)
-        decoder = Decoder(n_rx=int(cfg.N_r), n_tx=int(cfg.N_t), n_m=int(cfg.N_m)).to(device)
+
+        dec_type = str(getattr(cfg, "decoder_type", "base")).lower()
+        if dec_type == "powerful":
+            decoder = PowerfulDecoder(n_rx=int(cfg.N_r), n_tx=int(cfg.N_t), n_m=int(cfg.N_m)).to(device)
+        else:
+            decoder = Decoder(n_rx=int(cfg.N_r), n_tx=int(cfg.N_t), n_m=int(cfg.N_m)).to(device)
+
         encoder = Encoder(int(cfg.N_t)).to(device)
 
         # Load trained encoder for Phase 2 (if specified)
@@ -1716,27 +1818,27 @@ if __name__ == '__main__':
             stage = getattr(cfg, "stage", None)
             if stage is not None:
                 stage = int(stage)
-                if stage == 3:
-                    # Stage 3: Train Controller, need trained Encoder
+                if stage == 2:
+                    # Stage 2: Train Controller, need trained Encoder
                     if "encoder" in ckpt:
                         encoder.load_state_dict(ckpt["encoder"])
-                        print("[INFO] Loaded encoder from checkpoint for Stage 3")
-                elif stage == 4:
-                    # Stage 4: Train Decoder, need trained Encoder and Controller
+                        print("[INFO] Loaded encoder from checkpoint for Stage 2")
+                elif stage == 3:
+                    # Stage 3: Train Decoder, need trained Encoder and Controller
                     if "encoder" in ckpt:
                         encoder.load_state_dict(ckpt["encoder"])
                     if "controller" in ckpt:
                         controller.load_state_dict(ckpt["controller"])
-                    print("[INFO] Loaded encoder and controller from checkpoint for Stage 4")
-                elif stage == 5:
-                    # Stage 5: Train Encoder and Decoder, need trained Controller only
+                    print("[INFO] Loaded encoder and controller from checkpoint for Stage 3")
+                elif stage == 4:
+                    # Stage 4: Train Encoder and Decoder, need trained Controller only
                     if "controller" in ckpt:
                         controller.load_state_dict(ckpt["controller"])
                         print(
-                            "[INFO] Loaded controller from checkpoint for Stage 5 (Encoder/Decoder will be fresh)"
+                            "[INFO] Loaded controller from checkpoint for Stage 4 (Encoder/Decoder will be fresh)"
                         )
                 else:
-                    # For other stages (like Stage 2 or undefined), load what's available
+                    # For other stages (like Stage 1 or undefined), load what's available
                     if "encoder" in ckpt:
                         encoder.load_state_dict(ckpt["encoder"])
                     if "controller" in ckpt:
@@ -1754,15 +1856,34 @@ if __name__ == '__main__':
 
             print("[INFO] Staged checkpoint loaded successfully")
 
+        # Load specific controller checkpoint if specified (Stage 3/4 override)
+        if hasattr(cfg, "load_ctrl") and cfg.load_ctrl and os.path.exists(cfg.load_ctrl):
+            print(f"[INFO] Loading specific controller from {cfg.load_ctrl}")
+            ctrl_ckpt = torch.load(cfg.load_ctrl, map_location=device)
+            if "controller" in ctrl_ckpt:
+                controller.load_state_dict(ctrl_ckpt["controller"])
+                print("[INFO] Controller loaded successfully from load_ctrl")
+            elif any(k.startswith('controller.') for k in ctrl_ckpt.keys()):
+                # If it's a direct state dict of the controller (not wrapped)
+                controller.load_state_dict(ctrl_ckpt)
+                print("[INFO] Controller loaded successfully from direct state dict (load_ctrl)")
+            else:
+                # Try loading whatever is in there if it matches keys
+                try:
+                    controller.load_state_dict(ctrl_ckpt)
+                    print("[INFO] Controller loaded successfully (load_ctrl fallback)")
+                except:
+                    print("[WARNING] Could not load controller from load_ctrl")
+
         encoder_distiller = None
         controller_distiller = None
 
-        if getattr(cfg, "stage", None) in [2, 3, 4, 5]:
+        if getattr(cfg, "stage", None) in [1, 2, 3, 4]:
             stage = int(cfg.stage)
             model_store_name = f"minn_model_stage{stage}"
 
-            # Setup teacher/distillers for stages 2 and 3
-            if stage in [2, 3]:
+            # Setup teacher/distillers for stages 1 and 2
+            if stage in [1, 2]:
                 teacher_ckpt_path = cfg.teacher_path or DEFAULT_CNN_CLASSIFIER_PATH
                 if not os.path.exists(teacher_ckpt_path):
                     raise RuntimeError(f"Teacher model not found at {teacher_ckpt_path}. Run Stage 1 (train_classifier) first.")
@@ -1770,48 +1891,136 @@ if __name__ == '__main__':
                 # Load teacher
                 teacher_ckpt = torch.load(teacher_ckpt_path, map_location=device)
 
-                if "classifier" in teacher_ckpt:
-                    # Traditional CNN teacher
-                    teacher_model = MNISTClassifier(num_classes=10, use_channel=False).to(device)
-                    teacher_model.load_state_dict(teacher_ckpt["classifier"], strict=False)
+                if "e2e_proxy" in teacher_ckpt or (getattr(cfg, "teacher_type", None) == "e2e_proxy"):
+                    # E2E Proxy Teacher
+                    print(f"[INFO] Stage {stage}: Using E2E Proxy Teacher from {teacher_ckpt_path}")
+                    teacher_model = E2EProxyTeacher(
+                        nt=int(cfg.N_t),
+                        nr=int(cfg.N_r),
+                        k_factor_db=float(getattr(cfg, "k_factor_db", 10.0)),
+                        noise_std=float(cfg.noise_std)
+                    ).to(device)
+
+                    if "e2e_proxy" in teacher_ckpt:
+                        teacher_model.load_state_dict(teacher_ckpt["e2e_proxy"])
+                    elif "classifier" in teacher_ckpt:
+                        # Fallback: maybe it was saved with "classifier" key but intended as e2e_proxy
+                        teacher_model.load_state_dict(teacher_ckpt["classifier"], strict=False)
+
                     teacher_model.eval()
 
+                    if stage == 1:
+                        # For Phase 1, we use the teacher's internal encoder for distillation
+                        encoder_distiller = EncoderFeatureDistiller(
+                            teacher_model.encoder, encoder, pre_relu=True, distill_conv=True, distill_s=True
+                        ).to(device)
+
                     if stage == 2:
+                        # For Phase 2, we use teacher_model features (encoder + decoder)
+                        # The E2EProxyTeacher.extract_features returns 5 features:
+                        # [enc_conv1, enc_conv2, enc_conv3, dec_fc1, dec_fc2]
+                        # We use dec_fc1 and dec_fc2 (indices 3 and 4)
+                        layer_configs = [(128,), (64,)]
+                        layer_indices = [3, 4]
+                        controller_distiller = ControllerDistiller(
+                            teacher=teacher_model,
+                            n_r=int(cfg.N_r),
+                            layer_configs=layer_configs,
+                            layer_indices=layer_indices
+                        ).to(device)
+
+                elif "classifier" in teacher_ckpt:
+                    # Traditional CNN teacher
+                    # Try to detect if the saved model has channel layers or bottleneck by checking keys
+                    has_channel = any("channel_layer" in k for k in teacher_ckpt["classifier"].keys())
+                    has_bottleneck = any("bottleneck_layer" in k for k in teacher_ckpt["classifier"].keys())
+
+                    # If we have bottleneck layer, we need to know its dimension
+                    b_dim = args.bottleneck_dim
+                    if has_bottleneck and b_dim is None:
+                        # Try to infer bottleneck_dim from weight shape
+                        for k, v in teacher_ckpt["classifier"].items():
+                            if "bottleneck_layer.weight" in k:
+                                b_dim = v.size(0)
+                                break
+
+                    teacher_model = MNISTClassifier(
+                        num_classes=10,
+                        use_channel=has_channel,
+                        bottleneck_dim=b_dim,
+                        channel_noise_std=float(cfg.teacher_channel_noise_std) if hasattr(cfg, 'teacher_channel_noise_std') else 1e-2,
+                        channel_output_mode=str(cfg.teacher_channel_output_mode) if hasattr(cfg, 'teacher_channel_output_mode') else "magnitude",
+                    ).to(device)
+                    teacher_model.load_state_dict(teacher_ckpt["classifier"], strict=True)
+                    teacher_model.eval()
+
+                    if stage == 1:
                         teacher_extractor = CNNTeacherExtractor(teacher_model).to(device)
                         encoder_distiller = EncoderFeatureDistiller(
                             teacher_extractor, encoder, pre_relu=True, distill_conv=True, distill_s=False
                         ).to(device)
 
-                    if stage == 3:
-                        layer_configs = [(128, 14, 14), (256, 7, 7)]
-                        controller_distiller = ControllerDistiller(teacher_model, int(cfg.N_r), layer_configs).to(device)
+                    if stage == 2:
+                        if b_dim is not None:
+                            # Bottleneck mode: distill from the bottleneck feature (index 2)
+                            layer_configs = [(b_dim,)]
+                            layer_indices = [2]
+                        else:
+                            # Standard mode: distill from layers 3 and 4 (indices 2 and 3)
+                            layer_configs = [(128, 14, 14), (256, 7, 7)]
+                            layer_indices = [2, 3]
+
+                        controller_distiller = ControllerDistiller(
+                            teacher=teacher_model,
+                            n_r=int(cfg.N_r),
+                            layer_configs=layer_configs,
+                            layer_indices=layer_indices
+                        ).to(device)
 
                 elif "encoder" in teacher_ckpt:
-                    # E2E Encoder as teacher (Stage 2 only)
-                    print(f"[INFO] Stage {stage}: Using E2E encoder from {teacher_ckpt_path} as teacher")
-                    teacher_encoder = Encoder(Nt=int(cfg.N_t)).to(device)
-                    teacher_encoder.load_state_dict(teacher_ckpt["encoder"], strict=False)
-                    teacher_encoder.eval()
+                    # E2E model as teacher
+                    print(f"[INFO] Stage {stage}: Using E2E model from {teacher_ckpt_path} as teacher")
 
-                    if stage == 2:
+                    if stage == 1:
+                        teacher_encoder = Encoder(Nt=int(cfg.N_t)).to(device)
+                        teacher_encoder.load_state_dict(teacher_ckpt["encoder"], strict=False)
+                        teacher_encoder.eval()
                         # Direct Encoder-to-Encoder distillation
                         encoder_distiller = EncoderFeatureDistiller(
                             teacher_encoder, encoder, pre_relu=True, distill_conv=True, distill_s=True
                         ).to(device)
 
-                    if stage == 3:
-                        # Controller distillation still needs a classifier for high-level target features
-                        print(f"[WARNING] E2E checkpoint used for Stage 3 teacher. Controller distillation requires an MNISTClassifier teacher for target features.")
-                        if os.path.exists(DEFAULT_CNN_CLASSIFIER_PATH):
-                            print(f"[INFO] Falling back to {DEFAULT_CNN_CLASSIFIER_PATH} for Stage 3 teacher features.")
-                            fallback_ckpt = torch.load(DEFAULT_CNN_CLASSIFIER_PATH, map_location=device)
-                            teacher_model = MNISTClassifier(num_classes=10, use_channel=False).to(device)
-                            teacher_model.load_state_dict(fallback_ckpt["classifier"], strict=False)
-                            teacher_model.eval()
-                            layer_configs = [(128, 14, 14), (256, 7, 7)]
-                            controller_distiller = ControllerDistiller(teacher_model, int(cfg.N_r), layer_configs).to(device)
+                    if stage == 2:
+                        # For Stage 2, if the teacher is an E2E model, we use its controller (and optionally decoder)
+                        if "controller" in teacher_ckpt:
+                            print(f"[INFO] Stage 2: Performing direct controller distillation from E2E teacher")
+                            teacher_controller = Controller_DNN(
+                                n_t=int(cfg.N_t), n_r=int(cfg.N_r), n_ms=int(cfg.N_m),
+                                layer_sizes=layer_sizes,
+                                ctrl_full_csi=bool(cfg.cotrl_CSI)
+                            ).to(device)
+                            teacher_controller.load_state_dict(teacher_ckpt["controller"])
+
+                            # Create distiller that matches teacher controller outputs
+                            controller_distiller = ControllerDistiller(teacher_controller=teacher_controller).to(device)
                         else:
-                            raise RuntimeError(f"E2E checkpoint cannot be used for Stage 3 (Controller) distillation, and no default CNN teacher found at {DEFAULT_CNN_CLASSIFIER_PATH}")
+                            # Fallback to CNN features if E2E model doesn't have a controller (unlikely)
+                            print(f"[WARNING] E2E checkpoint has no 'controller'. Falling back to CNN teacher features.")
+                            if os.path.exists(DEFAULT_CNN_CLASSIFIER_PATH):
+                                fallback_ckpt = torch.load(DEFAULT_CNN_CLASSIFIER_PATH, map_location=device)
+                                teacher_model = MNISTClassifier(num_classes=10, use_channel=False).to(device)
+                                teacher_model.load_state_dict(fallback_ckpt["classifier"], strict=False)
+                                teacher_model.eval()
+                                layer_configs = [(128, 14, 14), (256, 7, 7)]
+                                layer_indices = [2, 3]
+                                controller_distiller = ControllerDistiller(
+                                    teacher=teacher_model,
+                                    n_r=int(cfg.N_r),
+                                    layer_configs=layer_configs,
+                                    layer_indices=layer_indices
+                                ).to(device)
+                            else:
+                                raise RuntimeError(f"E2E checkpoint has no controller, and no default CNN teacher found at {DEFAULT_CNN_CLASSIFIER_PATH}")
                 else:
                     raise RuntimeError(f"Unknown checkpoint format at {teacher_ckpt_path}. Expected 'classifier' or 'encoder' key.")
         elif bool(cfg.encoder_distill):
@@ -1823,7 +2032,7 @@ if __name__ == '__main__':
             classifier_ckpt = cfg.teacher_path or DEFAULT_CNN_CLASSIFIER_PATH
 
             # Note: When loading the classifier checkpoint, we need to infer if it was trained
-            # with a channel layer. For now, we try to load with use_channel=False first,
+            # with channel layers. For now, we try to load with use_channel=False first,
             # and if that fails with a shape mismatch, we try with use_channel=True.
             # A better approach would be to save metadata in the checkpoint.
             classifier = None
@@ -1832,9 +2041,10 @@ if __name__ == '__main__':
                     classifier = MNISTClassifier(
                         num_classes=10,
                         use_channel=try_use_channel,
+                        bottleneck_dim=args.bottleneck_dim,
                         channel_noise_std=float(cfg.teacher_channel_noise_std) if hasattr(cfg, 'teacher_channel_noise_std') else 1e-2,
                         channel_output_mode=str(cfg.teacher_channel_output_mode) if hasattr(cfg, 'teacher_channel_output_mode') else "magnitude",
-                    )
+                    ).to(device)
                     ckpt = torch.load(classifier_ckpt, map_location=device)
                     classifier.load_state_dict(ckpt["classifier"], strict=True)
                     classifier.eval()
@@ -1867,7 +2077,7 @@ if __name__ == '__main__':
         use_phase_training = bool(cfg.encoder_distill) or (hasattr(cfg, 'load_encoder') and cfg.load_encoder)
 
         extra_kwargs = {}
-        if getattr(cfg, "stage", None) in [2, 3, 4, 5]:
+        if getattr(cfg, "stage", None) in [1, 2, 3, 4]:
             train_fn = train_minn_staged
             extra_kwargs["stage"] = int(cfg.stage)
             extra_kwargs["controller_distiller"] = controller_distiller
@@ -1936,7 +2146,7 @@ if __name__ == '__main__':
         def _cast(name: str, raw: str):
             if name in {"encoder_distill", "cotrl_CSI", "alternating_train", "grad_approx"}:
                 return _parse_bool(raw)
-            if name in {"channel_type"}:
+            if name in {"channel_type", "teacher_type"}:
                 return str(raw)
             if name in {"geo_pathloss_exp", "geo_pathloss_gain_db"}:
                 return float(raw)
@@ -1946,16 +2156,16 @@ if __name__ == '__main__':
                 return float(raw)
             if name in {"subset_size", "batchsize", "epochs", "channel_sampling_size", "N_t", "N_r", "N_m", "stage"}:
                 return int(float(raw))
-            if name in {"combine_mode", "fading_type"}:
+            if name in {"combine_mode", "fading_type", "decoder_type"}:
                 return str(raw)
-            if name in {"load_encoder", "teacher_path", "classifier_path", "load_path"}:
+            if name in {"load_encoder", "teacher_path", "classifier_path", "load_path", "teacher_type"}:
                 # Handle None/null/empty as actual None, otherwise return the string path
                 return None if raw.lower() in {"none", "null", ""} else str(raw)
             raise ValueError(
                 f"Unsupported compare_arg '{name}'. Supported: combine_mode, fading_type, noise_std, "
                 "lam, k_factor_db, lr, weight_decay, subset_size, batchsize, epochs, channel_sampling_size, N_t, N_r, N_m, "
                 "encoder_distill, cotrl_CSI, channel_type, geo_pathloss_exp, geo_pathloss_gain_db, tx_power_dbm, "
-                "load_encoder, teacher_path, classifier_path, stage, load_path, grad_approx, grad_approx_sigma."
+                "load_encoder, teacher_path, classifier_path, stage, load_path, grad_approx, grad_approx_sigma, teacher_type."
             )
 
         # Headless-safe backend when we only save (no show-at-end)
@@ -1974,7 +2184,19 @@ if __name__ == '__main__':
             cfg._save_suffix = f"_{_safe_token(arg_name)}={_safe_token(cast_val)}"
             print(f"\n=== Training {arg_name}={cast_val} ===")
             hist = _run_one(cfg)
-            histories.append((f"{arg_name}={cast_val}", hist))
+
+            # Create a readable label for the plot
+            label = f"{arg_name}={cast_val}"
+            if arg_name == "load_path" and cast_val:
+                # If it's a path, try to use the filename or a meaningful part of it as label
+                base = os.path.basename(str(cast_val))
+                # Remove common prefixes/extensions to get to the "teacher" part
+                for prefix in ["minn_model_stage2_", "phase2_ctrl_", "minn_model_", "phase1_encoder_"]:
+                    if base.startswith(prefix):
+                        base = base[len(prefix):]
+                label = base.replace(".pth", "").replace("_", " ")
+
+            histories.append((label, hist))
 
         if plot_enabled:
             fig, (ax_acc, ax_loss) = plt.subplots(nrows=2, ncols=1, figsize=(8, 8), sharex=True)

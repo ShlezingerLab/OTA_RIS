@@ -560,6 +560,110 @@ class Decoder(nn.Module):
         x = F.relu(self.fc_main3(x))
         logits = self.fc_out(x)
         return logits
+
+class PowerfulDecoder(nn.Module):
+    """
+    Enhanced decoder architecture with deeper branches, LayerNorm, and LeakyReLU.
+    Designed to handle complex non-linear distortions in MIMO fading channels.
+    """
+    def __init__(self, n_rx: int = 32, n_tx: int = 10, n_m: int = 64):
+        super().__init__()
+        self.n_rx = n_rx
+        self.n_tx = n_tx
+        self.n_m = n_m
+
+        # Branch width
+        W = 256
+
+        # 1. Received signal branch (y)
+        self.y_branch = nn.Sequential(
+            nn.Linear(n_rx * 2, W * 2),
+            nn.LayerNorm(W * 2),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(W * 2, W),
+            nn.LayerNorm(W),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
+
+        # 2. Direct channel branch (H_D)
+        self.hd_branch = nn.Sequential(
+            nn.Linear(n_rx * n_tx * 2, W * 2),
+            nn.LayerNorm(W * 2),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(W * 2, W),
+            nn.LayerNorm(W),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
+
+        # 3. Metasurface channel branch (H_2)
+        self.h2_branch = nn.Sequential(
+            nn.Linear(n_rx * n_m * 2, W * 2),
+            nn.LayerNorm(W * 2),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(W * 2, W),
+            nn.LayerNorm(W),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
+
+        # 4. Fusion and classification
+        # Full case: y + H_D + H_2
+        self.classifier_full = nn.Sequential(
+            nn.Linear(W * 3, W * 4),
+            nn.LayerNorm(W * 4),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(W * 4, W * 2),
+            nn.LayerNorm(W * 2),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(W * 2, 128),
+            nn.LayerNorm(128),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(128, 10),
+        )
+
+        # Partial case: y + (H_D OR H_2)
+        self.classifier_partial = nn.Sequential(
+            nn.Linear(W * 2, W * 4),
+            nn.LayerNorm(W * 4),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(W * 4, W * 2),
+            nn.LayerNorm(W * 2),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(W * 2, 10),
+        )
+
+    def forward(self, y, H_D=None, H_2=None, H=None):
+        # Convert complex signal → real concatenation
+        y_real = torch.real(y)
+        y_imag = torch.imag(y)
+        y_cat = torch.cat([y_real, y_imag], dim=1)  # (batch, n_rx*2)
+        x_y = self.y_branch(y_cat)
+
+        features = [x_y]
+
+        if H_D is not None:
+            H_D_flat = torch.cat([torch.real(H_D).flatten(1), torch.imag(H_D).flatten(1)], dim=1)
+            features.append(self.hd_branch(H_D_flat))
+
+        if H_2 is not None:
+            H_2_flat = torch.cat([torch.real(H_2).flatten(1), torch.imag(H_2).flatten(1)], dim=1)
+            features.append(self.h2_branch(H_2_flat))
+
+        x = torch.cat(features, dim=1)
+
+        if len(features) == 3:
+            return self.classifier_full(x)
+        elif len(features) == 2:
+            return self.classifier_partial(x)
+        else:
+            # Fallback for y-only (should not happen if CSI is expected)
+            # We'll just pad with zeros to use the partial classifier
+            W = self.y_branch[-2].normalized_shape[0] # Get W from LayerNorm
+            zeros = torch.zeros_like(x_y)
+            return self.classifier_partial(torch.cat([x_y, zeros], dim=1))
+
 class ChannelAwareDecoder(nn.Module):
     def __init__(self, Nt, Nr, N, hidden_dim=32):
         super(ChannelAwareDecoder, self).__init__()
@@ -707,13 +811,14 @@ class Controller_DNN(nn.Module):
       H_1: (B, N_ms, N_t) complex - TX-MS
       H_2: (B, N_r, N_ms) complex - MS-RX
     """
-    def __init__(self, n_t: int, n_r: int, n_ms: int, layer_sizes: list[int], *, ctrl_full_csi: bool = True):
+    def __init__(self, n_t: int, n_r: int, n_ms: int, layer_sizes: list[int], *, ctrl_full_csi: bool = True, cotrl_signal: bool = False):
         super().__init__()
         self.n_t = n_t
         self.n_r = n_r
         self.n_ms = n_ms
         self.layer_sizes = layer_sizes
         self.ctrl_full_csi = bool(ctrl_full_csi)
+        self.cotrl_signal = bool(cotrl_signal)
 
         # input dim
         h_1_dim = n_ms * n_t * 2
@@ -723,6 +828,9 @@ class Controller_DNN(nn.Module):
             self.h_dim = h_d_dim + h_1_dim + h_2_dim
         else:
             self.h_dim = h_1_dim
+
+        if self.cotrl_signal:
+            self.h_dim += n_ms * 2
 
         self.h_norm = nn.LayerNorm(self.h_dim)
         self.fc_h1 = nn.Linear(self.h_dim, 256)
@@ -737,6 +845,7 @@ class Controller_DNN(nn.Module):
         H_1: torch.Tensor,
         H_D: torch.Tensor | None = None,
         H_2: torch.Tensor | None = None,
+        s_ms: torch.Tensor | None = None,
     ) -> list[torch.Tensor]:
         """
         Returns a list of theta tensors, one per SIM layer.
@@ -755,6 +864,13 @@ class Controller_DNN(nn.Module):
             h_in = torch.cat([v_D, v_1, v_2], dim=1)
         else:
             h_in = v_1
+
+        if self.cotrl_signal:
+            if s_ms is None:
+                raise ValueError("cotrl_signal=True requires s_ms.")
+            s_ms_real, s_ms_imag = s_ms.real, s_ms.imag
+            v_s = torch.cat([s_ms_real.flatten(1), s_ms_imag.flatten(1)], dim=1)
+            h_in = torch.cat([h_in, v_s], dim=1)
 
         h_in = self.h_norm(h_in)
         h = F.relu(self.fc_h1(h_in))
@@ -832,32 +948,48 @@ class SimNet_wrapper(nn.Module):
     This class implements the controllable version where the MS Controller network
     takes H(t) as input and outputs phase configurations for each SimNet layer.
     """
-    def __init__(self, simnet: nn.Module, channel_aware: bool = False, n_rx: int = None, n_tx: int = None):
+    def __init__(self, simnet: nn.Module, channel_aware: bool = False, n_rx: int = None, n_tx: int = None, cotrl_signal: bool = False):
         """
         Args:
             simnet: The underlying SimNet module
             channel_aware: If True, SimNet phases are controlled by H(t) via controller network
             n_rx: Number of receive antennas (required if channel_aware=True)
             n_tx: Number of transmit antennas (required if channel_aware=True)
+            cotrl_signal: Whether to pass the transmit signal s_ms as input to the controller
         """
         super().__init__()
         self.simnet = simnet
         self.n_rx = n_rx
         self.n_tx = n_tx
+        self.cotrl_signal = cotrl_signal
 
         h_dim = n_rx * n_tx * 2
+        if self.cotrl_signal:
+            # simnet input is N_ms, but here s_ms is passed in forward
+            # we need n_ms for input dim if cotrl_signal is True
+            # but SimNet_wrapper seems to use H only in the current implementation?
+            # Looking at its forward, it uses H_flat.
+            # Let's adjust SimNet_wrapper to be consistent with Controller_DNN if needed,
+            # but SimNet_wrapper has its own internal controller.
+            pass
 
         # Count total number of phase parameters across all SimNet layers
         total_phase_params = 0
         for layer in simnet.ris_layers:
             total_phase_params += layer.num_elems
 
-        # MS Controller: H(t) → phase configurations for all layers
-        # Output: theta values for all layers (will be converted to phases)
-        self.fc_h1 = nn.Linear(h_dim, 256)
+        # We'll update the internal controller to also take s_ms if cotrl_signal is True
+        # In current flow.py, SimNet_wrapper.forward only takes s and H.
+        # s here is actually s_ms from SimRISChannel.forward.
+        n_ms = simnet.ris_layers[0].num_elems
+        ctrl_in_dim = h_dim
+        if self.cotrl_signal:
+            ctrl_in_dim += n_ms * 2
+
+        self.fc_h1 = nn.Linear(ctrl_in_dim, 256)
         self.fc_h2 = nn.Linear(256, 256)
         self.fc_h3 = nn.Linear(256, total_phase_params)  # Output theta for all layers
-        self.h_norm = nn.LayerNorm(h_dim)
+        self.h_norm = nn.LayerNorm(ctrl_in_dim)
 
         # Store layer boundaries for splitting controller output
         self.layer_sizes = [layer.num_elems for layer in simnet.ris_layers]
@@ -865,7 +997,7 @@ class SimNet_wrapper(nn.Module):
     def forward(self, s, H=None):
         """
         Args:
-            s: Input signal of shape (batch, n_tx) - real or complex
+            s: Input signal of shape (batch, n_ms) - real or complex
             H: Optional channel matrix of shape (batch, n_rx, n_tx) complex
                Required if channel_aware=True
         Returns:
@@ -874,13 +1006,18 @@ class SimNet_wrapper(nn.Module):
             # Flatten H: (batch, n_rx, n_tx) complex -> (batch, n_rx*n_tx*2)
         H_real = torch.real(H)
         H_imag = torch.imag(H)
-        H_flat = torch.cat([H_real.flatten(1), H_imag.flatten(1)], dim=1)
+        h_in = torch.cat([H_real.flatten(1), H_imag.flatten(1)], dim=1)
+
+        if self.cotrl_signal:
+            s_real, s_imag = torch.real(s), torch.imag(s)
+            s_flat = torch.cat([s_real.flatten(1), s_imag.flatten(1)], dim=1)
+            h_in = torch.cat([h_in, s_flat], dim=1)
 
         # Normalize channel inputs
-        H_flat = self.h_norm(H_flat)
+        h_in = self.h_norm(h_in)
 
         # MS Controller: f_m^{w_m}(H(t)) → phase configurations
-        h_cond = F.relu(self.fc_h1(H_flat))
+        h_cond = F.relu(self.fc_h1(h_in))
         h_cond = F.relu(self.fc_h2(h_cond))
         theta_all = self.fc_h3(h_cond)  # (batch, total_phase_params)
 
@@ -932,6 +1069,145 @@ class RayleighChannel(nn.Module):
         # y = Hs (no noise - noise is added by SimRISChannel before decoder)
         y = torch.matmul(H, s.unsqueeze(-1)).squeeze(-1)
         return y, H
+
+class RiceanProxyChannel(nn.Module):
+    """
+    A Statistical Proxy Channel for E2E Training.
+    Simulates Ricean fading effects (Amplitude Scaling + AWGN) without
+    using a physical channel matrix H.
+
+    Forward: y = s * fading_gain + noise
+    """
+    def __init__(self, n_r, k_factor_db=10.0, noise_std=0.1):
+        super().__init__()
+        self.n_r = n_r
+        self.noise_std = noise_std
+
+        # Convert K-factor to linear weights
+        k_linear = 10 ** (k_factor_db / 10.0)
+        self.los_weight = math.sqrt(k_linear / (k_linear + 1))
+        self.nlos_weight = math.sqrt(1 / (k_linear + 1))
+
+    def forward(self, s, phase_mode="train"):
+        """
+        s: (batch, N_t) or (batch, 1, N_t) complex encoder output
+        """
+        if s.dim() == 3:
+            s = s.squeeze(1)
+
+        batch_size = s.shape[0]
+
+        # 1. Generate Ricean Fading Gain (Scalar or Vector)
+        # We simulate the magnitude degradation caused by the channel.
+        # Construct a random complex gain 'alpha' following Ricean stats.
+
+        # LoS Component (Constant magnitude, random phase or fixed)
+        # For simplicity in proxy, we often assume LoS aligns (constructive) or rotates.
+        los = torch.ones(batch_size, 1, device=s.device, dtype=torch.complex64)
+
+        # NLoS Component (Rayleigh: Complex Gaussian)
+        nlos_real = torch.randn(batch_size, 1, device=s.device) / math.sqrt(2)
+        nlos_imag = torch.randn(batch_size, 1, device=s.device) / math.sqrt(2)
+        nlos = torch.complex(nlos_real, nlos_imag)
+
+        # Combined Fading Gain alpha
+        alpha = self.los_weight * los + self.nlos_weight * nlos
+
+        # 2. Apply Fading to Signal
+        # Broadcast alpha to match s dimensions if needed, or expand s to match N_r
+        # Here we simulate that the received signal y is a faded version of s.
+        # Since s is (B, N_t) and y is (B, N_r), we need to project or repeat.
+        # PROXY SHORTCUT: Assume orthogonal transmission or repeat s to fill N_r.
+
+        # Simple Proxy: Just scale s and pad/crop to N_r
+        y_scaled = s * alpha  # Apply fading
+
+        if y_scaled.shape[1] < self.n_r:
+            # Pad if N_r > N_t
+            padding = torch.zeros(batch_size, self.n_r - y_scaled.shape[1],
+                                device=s.device, dtype=torch.complex64)
+            y = torch.cat([y_scaled, padding], dim=1)
+        else:
+            # Crop if N_t > N_r
+            y = y_scaled[:, :self.n_r]
+
+        # 3. Add AWGN
+        noise_real = torch.randn_like(y.real) * (self.noise_std / math.sqrt(2))
+        noise_imag = torch.randn_like(y.imag) * (self.noise_std / math.sqrt(2))
+        noise = torch.complex(noise_real, noise_imag)
+
+        y_out = y + noise
+
+        # Return None for H, as there is no physical H matrix
+        return y_out, (None, None)
+
+class E2EProxyTeacher(nn.Module):
+    """
+    End-to-End Teacher model using a Proxy Channel for distillation.
+    Consists of an Encoder, RiceanProxyChannel, and a simple classifier.
+    """
+    def __init__(self, nt, nr, k_factor_db=10.0, noise_std=0.1):
+        super().__init__()
+        self.encoder = Encoder(nt)
+        self.channel = RiceanProxyChannel(nr, k_factor_db=k_factor_db, noise_std=noise_std)
+        self.decoder = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(2 * nr, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 10)
+        )
+
+    def forward(self, x):
+        s = self.encoder(x)
+        y, _ = self.channel(s)
+        # y is (B, Nr) complex
+        y_ri = torch.cat([y.real, y.imag], dim=1)
+        logits = self.decoder(y_ri)
+        return logits
+
+    def extract_feature(self, x, preReLU=True):
+        """
+        Mimics Encoder.extract_feature() for distillation.
+        """
+        # Returns (feats, s_out)
+        return self.encoder.extract_feature(x, preReLU=preReLU)
+
+    def extract_features(self, x, preReLU=True):
+        """
+        Mimics MNISTClassifier.extract_features() for distillation.
+        Used by ControllerDistiller in Stage 2.
+        """
+        # For Stage 2, we might want features from the decoder or the channel output.
+        # But E2EProxyTeacher is mostly used as an alternative encoder teacher.
+        # If we need it for Stage 2, we can return something meaningful here.
+        # For now, let's return encoder features + a dummy or decoder feature.
+        enc_feats, s_out = self.encoder.extract_feature(x, preReLU=preReLU)
+
+        # To support Stage 2 (Controller distillation), we need features that
+        # ControllerDistiller expects (typically from the classifier's late layers).
+        # Let's return the decoder's intermediate features.
+        s_flat = s_out.squeeze(1)
+        y, _ = self.channel(s_flat)
+        y_ri = torch.cat([y.real, y.imag], dim=1)
+
+        # Manually pass through decoder parts
+        x_dec = self.decoder[0](y_ri)
+        x_dec = self.decoder[1](x_dec)
+        d1 = self.decoder[2](x_dec)
+        x_dec = self.decoder[3](d1)
+        d2 = self.decoder[4](x_dec)
+        logits = self.decoder[5](d2)
+
+        # Return concatenated list: encoder features + decoder features
+        # Stage 2 usually uses indices [2, 3] or similar.
+        return enc_feats + [d1, d2], logits
+
+    def get_channel_num(self):
+        # Encoder channels are [32, 64, 128]
+        # Plus decoder hidden dims [128, 64]
+        return self.encoder.get_channel_num() + [128, 64]
 
 class direct(nn.Module):
     def __init__(
@@ -1006,8 +1282,8 @@ class META_PATH(nn.Module):
         self.path_loss_ms = 10 ** (-path_loss_ms_db / 20.0)  # Convert dB to linear scale
 
     def _get_underlying_simnet(self):
-        """Get the underlying SimNet, unwrapping ChannelAwareSimNet if needed."""
-        if isinstance(self.simnet, ChannelAwareSimNet):
+        """Get the underlying SimNet, unwrapping SimNet_wrapper if needed."""
+        if isinstance(self.simnet, SimNet_wrapper):
             return self.simnet.simnet
         return self.simnet
 
@@ -1127,8 +1403,8 @@ class SimRISChannel(nn.Module):
         self.combine_mode = mode
 
     def _get_underlying_simnet(self):
-        """Get the underlying SimNet, unwrapping ChannelAwareSimNet if needed."""
-        if isinstance(self.simnet, ChannelAwareSimNet):
+        """Get the underlying SimNet, unwrapping SimNet_wrapper if needed."""
+        if isinstance(self.simnet, SimNet_wrapper):
             return self.simnet.simnet
         return self.simnet
 
@@ -1277,18 +1553,25 @@ class chennel_params():
 
 class SignalToFeatureConnector(nn.Module):
     """
-    Map complex received signal y (B, Nr) to teacher features (B, C, H, W).
-    Used in Stage 3 to distill teacher's later layers into the controller-guided channel output.
+    Map complex received signal y (B, Nr) to teacher features (B, C, H, W) or (B, C).
+    Used in Stage 2 to distill teacher's later layers into the controller-guided channel output.
     """
-    def __init__(self, n_r: int, target_channels: int, target_h: int, target_w: int):
+    def __init__(self, n_r: int, target_channels: int, target_h: int | None = None, target_w: int | None = None):
         super().__init__()
         # Input size is 2 * n_r (real + imag)
+        self.target_shape = (target_channels,)
+        if target_h is not None and target_w is not None:
+            self.target_shape = (target_channels, target_h, target_w)
+
+        flat_target_dim = 1
+        for dim in self.target_shape:
+            flat_target_dim *= dim
+
         self.fc = nn.Sequential(
             nn.Linear(2 * n_r, 512),
             nn.ReLU(),
-            nn.Linear(512, target_channels * target_h * target_w),
+            nn.Linear(512, flat_target_dim),
         )
-        self.target_shape = (target_channels, target_h, target_w)
 
     def forward(self, y: torch.Tensor) -> torch.Tensor:
         # y is complex (B, Nr)
@@ -1322,15 +1605,25 @@ class FeatureConnector(nn.Module):
 
         Args:
             s_feat: Student feature (B, C_s, H_s, W_s)
-            t_feat: Teacher feature (B, C_t, H_t, W_t) - used for spatial reference
+            t_feat: Teacher feature (B, C_t, H_t, W_t) OR (B, C_t)
+                   used for spatial reference
 
         Returns:
-            aligned: Aligned student feature (B, C_t, H_t, W_t)
+            aligned: Aligned student feature matching t_feat shape
         """
-        # Align channels first
+        # Align channels first (using Conv2d alignment)
         s_aligned = self.channel_align(s_feat)
 
-        # Align spatial dimensions if needed
+        # Handle target as vector (e.g., bottleneck layer)
+        if t_feat.dim() == 2:
+            if s_aligned.dim() == 4:
+                # Source is spatial (B, C, H, W), Target is vector (B, C).
+                # Global average pool and flatten.
+                s_aligned = F.adaptive_avg_pool2d(s_aligned, (1, 1))
+                s_aligned = s_aligned.reshape(s_aligned.size(0), -1)
+            return s_aligned
+
+        # Source and Target are both spatial (4D)
         if s_aligned.shape[2:] != t_feat.shape[2:]:
             # Use adaptive pooling or interpolation to match spatial size
             s_aligned = F.adaptive_avg_pool2d(s_aligned, t_feat.shape[2:])
@@ -1368,15 +1661,20 @@ class DistillConfig:
 class MNISTClassifier(nn.Module):
     """
     5-layer CNN classifier for MNIST digit recognition.
+    Supports an optional bottleneck layer for compression/distillation.
 
     Architecture:
     - Conv1: 1 -> 32 channels (3x3 kernel, stride 1, padding 1)
     - Conv2: 32 -> 64 channels (3x3 kernel, stride 1, padding 1) + MaxPool
     - [OPTIONAL] RayleighChannelLayer (if use_channel=True)
-    - Conv3: 64 -> 128 channels (3x3 kernel, stride 1, padding 1)
-    - Conv4: 128 -> 256 channels (3x3 kernel, stride 1, padding 1) + MaxPool
-    - Conv5: 256 -> 512 channels (3x3 kernel, stride 1, padding 1)
-    - Fully connected layers to 10 classes
+    - STANDARD MODE:
+        - Conv3: 64 -> 128 channels (3x3 kernel, stride 1, padding 1)
+        - Conv4: 128 -> 256 channels (3x3 kernel, stride 1, padding 1) + MaxPool
+        - Conv5: 256 -> 512 channels (3x3 kernel, stride 1, padding 1)
+        - Fully connected layers to 10 classes
+    - BOTTLENECK MODE (if bottleneck_dim is set):
+        - Bottleneck: Flatten -> Linear(64*14*14, bottleneck_dim) -> ReLU
+        - Classifier: Linear(bottleneck_dim, 128) -> ReLU -> Linear(128, 10)
 
     Input: (batch, 1, 28, 28)
     Output: (batch, 10) logits
@@ -1384,6 +1682,7 @@ class MNISTClassifier(nn.Module):
     Args:
         num_classes: Number of output classes (default: 10)
         use_channel: If True, insert Rayleigh channel layer after Layer 2
+        bottleneck_dim: If set, uses a bottleneck architecture after Layer 2
         channel_noise_std: Noise level for channel layer (default: 1e-2)
         channel_output_mode: 'magnitude' or 'real' for channel layer output
     """
@@ -1392,12 +1691,14 @@ class MNISTClassifier(nn.Module):
         self,
         num_classes: int = 10,
         use_channel: bool = False,
+        bottleneck_dim: int = None,
         channel_noise_std: float = 1e-2,
         channel_output_mode: str = "magnitude",
     ):
         super().__init__()
         self.num_classes = num_classes
         self.use_channel = use_channel
+        self.bottleneck_dim = bottleneck_dim
 
         # Layer 1: 1 -> 32
         self.conv1 = nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1)
@@ -1410,101 +1711,124 @@ class MNISTClassifier(nn.Module):
         self.relu2 = nn.ReLU()
         self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)  # 28x28 -> 14x14
 
-        # Optional channel layer (inserted between Layer 2 and Layer 3)
+        # Optional channel layers
         if use_channel:
-            self.channel_layer = RayleighChannelLayer(
+            self.channel_layer1 = RayleighChannelLayer(
                 num_channels=64,
                 noise_std=channel_noise_std,
                 output_mode=channel_output_mode,
             )
         else:
-            self.channel_layer = None
+            self.channel_layer1 = None
 
-        # Layer 3: 64 -> 128
-        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
-        self.bn3 = nn.BatchNorm2d(128)
-        self.relu3 = nn.ReLU()
+        if self.bottleneck_dim is not None:
+            # BOTTLENECK MODE: Compress 64x14x14 -> bottleneck_dim
+            self.flat_dim = 64 * 14 * 14
+            self.bottleneck_layer = nn.Linear(self.flat_dim, self.bottleneck_dim)
+            self.bottleneck_relu = nn.ReLU()
 
-        # Layer 4: 128 -> 256 + MaxPool
-        self.conv4 = nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1)
-        self.bn4 = nn.BatchNorm2d(256)
-        self.relu4 = nn.ReLU()
-        self.pool4 = nn.MaxPool2d(kernel_size=2, stride=2)  # 14x14 -> 7x7
+            # Classification Path
+            self.fc_p1 = nn.Linear(self.bottleneck_dim, 128)
+            self.fc_p2 = nn.Linear(128, num_classes)
 
-        # Layer 5: 256 -> 512
-        self.conv5 = nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1)
-        self.bn5 = nn.BatchNorm2d(512)
-        self.relu5 = nn.ReLU()
+            # Unused standard layers
+            self.conv3 = self.bn3 = self.relu3 = None
+            self.conv4 = self.bn4 = self.relu4 = self.pool4 = None
+            self.conv5 = self.bn5 = self.relu5 = None
+            self.channel_layer2 = None
+            self.global_pool = self.fc1 = self.fc_relu = self.dropout = self.fc2 = None
+        else:
+            # STANDARD MODE (Keep original logic)
+            self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
+            self.bn3 = nn.BatchNorm2d(128)
+            self.relu3 = nn.ReLU()
 
-        # Global average pooling + classifier
-        self.global_pool = nn.AdaptiveAvgPool2d(1)  # -> (batch, 512, 1, 1)
-        self.fc1 = nn.Linear(512, 256)
-        self.fc_relu = nn.ReLU()
-        self.dropout = nn.Dropout(0.5)
-        self.fc2 = nn.Linear(256, num_classes)
+            self.conv4 = nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1)
+            self.bn4 = nn.BatchNorm2d(256)
+            self.relu4 = nn.ReLU()
+            self.pool4 = nn.MaxPool2d(kernel_size=2, stride=2)  # 14x14 -> 7x7
+
+            if use_channel:
+                self.channel_layer2 = RayleighChannelLayer(
+                    num_channels=256,
+                    noise_std=channel_noise_std,
+                    output_mode=channel_output_mode,
+                )
+            else:
+                self.channel_layer2 = None
+
+            self.conv5 = nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1)
+            self.bn5 = nn.BatchNorm2d(512)
+            self.relu5 = nn.ReLU()
+
+            self.global_pool = nn.AdaptiveAvgPool2d(1)
+            self.fc1 = nn.Linear(512, 256)
+            self.fc_relu = nn.ReLU()
+            self.dropout = nn.Dropout(0.5)
+            self.fc2 = nn.Linear(256, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass.
-
-        Args:
-            x: Input tensor (batch, 1, 28, 28)
-
-        Returns:
-            logits: Output logits (batch, num_classes)
         """
-        # Layer 1
+        # Common Layers 1 & 2
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu1(x)
-
-        # Layer 2 + pool
         x = self.conv2(x)
         x = self.bn2(x)
         x = self.relu2(x)
         x = self.pool2(x)
 
-        # Optional channel layer
-        if self.channel_layer is not None:
-            x = self.channel_layer(x)
+        if self.bottleneck_dim is not None:
+            # --- Bottleneck Path ---
+            if self.channel_layer1 is not None:
+                x = self.channel_layer1(x)
 
-        # Layer 3
-        x = self.conv3(x)
-        x = self.bn3(x)
-        x = self.relu3(x)
+            x = x.reshape(x.size(0), -1)      # Flatten
+            x = self.bottleneck_layer(x)   # Compress
+            x = self.bottleneck_relu(x)
 
-        # Layer 4 + pool
-        x = self.conv4(x)
-        x = self.bn4(x)
-        x = self.relu4(x)
-        x = self.pool4(x)
+            # Classification
+            x = F.relu(self.fc_p1(x))
+            x = self.fc_p2(x)
+            return x
+        else:
+            # --- Standard Path ---
+            if self.channel_layer1 is not None:
+                x = self.channel_layer1(x)
 
-        # Layer 5
-        x = self.conv5(x)
-        x = self.bn5(x)
-        x = self.relu5(x)
+            x = self.conv3(x)
+            x = self.bn3(x)
+            x = self.relu3(x)
 
-        # Classifier
-        x = self.global_pool(x)
-        x = x.view(x.size(0), -1)  # (batch, 512)
-        x = self.fc1(x)
-        x = self.fc_relu(x)
-        x = self.dropout(x)
-        x = self.fc2(x)
+            x = self.conv4(x)
+            x = self.bn4(x)
+            x = self.relu4(x)
+            x = self.pool4(x)
 
-        return x
+            if self.channel_layer2 is not None:
+                x = self.channel_layer2(x)
+
+            x = self.conv5(x)
+            x = self.bn5(x)
+            x = self.relu5(x)
+
+            x = self.global_pool(x)
+            x = x.view(x.size(0), -1)
+            x = self.fc1(x)
+            x = self.fc_relu(x)
+            x = self.dropout(x)
+            x = self.fc2(x)
+
+            return x
 
     def extract_features(self, x: torch.Tensor, preReLU: bool = True):
         """
-        Extract intermediate features from first 5 conv layers.
+        Extract intermediate features.
 
-        Args:
-            x: Input tensor (batch, 1, 28, 28)
-            preReLU: If True, return features before ReLU; otherwise after ReLU
-
-        Returns:
-            feats: List of 5 feature tensors [feat1, feat2, feat3, feat4, feat5]
-            output: Final classifier output (batch, num_classes)
+        If bottleneck_dim is set: returns [feat1, feat2, bottleneck_feat]
+        Otherwise: returns [feat1, feat2, feat3, feat4, feat5]
         """
         feats = []
 
@@ -1521,54 +1845,72 @@ class MNISTClassifier(nn.Module):
         x = self.relu2(x)
         x = self.pool2(x)
 
-        # Optional channel layer (applied during feature extraction for distillation)
-        if self.channel_layer is not None:
-            x = self.channel_layer(x)
+        if self.channel_layer1 is not None:
+            x = self.channel_layer1(x)
 
-        # Append second feature AFTER pooling and optional channel (aligns with extractor)
+        # Post pool and channel for layer 2
         feats.append(x)
 
-        # Layer 3
-        x = self.conv3(x)
-        x = self.bn3(x)
-        feats.append(x if preReLU else self.relu3(x))
-        x = self.relu3(x)
+        if self.bottleneck_dim is not None:
+            # --- Bottleneck Feature Extraction ---
+            x_bn = self.bottleneck_layer(x.reshape(x.size(0), -1))
+            feats.append(x_bn) # This is the target for the student's 3rd feature
 
-        # Layer 4 + pool
-        x = self.conv4(x)
-        x = self.bn4(x)
-        x_out_4 = x if preReLU else self.relu4(x)
-        x = self.relu4(x)
-        x = self.pool4(x)
-        feats.append(x) # post pool for layer 4
+            # Classification for output
+            x = self.bottleneck_relu(x_bn)
+            x = F.relu(self.fc_p1(x))
+            output = self.fc_p2(x)
+            return feats, output
+        else:
+            # --- Standard Feature Extraction ---
+            # Layer 3
+            x = self.conv3(x)
+            x = self.bn3(x)
+            feats.append(x if preReLU else self.relu3(x))
+            x = self.relu3(x)
 
-        # Layer 5
-        x = self.conv5(x)
-        x = self.bn5(x)
-        feats.append(x if preReLU else self.relu5(x))
-        x = self.relu5(x)
+            # Layer 4 + pool
+            x = self.conv4(x)
+            x = self.bn4(x)
+            x_out_4 = x if preReLU else self.relu4(x)
+            x = self.relu4(x)
+            x = self.pool4(x)
 
-        # Classifier
-        x = self.global_pool(x)
-        x = x.view(x.size(0), -1)
-        x = self.fc1(x)
-        x = self.fc_relu(x)
-        x = self.dropout(x)
-        output = self.fc2(x)
+            if self.channel_layer2 is not None:
+                x = self.channel_layer2(x)
 
-        return feats, output
+            feats.append(x)
+
+            # Layer 5
+            x = self.conv5(x)
+            x = self.bn5(x)
+            feats.append(x if preReLU else self.relu5(x))
+            x = self.relu5(x)
+
+            # Classifier
+            x = self.global_pool(x)
+            x = x.view(x.size(0), -1)
+            x = self.fc1(x)
+            x = self.fc_relu(x)
+            x = self.dropout(x)
+            output = self.fc2(x)
+
+            return feats, output
+
+    def get_channel_num(self) -> list[int]:
+        """Return channel numbers for the conv layers / bottleneck."""
+        if self.bottleneck_dim is not None:
+            return [32, 64, self.bottleneck_dim]
+        return [32, 64, 128, 256, 512]
 
 
 class CNNTeacherExtractor(nn.Module):
     """
-    Extracts and freezes the first 2 CNN layers from a trained MNISTClassifier
+    Extracts and freezes CNN layers from a trained MNISTClassifier
     to use as a teacher for encoder feature distillation.
 
-    This class wraps the first 2 conv layers of the classifier and provides
-    a compatible interface with EncoderFeatureDistiller.
-
-    If the classifier has a channel layer, it is included and applied during
-    feature extraction so the student learns from channel-robust features.
+    If the classifier has a bottleneck layer, it can optionally be included
+    as the 3rd teacher feature.
     """
 
     def __init__(self, classifier: MNISTClassifier):
@@ -1582,8 +1924,14 @@ class CNNTeacherExtractor(nn.Module):
         self.relu2 = classifier.relu2
         self.pool2 = classifier.pool2
 
+        # Include bottleneck layer if present
+        self.bottleneck_dim = classifier.bottleneck_dim
+        if self.bottleneck_dim is not None:
+            self.bottleneck_layer = classifier.bottleneck_layer
+            self.bottleneck_relu = classifier.bottleneck_relu
+
         # Include channel layer if present in the classifier
-        self.channel_layer = classifier.channel_layer if hasattr(classifier, 'channel_layer') else None
+        self.channel_layer1 = classifier.channel_layer1 if hasattr(classifier, 'channel_layer1') else None
 
         # Freeze all parameters
         for param in self.parameters():
@@ -1593,18 +1941,7 @@ class CNNTeacherExtractor(nn.Module):
 
     def extract_feature(self, x: torch.Tensor, preReLU: bool = True):
         """
-        Extract features from first 2 conv layers.
-
-        If classifier has a channel layer, it is applied to the features so
-        the student learns channel-robust representations.
-
-        Args:
-            x: Input tensor (batch, 1, 28, 28)
-            preReLU: If True, return features before ReLU; otherwise after ReLU
-
-        Returns:
-            feats: List of 2 feature tensors [feat1 (32 ch), feat2 (64 ch)]
-            dummy_output: Dummy output (zeros) to match expected interface
+        Extract features. Returns [feat1, feat2] or [feat1, feat2, bottleneck_feat].
         """
         feats = []
 
@@ -1617,27 +1954,31 @@ class CNNTeacherExtractor(nn.Module):
         # Layer 2 + pool
         x2 = self.conv2(x1)
         x2 = self.bn2(x2)
-        # Store pre-channel version of x2 if needed, but for now we want student to mimic post-channel features
         x2_out = x2 if preReLU else self.relu2(x2)
         x2_pool = self.pool2(x2_out)
 
-        # Apply channel layer if present (FIX A: Student mimics robust features)
-        if self.channel_layer is not None:
-            # Apply channel to the feature map
-            x2_final = self.channel_layer(x2_pool)
+        # Apply channel layer if present
+        if self.channel_layer1 is not None:
+            x2_final = self.channel_layer1(x2_pool)
         else:
             x2_final = x2_pool
 
         feats.append(x2_final)
 
+        if self.bottleneck_dim is not None:
+            # Add bottleneck as 3rd feature
+            x_bn = self.bottleneck_layer(x2_final.reshape(x2_final.size(0), -1))
+            feats.append(x_bn)
+
         # Return dummy output to match encoder interface
-        # EncoderFeatureDistiller expects (feats, output), but we only use feats
         dummy_output = torch.zeros(x.size(0), 1, 1, dtype=torch.complex64, device=x.device)
 
         return feats, dummy_output
 
     def get_channel_num(self) -> list[int]:
-        """Return channel numbers for the 2 conv layers."""
+        """Return channel numbers for the extracted layers."""
+        if self.bottleneck_dim is not None:
+            return [32, 64, self.bottleneck_dim]
         return [32, 64]
 
     def forward(self, x: torch.Tensor):
@@ -1648,51 +1989,82 @@ class CNNTeacherExtractor(nn.Module):
 
 class ControllerDistiller(nn.Module):
     """
-    Distillation wrapper for Stage 3: Train Controller using Teacher Layers 3 & 4.
-    Matches the received signal y (post-channel) to teacher features.
+    Distillation wrapper for Stage 2: Train Controller using a Teacher.
+    - If a teacher_model (classifier) is provided, it matches the received signal y to teacher features.
+    - If a teacher_controller is provided, it performs direct controller-to-controller distillation.
     """
-    def __init__(self, teacher: MNISTClassifier, n_r: int, layer_configs: list[tuple[int, int, int]]):
+    def __init__(self, teacher: nn.Module | None = None, n_r: int | None = None,
+                 layer_configs: list[tuple] | None = None,
+                 layer_indices: list[int] = [2, 3],
+                 teacher_controller: nn.Module | None = None):
         super().__init__()
         self.teacher = teacher
-        # layer_configs should be [(channels, h, w), ...] for target layers
-        self.connectors = nn.ModuleList([
-            SignalToFeatureConnector(n_r, *cfg) for cfg in layer_configs
-        ])
+        self.teacher_controller = teacher_controller
+        self.layer_indices = layer_indices
+        self.connectors = nn.ModuleList()
 
-        # Freeze teacher
-        for p in self.teacher.parameters():
-            p.requires_grad = False
-        self.teacher.eval()
+        if self.teacher is not None and n_r is not None and layer_configs is not None:
+            # Feature-based distillation (from CNN)
+            self.connectors = nn.ModuleList([
+                SignalToFeatureConnector(n_r, *cfg) for cfg in layer_configs
+            ])
+            # Freeze teacher
+            for p in self.teacher.parameters():
+                p.requires_grad = False
+            self.teacher.eval()
 
-    def forward(self, images: torch.Tensor, y_received: torch.Tensor, layer_indices: list[int] = [2, 3], reduction: str = 'mean'):
+        if self.teacher_controller is not None:
+            # Freeze teacher controller
+            for p in self.teacher_controller.parameters():
+                p.requires_grad = False
+            self.teacher_controller.eval()
+
+    def forward(self, images: torch.Tensor, y_received: torch.Tensor | None = None,
+                H_1: torch.Tensor | None = None, H_D: torch.Tensor | None = None, H_2: torch.Tensor | None = None,
+                s_ms: torch.Tensor | None = None,
+                student_controller: nn.Module | None = None,
+                reduction: str = 'mean'):
         """
-        Compute distillation loss between received signal and teacher features.
-
-        Args:
-            images: Input images (B, 1, 28, 28)
-            y_received: Complex received signal (B, Nr)
-            layer_indices: Indices of features in teacher.extract_features() to match.
-                           Default [2, 3] corresponds to Layers 3 and 4.
-            reduction: 'mean' or 'none'. If 'none', returns loss per sample (B,).
+        Compute distillation loss.
+        - If self.teacher is set, performs feature distillation (needs images, y_received).
+        - If self.teacher_controller is set, performs direct controller distillation (needs H_1, H_D, H_2, student_controller).
         """
-        with torch.no_grad():
-            t_feats, _ = self.teacher.extract_features(images, preReLU=True)
-
         loss_distill = 0
-        for i, idx in enumerate(layer_indices):
-            # Target teacher feature
-            t_feat = t_feats[idx]
-            # Map y to same space
-            y_mapped = self.connectors[i](y_received)
 
-            # F.mse_loss with reduction='none' returns (B, C, H, W)
-            l = F.mse_loss(y_mapped, t_feat, reduction='none')
-            # Reduce over all dims except batch
-            l = l.view(l.size(0), -1).mean(dim=1)
-            loss_distill += l
+        # 1. Direct Controller-to-Controller Distillation
+        if self.teacher_controller is not None and student_controller is not None:
+            if H_1 is None:
+                raise ValueError("Direct controller distillation requires H_1.")
+
+            with torch.no_grad():
+                t_thetas = self.teacher_controller(H_1=H_1, H_D=H_D, H_2=H_2, s_ms=s_ms)
+
+            s_thetas = student_controller(H_1=H_1, H_D=H_D, H_2=H_2, s_ms=s_ms)
+
+            for t_theta, s_theta in zip(t_thetas, s_thetas):
+                # Match the output phases (theta)
+                l = F.mse_loss(s_theta, t_theta, reduction='none')
+                l = l.view(l.size(0), -1).mean(dim=1)
+                loss_distill += l
+
+        # 2. Feature-based Distillation (from CNN)
+        if self.teacher is not None and y_received is not None:
+            with torch.no_grad():
+                t_feats, _ = self.teacher.extract_features(images, preReLU=True)
+
+            for i, idx in enumerate(self.layer_indices):
+                if idx >= len(t_feats):
+                    continue
+                t_feat = t_feats[idx]
+                y_mapped = self.connectors[i](y_received)
+                l = F.mse_loss(y_mapped, t_feat, reduction='none')
+                l = l.view(l.size(0), -1).mean(dim=1)
+                loss_distill += l
 
         if reduction == 'mean':
-            return loss_distill.mean()
+            if isinstance(loss_distill, torch.Tensor):
+                return loss_distill.mean()
+            return torch.tensor(0.0, device=images.device)
         return loss_distill
 
 
@@ -1874,7 +2246,7 @@ if __name__ == '__main__':
         print(f"Created channel pools: {', '.join(pools_summary)}")
 
     # Combined channel wrapper
-    channel = SimRISChannel_new(
+    channel = SimRISChannel(
         noise_std=noise_std,
         combine_mode=channel_mode,
         path_loss_direct_db=3.0,
