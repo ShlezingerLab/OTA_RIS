@@ -7,7 +7,7 @@ from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 from torch.utils.data import Subset, DataLoader
 from flow import *
-from channel_tensors import generate_channel_tensors_by_type
+from channels import generate_channel_tensors_by_type
 import numpy as np  # note
 import argparse
 import math
@@ -362,12 +362,14 @@ plot_path: str | None = None,
 plot_live: bool = False,
 show_plot_end: bool = True,
 tx_power_dbm: float = 30.0,
-metasurface_type: str = "sim"):
+metasurface_type: str = "sim",
+teacher_model=None,
+lambda_teacher: float = 1e-4):
     """
     2-PHASE MINN training loop:
 
     Phase 1 (encoder_distiller is not None): Train ONLY encoder with CNN teacher distillation
-      - Encoder learns from feature distillation loss (MSE with CNN teacher features)
+      - Encoder learns from feature distillation loss (geometrical loss with CNN teacher features)
       - Decoder/controller are NOT trained, channel operations are skipped
       - Output: Trained encoder with good feature representations
       - No classification accuracy (only distillation loss)
@@ -375,7 +377,8 @@ metasurface_type: str = "sim"):
     Phase 2 (encoder_distiller is None): Train decoder + controller with frozen encoder
       - Encoder is frozen and used as feature extractor
       - Full pipeline: Encoder --> Channel --> Decoder
-      - Decoder/controller learn from classification loss
+      - Decoder/controller learn from classification loss + optional teacher logit distillation
+      - Loss = CE(logits, labels) + λ_teacher * CE(logits, teacher_logits)
       - Encoder parameters are NOT updated
 
     Supports channel-aware mode: if decoder is channel-aware, passes H(t) to decoder.
@@ -384,7 +387,7 @@ metasurface_type: str = "sim"):
 
     if encoder_distiller is None:
         # Phase 2: Train decoder + controller (encoder is frozen)
-        print("[INFO] Phase 2: Training decoder + controller (encoder frozen)")
+        print("[INFO] Training decoder + controller (encoder frozen)")
         decoder.to(device)
         params += [p for p in decoder.parameters() if p.requires_grad]
         if combine_mode in ["metanet", "both"]:
@@ -407,6 +410,13 @@ metasurface_type: str = "sim"):
         encoder.eval()
         for p in encoder.parameters():
             p.requires_grad = False
+        # Setup teacher model for logit distillation if provided
+        if teacher_model is not None:
+            teacher_model.to(device)
+            teacher_model.eval()
+            for p in teacher_model.parameters():
+                p.requires_grad = False
+            print(f"[INFO] Using teacher logit distillation with lambda={lambda_teacher}")
     else:
         # Phase 1: Train ONLY encoder with distillation
         print("[INFO] Phase 1: Training encoder with CNN teacher distillation (decoder/controller skipped)")
@@ -536,21 +546,34 @@ metasurface_type: str = "sim"):
             loss_ce = criterion(logits, labels)
             loss = loss_ce
 
+            # Add teacher logit distillation if teacher is provided
+            loss_teacher = images.new_tensor(0.0)
+            if teacher_model is not None:
+                with torch.no_grad():
+                    teacher_logits = teacher_model(images)
+                # Distillation loss: cross-entropy between student logits and teacher logits (as soft labels)
+                loss_teacher = F.cross_entropy(logits, teacher_logits.softmax(dim=1))
+                loss = loss + lambda_teacher * loss_teacher
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
             running_loss += loss.item()
             running_ce += loss_ce.item()
+            running_fd += loss_teacher.item()
             probs = torch.softmax(logits, dim=1)
             _, predicted = torch.max(probs.data, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
 
-            pbar.set_postfix({
+            postfix = {
                 'loss': f"{loss.item():.4f}",
                 'acc': f"{100 * correct / total:.2f}%"
-            })
+            }
+            if teacher_model is not None:
+                postfix['loss_teacher'] = f"{loss_teacher.item():.4f}"
+            pbar.set_postfix(postfix)
 
         epoch_loss = running_loss / len(train_loader)
         epoch_ce = running_ce / len(train_loader)
@@ -564,7 +587,10 @@ metasurface_type: str = "sim"):
         if encoder_distiller is not None:
             print(f"Epoch {epoch+1}/{num_epochs} | Loss_FD: {epoch_fd:.4f}")
         else:
-            print(f"Epoch {epoch+1}/{num_epochs} | Loss: {epoch_loss:.4f} | Acc: {epoch_accuracy:.2f}%")
+            msg = f"Epoch {epoch+1}/{num_epochs} | Loss: {epoch_loss:.4f} | Acc: {epoch_accuracy:.2f}%"
+            if teacher_model is not None:
+                msg += f" | Loss_Teacher: {epoch_fd:.4f}"
+            print(msg)
 
         if plot_acc:
             xs = list(range(1, len(epoch_accs) + 1))
@@ -634,7 +660,8 @@ def train_minn_staged(channel, encoder, decoder, controller, physical_sim, train
                       controller_distiller: ControllerDistiller | None = None,
                       tx_power_dbm=30.0, metasurface_type="sim",
                       plot_acc=False, plot_path=None, plot_live=False, show_plot_end=True,
-                      grad_approx: bool = False, grad_approx_sigma: float = 0.1):
+                      grad_approx: bool = False, grad_approx_sigma: float = 0.1,
+                      matrix_distill_lambda: float = 1.0):
     """
     STAGED training loop for the 4-stage procedure:
     Stage 1: Train Encoder via distillation from Teacher Layers 1-2.
@@ -662,9 +689,17 @@ def train_minn_staged(channel, encoder, decoder, controller, physical_sim, train
             raise ValueError("Stage 2 requires controller_distiller.")
         controller_distiller.to(device)
         controller.to(device)
+        use_matrix_loss = (
+            hasattr(controller_distiller, "teacher")
+            and controller_distiller.teacher is not None
+            and hasattr(controller_distiller.teacher, "get_intermediate_ws")
+        )
+        if use_matrix_loss and str(combine_mode).lower() == "direct":
+            raise ValueError("Matrix distillation loss requires combine_mode 'metanet' or 'both'.")
         # Train controller AND distillation connectors
         params += [p for p in controller.parameters() if p.requires_grad]
-        params += [p for p in controller_distiller.connectors.parameters() if p.requires_grad]
+        if not use_matrix_loss:
+            params += [p for p in controller_distiller.connectors.parameters() if p.requires_grad]
         # Freeze encoder and decoder
         encoder.eval(); decoder.eval()
         for p in list(encoder.parameters()) + list(decoder.parameters()):
@@ -722,6 +757,53 @@ def train_minn_staged(channel, encoder, decoder, controller, physical_sim, train
         fig, (ax_acc, ax_loss) = plt.subplots(nrows=2, ncols=1, figsize=(7, 7), sharex=True)
         if plot_live: plt.ion()
         if plot_path is None: plot_path = f"MY_code/plots/training_curves_stage{stage}.png"
+
+    def _matrix_distill_loss(teacher, images, H_1, H_2_eff, theta_list, metasurface_type, physical_sim=None, reduction="mean", lambda_weight=1.0):
+        ms_type = str(metasurface_type).lower()
+        with torch.no_grad():
+            w_teacher_list = teacher.get_intermediate_ws(images)
+        if ms_type == "ris":
+            if isinstance(theta_list, (list, tuple)):
+                if len(theta_list) != 1:
+                    raise ValueError(f"Matrix distillation expects 1 theta vector (got {len(theta_list)})")
+                theta = theta_list[0]
+            else:
+                theta = theta_list
+            phi = torch.exp(-1j * theta)
+            H2_phi = H_2_eff * phi.unsqueeze(1)
+            w_target = torch.matmul(H2_phi, H_1)
+        elif ms_type == "sim":
+            if physical_sim is None:
+                raise ValueError("Matrix distillation for metasurface_type='sim' requires physical_sim.")
+            simnet = physical_sim.simnet
+            num_layers = len(simnet.ris_layers)
+            if not isinstance(theta_list, (list, tuple)) or len(theta_list) != num_layers:
+                raise ValueError(f"SIM expects {num_layers} theta layers (got {0 if not isinstance(theta_list, (list, tuple)) else len(theta_list)})")
+            def _theta_to_phi(theta: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+                theta = torch.sigmoid(theta) * (2 * torch.pi)
+                return torch.exp(1j * theta).to(dtype)
+            phi_list = [_theta_to_phi(t, torch.complex64) for t in theta_list]
+            M = torch.diag_embed(phi_list[0])
+            for i in range(1, num_layers):
+                W = simnet.transmission_layers[i - 1]().to(M.device)
+                if not torch.is_complex(W):
+                    W = W.to(torch.complex64)
+                M = torch.matmul(M, W)
+                D_i = torch.diag_embed(phi_list[i])
+                M = torch.matmul(M, D_i)
+            M_T = M.transpose(1, 2)
+            w_target = torch.matmul(torch.matmul(H_2_eff, M_T), H_1)
+        else:
+            raise ValueError("Matrix distillation loss requires metasurface_type='ris' or 'sim'.")
+        per_layer_losses = []
+        for w_teacher in w_teacher_list:
+            diff = w_target - w_teacher
+            per_sample = torch.mean(torch.abs(diff) ** 2, dim=(1, 2))
+            per_layer_losses.append(per_sample)
+        loss_per_sample = torch.stack(per_layer_losses, dim=0).mean(dim=0)
+        if reduction == "none":
+            return lambda_weight * loss_per_sample
+        return lambda_weight * loss_per_sample.mean()
 
     for epoch in range(num_epochs):
         running_loss = 0.0
@@ -830,13 +912,26 @@ def train_minn_staged(channel, encoder, decoder, controller, physical_sim, train
                 if grad_approx:
                     # REINFORCE gradient estimate for controller
                     # 1. Distiller loss per sample (reduction='none')
-                    # Pass extra arguments for potential direct controller distillation
-                    loss_fd_per_sample = controller_distiller(
-                        images=images, y_received=y, reduction='none',
-                        H_1=H_1, H_D=H_D_eff, H_2=H_2_eff,
-                        s_ms=s_ms,
-                        student_controller=controller
-                    )
+                    if use_matrix_loss:
+                        loss_fd_per_sample = _matrix_distill_loss(
+                            controller_distiller.teacher,
+                            images=images,
+                            H_1=H_1,
+                            H_2_eff=H_2_eff,
+                            theta_list=theta_list_for_phys,
+                            metasurface_type=metasurface_type,
+                            physical_sim=physical_sim,
+                            reduction='none',
+                            lambda_weight=matrix_distill_lambda,
+                        )
+                    else:
+                        # Pass extra arguments for potential direct controller distillation
+                        loss_fd_per_sample = controller_distiller(
+                            images=images, y_received=y, reduction='none',
+                            H_1=H_1, H_D=H_D_eff, H_2=H_2_eff,
+                            s_ms=s_ms,
+                            student_controller=controller
+                        )
 
                     # 2. Surrogate loss for controller: E[L.detach() * log_prob]
                     # We want to minimize E[L], so the gradient is E[L * grad log pi]
@@ -850,12 +945,24 @@ def train_minn_staged(channel, encoder, decoder, controller, physical_sim, train
 
                     running_fd += loss_connectors.item()
                 else:
-                    loss_fd = controller_distiller(
-                        images=images, y_received=y,
-                        H_1=H_1, H_D=H_D_eff, H_2=H_2_eff,
-                        s_ms=s_ms,
-                        student_controller=controller
-                    )
+                    if use_matrix_loss:
+                        loss_fd = _matrix_distill_loss(
+                            controller_distiller.teacher,
+                            images=images,
+                            H_1=H_1,
+                            H_2_eff=H_2_eff,
+                            theta_list=theta_list,
+                            metasurface_type=metasurface_type,
+                            physical_sim=physical_sim,
+                            lambda_weight=matrix_distill_lambda,
+                        )
+                    else:
+                        loss_fd = controller_distiller(
+                            images=images, y_received=y,
+                            H_1=H_1, H_D=H_D_eff, H_2=H_2_eff,
+                            s_ms=s_ms,
+                            student_controller=controller
+                        )
                     loss = loss_fd
                     running_fd += loss_fd.item()
 
@@ -1354,8 +1461,147 @@ def train_classifier(classifier, train_loader, num_epochs=20, lr=1e-3, weight_de
     }
 
 
+def train_classifier_complexity_shift(classifier, train_loader, num_epochs=10, lr=1e-4, device="cpu",
+                                      lambda_complexity=0.01, complexity_type="l1",
+                                      plot_acc=False, plot_path=None,
+                                      plot_live=False, show_plot_end=True):
+    """
+    Phase 2: The Complexity Shift.
+    Fine-tune the teacher while penalizing encoder complexity to shift 'heaviness' to the decoder.
+    """
+    classifier.to(device)
+    # Lower default learning rate for fine-tuning
+    optimizer = optim.Adam(classifier.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
+
+    epoch_accs: list[float] = []
+    epoch_losses: list[float] = []
+    epoch_complexity_losses: list[float] = []
+
+    # Plotting setup
+    if plot_acc:
+        if (not plot_live) and (not show_plot_end):
+            import matplotlib
+            matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        fig, (ax_acc, ax_loss) = plt.subplots(nrows=2, ncols=1, figsize=(7, 7), sharex=True)
+        if plot_live:
+            plt.ion()
+        if plot_path is None:
+            plot_path = "MY_code/plots/classifier_complexity_shift_curves.png"
+
+    for epoch in range(num_epochs):
+        classifier.train()
+        running_loss = 0.0
+        running_complexity = 0.0
+        correct = 0
+        total = 0
+        pbar = tqdm(train_loader, desc=f"Shift Epoch {epoch+1}/{num_epochs}")
+
+        for images, labels in pbar:
+            images = images.to(device)
+            labels = labels.to(device)
+
+            # 1. Forward pass (classification)
+            logits = classifier(images)
+            loss_ce = criterion(logits, labels)
+
+            # 2. Complexity penalty on Encoder (conv1, conv2)
+            loss_complexity = torch.tensor(0.0, device=device)
+            if complexity_type == "l1":
+                # L1 on weights of conv1 and conv2
+                for name, param in classifier.named_parameters():
+                    if "conv1.weight" in name or "conv2.weight" in name:
+                        loss_complexity = loss_complexity + torch.norm(param, 1)
+            elif complexity_type == "activity":
+                # Penalty on ReLU activity in encoder
+                # Use extract_features to get intermediate activations (preReLU=False for post-activation)
+                feats, _ = classifier.extract_features(images, preReLU=False)
+                # feats[0] is relu1(bn1(conv1(x))), feats[1] is Rayleigh(pool2(relu2(bn2(conv2(x)))))
+                # We penalize the first two feature maps which correspond to the encoder.
+                for f in feats[:2]:
+                    loss_complexity = loss_complexity + torch.mean(torch.abs(f))
+
+            loss = loss_ce + lambda_complexity * loss_complexity
+
+            # 3. Backward and optimize
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            # Statistics
+            running_loss += loss_ce.item()
+            running_complexity += loss_complexity.item()
+            _, predicted = torch.max(logits.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+            pbar.set_postfix({
+                'loss_ce': f"{loss_ce.item():.4f}",
+                'loss_comp': f"{loss_complexity.item():.4f}",
+                'acc': f"{100 * correct / total:.2f}%"
+            })
+
+        epoch_loss = running_loss / len(train_loader)
+        epoch_comp = running_complexity / len(train_loader)
+        epoch_accuracy = 100 * correct / total
+        epoch_losses.append(float(epoch_loss))
+        epoch_complexity_losses.append(float(epoch_comp))
+        epoch_accs.append(float(epoch_accuracy))
+
+        print(f"Epoch {epoch+1}/{num_epochs} | Loss_CE: {epoch_loss:.4f} | Loss_Comp: {epoch_comp:.4f} | Acc: {epoch_accuracy:.2f}%")
+
+        if plot_acc:
+            xs = list(range(1, len(epoch_accs) + 1))
+            ax_acc.clear()
+            ax_acc.plot(xs, epoch_accs, label="acc (%)")
+            ax_acc.grid(True)
+            ax_acc.set_ylim(0.0, 100.0)
+            ax_acc.set_ylabel("acc (%)")
+            ax_acc.set_title("Complexity Shift Curves")
+            ax_acc.legend(loc="best")
+
+            ax_loss.clear()
+            ax_loss.plot(xs, epoch_losses, label="loss_ce")
+            ax_loss.plot(xs, epoch_complexity_losses, label="loss_comp")
+            ax_loss.grid(True)
+            ax_loss.set_xlabel("epoch")
+            ax_loss.set_ylabel("loss")
+            ax_loss.legend(loc="best")
+            fig.tight_layout()
+
+            if plot_path:
+                os.makedirs(os.path.dirname(plot_path) or ".", exist_ok=True)
+                fig.savefig(plot_path)
+
+            if plot_live:
+                try:
+                    plt.show(block=False)
+                    plt.pause(0.001)
+                except Exception:
+                    pass
+
+    print("Complexity shift training finished!")
+    if plot_acc and show_plot_end:
+        try:
+            import matplotlib.pyplot as plt
+            if plot_live:
+                plt.ioff()
+            plt.show()
+        except Exception:
+            pass
+
+    return {
+        "epoch": list(range(1, len(epoch_accs) + 1)),
+        "acc": epoch_accs,
+        "loss_ce": epoch_losses,
+        "loss_comp": epoch_complexity_losses,
+        "plot_path": plot_path,
+    }
+
+
 if __name__ == '__main__':
-    from flow import Encoder, Decoder, build_simnet, Controller_DNN, Physical_SIM, MNISTClassifier, CNNTeacherExtractor, E2EProxyTeacher  # adapt imports
+    from flow import Encoder, Decoder, build_simnet, Controller_DNN, Physical_SIM, MNISTClassifier, CNNTeacherExtractor, E2EProxyTeacher, HeavyIntermediateTeacher  # adapt imports
     parser = argparse.ArgumentParser(description='Train MINN on MNIST dataset')
     # Data configuration
     parser.add_argument('--subset_size', type=int, default=1000, help='Number of samples to use from training set')
@@ -1444,6 +1690,8 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
     parser.add_argument('--grad_approx', action='store_true', help='Use gradient approximation (REINFORCE) for controller training in Stage 3')
     parser.add_argument('--grad_approx_sigma', type=float, default=0.1, help='Sigma (noise std) for gradient approximation stochastic relaxation')
+    parser.add_argument('--matrix_distill_lambda', type=float, default=1.0,
+                        help='Weight for matrix distillation loss (heavy_intermediate teacher, Stage 2, RIS).')
     parser.add_argument('--weight_decay', type=float, default=0, help='Weight decay for optimizer')
     parser.add_argument('--device', type=str, default=None, help='Device to use (cuda/cpu). If None, auto-detect')
     parser.add_argument('--save_path', type=str, default=None,
@@ -1547,6 +1795,36 @@ if __name__ == '__main__':
         default=None,
         help='If set, use a bottleneck architecture for the teacher (MNISTClassifier) with this dimension.'
     )
+    # Complexity Shift (Phase 2 for Teacher)
+    parser.add_argument(
+        '--complexity_shift',
+        action='store_true',
+        help='Enable "Complexity Shift" (Phase 2) for teacher training. Penalizes encoder complexity.'
+    )
+    parser.add_argument(
+        '--lambda_complexity',
+        type=float,
+        default=0.01,
+        help='Penalty weight for encoder complexity in Phase 2.'
+    )
+    parser.add_argument(
+        '--complexity_type',
+        type=str,
+        default='l1',
+        choices=['l1', 'activity'],
+        help='Type of complexity penalty: "l1" (on weights) or "activity" (on activations).'
+    )
+    parser.add_argument(
+        '--load_classifier',
+        action='store_true',
+        help='If True, load a pre-trained classifier from --classifier_path before training (useful for starting Phase 2).'
+    )
+    parser.add_argument(
+        '--load_classifier_path',
+        type=str,
+        default=None,
+        help='Specific path to a pre-trained classifier to load before training. If set, --load_classifier is implied.'
+    )
     parser.add_argument(
         '--load_encoder',
         type=str,
@@ -1574,7 +1852,7 @@ if __name__ == '__main__':
                         help='Staged training stage (1: Encoder, 2: Controller, 3: Decoder, 4: Enc+Dec)')
     parser.add_argument('--decoder_type', type=str, choices=['base', 'powerful'], default='base',
                         help='Decoder architecture type: base (simple MLP) or powerful (deep robust MLP)')
-    parser.add_argument('--teacher_type', type=str, choices=['cnn', 'e2e', 'e2e_proxy'], default=None,
+    parser.add_argument('--teacher_type', type=str, choices=['cnn', 'e2e', 'e2e_proxy', 'heavy_intermediate'], default=None,
                         help='Type of teacher model to use for distillation.')
     parser.add_argument('--load_path', type=str, default=None,
                         help='Generic path to load models from for staged training.')
@@ -1683,6 +1961,16 @@ if __name__ == '__main__':
                 noise_std=float(args.noise_std)
             ).to(device)
             save_key = "e2e_proxy"
+        elif tt == "heavy_intermediate":
+            print(f"[INFO] Training Heavy Intermediate Teacher: Nt={args.N_t}, Nr={args.N_r}, Nm={args.N_m}")
+            classifier = HeavyIntermediateTeacher(
+                n_t=int(args.N_t),
+                n_r=int(args.N_r),
+                n_m=int(args.N_m) if getattr(args, "N_m", None) is not None else None,
+                num_classes=10,
+                power=1.0,
+            ).to(device)
+            save_key = "heavy_intermediate"
         else:
             print(f"[INFO] Training CNN Classifier Teacher: use_channel={args.teacher_use_channel}")
             classifier = MNISTClassifier(
@@ -1700,21 +1988,55 @@ if __name__ == '__main__':
             print(f"[INFO] Teacher using channel layer: noise_std={args.teacher_channel_noise_std}, "
                   f"output_mode={args.teacher_channel_output_mode}")
 
-        history = train_classifier(
-            classifier=classifier,
-            train_loader=train_loader,
-            num_epochs=int(args.epochs),
-            lr=float(args.lr),
-            weight_decay=float(args.weight_decay),
-            device=device,
-            plot_acc=(not args.no_plot_acc),
-            plot_path=args.plot_path if args.plot_path != "" else None,
-            plot_live=args.plot_live,
-            show_plot_end=(not args.no_show_plot_end),
-        )
+        classifier_path = args.classifier_path or f"MY_code/models_dict/teacher_{tt}.pth"
+
+        # PHASE 2 Check: If we want to skip Phase 1 and just load pre-trained
+        load_path = args.load_classifier_path or (classifier_path if args.load_classifier else None)
+        if load_path:
+            if not os.path.exists(load_path):
+                raise RuntimeError(f"Cannot load classifier for Phase 2: {load_path} does not exist.")
+            ckpt = torch.load(load_path, map_location=device)
+            classifier.load_state_dict(ckpt[save_key])
+            print(f"[INFO] Loaded pre-trained teacher from {load_path} for Complexity Shift (Phase 2).")
+            history = {"epoch": [], "acc": [], "loss": []} # placeholder
+        else:
+            # PHASE 1: Normal training
+            print(f"[INFO] Starting Phase 1: Normal Teacher Training")
+            history = train_classifier(
+                classifier=classifier,
+                train_loader=train_loader,
+                num_epochs=int(args.epochs),
+                lr=float(args.lr),
+                weight_decay=float(args.weight_decay),
+                device=device,
+                plot_acc=(not args.no_plot_acc),
+                plot_path=args.plot_path if args.plot_path != "" else None,
+                plot_live=args.plot_live,
+                show_plot_end=(not args.no_show_plot_end),
+            )
+
+        # PHASE 2: Complexity Shift
+        if tt == "cnn" and args.complexity_shift:
+            print(f"\n[INFO] Starting Phase 2: Complexity Shift (Squeeze and Shift)")
+            # Often useful to use a lower learning rate for fine-tuning
+            fine_tune_lr = float(args.lr) * 0.1
+            shift_history = train_classifier_complexity_shift(
+                classifier=classifier,
+                train_loader=train_loader,
+                num_epochs=int(args.epochs),
+                lr=fine_tune_lr,
+                device=device,
+                lambda_complexity=float(args.lambda_complexity),
+                complexity_type=str(args.complexity_type),
+                plot_acc=(not args.no_plot_acc),
+                plot_path=_suffix_path(args.plot_path, "_shift") if args.plot_path != "" else None,
+                plot_live=args.plot_live,
+                show_plot_end=(not args.no_show_plot_end),
+            )
+            # Optionally merge histories or just use the last one for return
+            history = shift_history
 
         # Save teacher
-        classifier_path = args.classifier_path or f"MY_code/models_dict/teacher_{tt}.pth"
         save_dir = os.path.dirname(classifier_path)
         if save_dir:
             os.makedirs(save_dir, exist_ok=True)
@@ -1734,6 +2056,8 @@ if __name__ == '__main__':
                     cfg.teacher_path = "models_dict/cnn_classifier_teacher.pth"
                 elif tt == "e2e_proxy":
                     cfg.teacher_path = "models_dict/teacher_e2e_proxy.pth"
+                elif tt == "heavy_intermediate":
+                    cfg.teacher_path = "models_dict/teacher_heavy_intermediate.pth"
                 else:
                     cfg.teacher_path = "models_dict/phase4_e2e.pth"
 
@@ -1929,6 +2253,40 @@ if __name__ == '__main__':
                             layer_indices=layer_indices
                         ).to(device)
 
+                elif "heavy_intermediate" in teacher_ckpt or (getattr(cfg, "teacher_type", None) == "heavy_intermediate"):
+                    print(f"[INFO] Stage {stage}: Using Heavy Intermediate Teacher from {teacher_ckpt_path}")
+                    teacher_model = HeavyIntermediateTeacher(
+                        n_t=int(cfg.N_t),
+                        n_r=int(cfg.N_r),
+                        n_m=int(cfg.N_m) if getattr(cfg, "N_m", None) is not None else None,
+                        num_classes=10,
+                        power=1.0,
+                    ).to(device)
+
+                    if "heavy_intermediate" in teacher_ckpt:
+                        teacher_model.load_state_dict(teacher_ckpt["heavy_intermediate"])
+                    elif "classifier" in teacher_ckpt:
+                        teacher_model.load_state_dict(teacher_ckpt["classifier"], strict=False)
+
+                    teacher_model.eval()
+
+                    if stage == 1:
+                        encoder_distiller = EncoderFeatureDistiller(
+                            teacher_model.encoder, encoder, pre_relu=True, distill_conv=True, distill_s=True
+                        ).to(device)
+
+                    if stage == 2:
+                        interm_dim = 2 * int(cfg.N_r) * int(cfg.N_t)
+                        layer_configs = [(interm_dim,) for _ in range(teacher_model.intermediate_layers_count)]
+                        enc_len = len(teacher_model.encoder.get_channel_num())
+                        layer_indices = list(range(enc_len, enc_len + teacher_model.intermediate_layers_count))
+                        controller_distiller = ControllerDistiller(
+                            teacher=teacher_model,
+                            n_r=int(cfg.N_r),
+                            layer_configs=layer_configs,
+                            layer_indices=layer_indices
+                        ).to(device)
+
                 elif "classifier" in teacher_ckpt:
                     # Traditional CNN teacher
                     # Try to detect if the saved model has channel layers or bottleneck by checking keys
@@ -1997,7 +2355,8 @@ if __name__ == '__main__':
                             teacher_controller = Controller_DNN(
                                 n_t=int(cfg.N_t), n_r=int(cfg.N_r), n_ms=int(cfg.N_m),
                                 layer_sizes=layer_sizes,
-                                ctrl_full_csi=bool(cfg.cotrl_CSI)
+                                ctrl_full_csi=bool(cfg.cotrl_CSI),
+                                cotrl_signal=bool(getattr(cfg, "cotrl_signal", False))
                             ).to(device)
                             teacher_controller.load_state_dict(teacher_ckpt["controller"])
 
@@ -2083,6 +2442,7 @@ if __name__ == '__main__':
             extra_kwargs["controller_distiller"] = controller_distiller
             extra_kwargs["grad_approx"] = bool(getattr(cfg, "grad_approx", False))
             extra_kwargs["grad_approx_sigma"] = float(getattr(cfg, "grad_approx_sigma", 0.1))
+            extra_kwargs["matrix_distill_lambda"] = float(getattr(cfg, "matrix_distill_lambda", 1.0))
         elif getattr(cfg, "alternating_train", False):
             train_fn = train_minn_alter
             print("[INFO] Using alternating training strategy (0.5 epoch per phase)")
@@ -2152,7 +2512,7 @@ if __name__ == '__main__':
                 return float(raw)
             if name in {"tx_power_dbm"}:
                 return float(raw)
-            if name in {"noise_std", "lam", "k_factor_db", "lr", "weight_decay", "grad_approx_sigma"}:
+            if name in {"noise_std", "lam", "k_factor_db", "lr", "weight_decay", "grad_approx_sigma", "matrix_distill_lambda"}:
                 return float(raw)
             if name in {"subset_size", "batchsize", "epochs", "channel_sampling_size", "N_t", "N_r", "N_m", "stage"}:
                 return int(float(raw))

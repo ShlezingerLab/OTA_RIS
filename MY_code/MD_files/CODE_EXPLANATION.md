@@ -6,13 +6,14 @@ This document explains the **current** MNIST “MINN / OTA-RIS” pipeline imple
 
 The training/evaluation scripts implement an end-to-end communication-and-inference pipeline:
 
-- **Encoder (`flow.py::Encoder`)**: MNIST image → complex transmit vector \(s\) with shape **(B, 1, N_t)**.
-- **Channel**: Uses precomputed channel triples \((H_D, H_1, H_2)\) from `channel_tensors.py`:
+- **Encoder (`students.py::Encoder`)**: MNIST image → complex transmit vector \(s\) with shape **(B, 1, N_t)** and power normalization.
+- **Channel (`channels.py`)**: Precomputed channel tensors are used during training/eval:
   - **Direct path**: \(y_d = H_D s\)
-  - **Metasurface path**: \(s_{ms} = H_1 s\) → controller predicts phases → **`Physical_SIM`** applies phases → \(y_{ms}\) → \(y_m = H_2 y_{ms}\)
+  - **Metasurface path**: \(s_{ms} = H_1 s\) → controller predicts phases → **`Physical_SIM`** (or RIS) applies phases → \(y_{ms}\) → \(y_m = H_2 y_{ms}\)
   - **Combine**: Modes include `direct`, `metanet`, or `both`.
-  - **Noise**: AWGN is added at the receiver.
-- **Decoder (`flow.py::Decoder`)**: Consumes received signal \(y\) and optionally CSI (\(H_D, H_2\)) to output classification logits.
+  - **Noise**: Complex AWGN added at the receiver.
+  - **Power scaling**: `--tx_power_dbm` scales \(s\) before the channel.
+- **Decoder (`students.py::Decoder`, `PowerfulDecoder`)**: Consumes received signal \(y\) and optionally CSI (\(H_D, H_2\)) to output logits.
 
 ---
 
@@ -23,12 +24,13 @@ OTA_RIS/
 ├── CLI_interface.py         # Automated dispatcher and IDE convenience (Entry point)
 ├── playground.py            # Simple legacy entry point
 └── MY_code/
-    ├── flow.py              # Core models (Encoder, Decoder, Controller, SIM, Teacher)
-    ├── channel_tensors.py    # Channel generation (Synthetic and Geometric models)
-    ├── training.py           # Training loops (Staged, 2-Phase, Alternating, Original)
-    ├── test.py               # Evaluation (Multi-trial, Comparisons, Plotting)
-    ├── test_channel_aware_teacher.py # Validation logic
-    └── models_dict/          # Saved model checkpoints (.pth)
+    ├── flow.py              # Unified entry point (imports channels/teachers/students)
+    ├── channels.py          # Channel modeling + tensor generation
+    ├── students.py          # Encoder, Decoder, Controller_DNN, Physical_SIM
+    ├── teachers.py          # Teacher models (CNN, E2E-Proxy) + feature extraction
+    ├── training.py          # Training loops (staged, legacy 2-phase, alternating)
+    ├── test.py              # Evaluation (multi-trial, comparisons, plots)
+    └── models_dict/         # Saved model checkpoints (.pth)
 ```
 
 ---
@@ -37,91 +39,123 @@ OTA_RIS/
 
 The pipeline supports several training methodologies, selectable via CLI flags:
 
-#### 1. Staged Training (Recommended)
-Enabled via `--stage <N>`. Follows a 4-phase procedure (0-3):
-- **Stage 0**: Train a standalone `MNISTClassifier` (Teacher) using `--train_classifier`.
-- **Stage 1**: Train the **Encoder** via feature distillation from the Teacher's early layers. Uses `--save_encoder`.
-- **Stage 2**: Train the **Controller** via feature distillation from the Teacher's late layers. Uses `--load_encoder` and `--save_ctrl`.
-- **Stage 3**: Train the **Decoder** while keeping the Encoder and Controller frozen. Uses `--load_encoder`, `--load_ctrl`, and `--save_decoder`. *Note: Stage 3 can combine encoders and controllers trained from different teacher types (e.g., CNN-based encoder with E2E-based controller).*
+#### 1. Teacher Training
+Enable `--train_classifier` to train a teacher:
+- **CNN teacher**: `MNISTClassifier` (optionally channel-aware and/or with bottleneck).
+- **E2E proxy teacher**: `E2EProxyTeacher` using a geometric Ricean proxy channel.
+- Optional **complexity shift** (for CNN): `--complexity_shift` triggers a squeeze-and-shift fine-tune phase.
 
-#### 2. Automated Full Pipeline (`CLI_interface.py`)
+#### 2. Staged Training (Recommended)
+Enabled via `--stage <1..4>`:
+- **Stage 1**: Train **Encoder** via distillation (no channel). CNN teachers distill conv features; E2E teachers can distill both conv features and \(s\).
+- **Stage 2**: Train **Controller** via distillation from teacher features (CNN late layers, bottleneck, or E2E proxy decoder features). Optional stochastic relaxation: `--grad_approx` with `--grad_approx_sigma`.
+- **Stage 3**: Train **Decoder** with **Encoder + Controller frozen**.
+- **Stage 4**: Train **Encoder + Decoder** with **Controller frozen**.
 
-Provides a high-level wrapper to run sequential phases automatically:
-- **Phase 0**: Train Teacher(s). Now supports training multiple teacher types (`cnn`, `e2e`, `e2e_proxy`) in a single execution by setting a list in `teacher_type_train`.
-- **Multi-Teacher Combinations**: Can run Stages 1-3 for multiple combinations of encoder/controller teachers. For example, if you set a list of types for `encoder_teacher_type` and `controller_teacher_type`, the script will iterate through all combinations.
-- **Automatic Suffixing**: Checkpoints and plots are automatically suffixed (e.g., `_enc=e2e_ctrl=cnn.pth`) to prevent overwriting during multi-run sweeps.
-- **Combined Stage 3 Plots**: When running multiple teacher combinations, Stage 3 automatically collapses them into a single run using `--compare_arg` to produce a single comparison plot (`*_comparison.png`).
-- **Full Run (Stages 1-3)**: Runs the complete distillation-based pipeline sequentially.
-- Configure via `IDE_TRAIN_STAGE = 4` in `CLI_interface.py`.
-
-#### 3. Two-Phase Training (Legacy)
-- **Phase 1**: Enable `--encoder_distill`. Trains only the student encoder to mimic a frozen teacher.
-- **Phase 2**: Run with `--load_encoder <path>`. Trains the decoder and controller while keeping the encoder frozen.
+#### 3. Legacy Two-Phase Training
+- **Phase 1**: `--encoder_distill` trains only the encoder via CNN distillation.
+- **Phase 2**: `--load_encoder <path>` trains the decoder/controller with encoder frozen.
 
 #### 4. Alternating Training (Experimental)
-Enabled via `--alternating_train`.
-- Each epoch is split: one half trains the Decoder/Controller (frozen Encoder), the other half trains the Encoder (frozen Decoder/Controller).
+Enable `--alternating_train` to alternate encoder and decoder/controller updates within each epoch.
+
+#### 5. Multi-Config Comparison
+- `--compare_arg <arg> <v1> <v2> ...` runs multiple configs in one process and saves a single comparison plot.
+- `--encoder_distill [True,False]` auto-expands into compare mode.
 
 ---
 
 ### Teacher Types
 
-The pipeline currently supports three main teacher paradigms for distillation:
-1. **`cnn`**: A standard MNIST CNN classifier. Features are distilled from its intermediate layers.
-2. **`e2e`**: An end-to-end model trained without distillation. The student mimics its learned communication/classification features.
-3. **`e2e_proxy`**: A variant of the E2E model (often using a proxy or simplified channel during its own training) used as a teacher for more complex deployment scenarios.
+The distillation pipeline supports three teacher checkpoints:
+1. **`cnn`**: `MNISTClassifier` with optional channel layers and bottleneck.
+2. **`e2e`**: End-to-end checkpoint containing `encoder` (and optionally `controller`) weights.
+3. **`e2e_proxy`**: `E2EProxyTeacher` trained with a geometric proxy channel; exposes encoder + decoder features.
+
+Stage 2 can distill directly from an E2E teacher controller if present; otherwise it falls back to feature-based distillation.
 
 ---
 
-### Channel Models (`channel_tensors.py`)
+### Channel Models (`channels.py`)
 
 Select via `--channel_type`:
-- **`synthetic_rayleigh | synthetic_ricean`**: i.i.d. matrices.
-- **`geometric_rayleigh | geometric_ricean`**: Distance-based pathloss and geometry-driven LoS (Ricean).
-  - Key knob: `--geo_pathloss_gain_db` (defaults to 0.0). Increase (e.g., +40 to +80) if signals are too weak for training.
+- **`synthetic_rayleigh | synthetic_ricean`**: i.i.d. channels.
+- **`geometric_rayleigh | geometric_ricean`**: Geometry-based pathloss + LoS/Ricean steering vectors.
+
+Additional knobs:
+- **`--noise_std`**: Default auto-set to `1e-6` for geometric channels and `1.0` for synthetic channels if omitted.
+- **`--geo_pathloss_gain_db`**: Increase (e.g., +40 to +80) if geometric channels are too weak.
+- **`--tx_power_dbm`**: Scales \(s\) before propagation (30 dBm = 1 W).
+- **`--N_m`** must be a perfect square (RIS layer is \( \sqrt{N_m} \times \sqrt{N_m} \)).
+
+Metasurface selection:
+- **`--metasurface_type sim`**: 3-layer SIM (Physical_SIM on SimNet).
+- **`--metasurface_type ris`**: Single-layer RIS: \(y_{ms} = \exp(-j\theta) \odot (H_1 s)\).
 
 ---
 
 ### Advanced Features
 
 #### Channel-Aware Teacher
-The teacher `MNISTClassifier` can include internal `RayleighChannelLayer`s during its own training (`--teacher_use_channel`). It utilizes a **multi-layer** approach, inserting fading layers after the first two and first four convolution blocks. This forces the teacher to learn features robust to MIMO fading and noise, which the student encoder and controller then inherit during distillation.
+`MNISTClassifier` can insert **RayleighChannelLayer** after Pool2 and Pool4 (`--teacher_use_channel`) to learn channel-robust features. Noise and output mode are configurable via `--teacher_channel_noise_std` and `--teacher_channel_output_mode`.
 
 #### Controller & Decoder CSI / Signal
 - **`Controller_DNN`**:
-  - **CSI**: If `--cotrl_CSI True`, it sees \((H_D, H_1, H_2)\). If `False`, it sees only \(H_1\).
-  - **Signal**: If `--cotrl_signal True`, it also receives the transmit signal at the metasurface \(s_{ms}\) as input. This allows the controller to optimize phases based on the actual content being transmitted, not just the channel.
-- **`Decoder`**: Can accept \(H_D\) and \(H_2\) as extra inputs to improve inference under varying channels.
+  - **CSI**: `--cotrl_CSI True` → uses \((H_D, H_1, H_2)\); `False` → uses only \(H_1\).
+  - **Signal**: `--cotrl_signal True` also feeds \(s_{ms}\).
+- **Decoder**: both `Decoder` and `PowerfulDecoder` accept \(H_D\) and \(H_2\).
+
+#### Distillation Blocks
+- **`EncoderFeatureDistiller`** aligns and distills conv features and/or \(s\).
+- **`ControllerDistiller`** distills controller outputs or maps received signals into teacher feature spaces.
+
+---
+
+### Evaluation (`test.py`)
+
+`test.py` rebuilds the same encoder/decoder/controller stack, precomputes channel tensors, and runs **multi-trial** accuracy evaluation. It supports:
+- `--compare_combine_modes`, `--compare_noise_stds`, `--compare_checkpoints`
+- `--compare_arg <arg> <v1> <v2> ...`
+- Optional bar plot summary via `--plot`
 
 ---
 
 ### Quickstart (CLI)
 
-**Train Robust Teacher (Stage 0):**
+**Train CNN teacher:**
 ```bash
-python MY_code/training.py --train_classifier --epochs 20 --teacher_use_channel --teacher_channel_noise_std 0.1
+python MY_code/training.py --train_classifier --teacher_type cnn --epochs 20 --teacher_use_channel --teacher_channel_noise_std 0.1
 ```
 
-**Staged Training (Stage 1 - Encoder):**
+**Train E2E proxy teacher:**
 ```bash
-python MY_code/training.py --stage 1 --epochs 10 --teacher_path MY_code/models_dict/cnn_classifier.pth --save_encoder models_dict/phase1_encoder.pth
+python MY_code/training.py --train_classifier --teacher_type e2e_proxy --epochs 20
 ```
 
-**Evaluation with Comparison:**
+**Stage 1 (Encoder distillation):**
 ```bash
-python MY_code/test.py --compare_arg noise_std 1e-6 1e-5 1e-4 --checkpoint my_model.pth --plot
+python MY_code/training.py --stage 1 --teacher_type cnn --teacher_path MY_code/models_dict/teacher_cnn.pth --epochs 10 --save_path MY_code/models_dict/minn_model_stage1.pth
 ```
 
-**Automated Full Pipeline (Stages 1-3):**
-1. Set `IDE_TRAIN_STAGE = 4` in `CLI_interface.py`.
-2. Run:
+**Stage 2 (Controller distillation):**
 ```bash
-python CLI_interface.py
+python MY_code/training.py --stage 2 --teacher_type cnn --load_path MY_code/models_dict/minn_model_stage1.pth --epochs 10 --save_path MY_code/models_dict/minn_model_stage2.pth
+```
+
+**Stage 3 (Decoder training):**
+```bash
+python MY_code/training.py --stage 3 --load_path MY_code/models_dict/minn_model_stage2.pth --epochs 10 --save_path MY_code/models_dict/minn_model_stage3.pth
+```
+
+**Evaluation with comparison:**
+```bash
+python MY_code/test.py --compare_arg noise_std 1e-6 1e-5 1e-4 --checkpoint MY_code/models_dict/minn_model_stage3.pth --plot
 ```
 
 ---
 
 ### Common Pitfalls
 - **N_m must be a perfect square**: e.g., 9, 16, 25...
-- **Geometric pathloss**: If training doesn't converge, check if `--noise_std` is too high or `--geo_pathloss_gain_db` is too low.
-- **Device consistency**: Ensure `--device` is consistent across teacher loading and student training.
+- **Geometric pathloss**: If training doesn't converge, check `--noise_std`, `--geo_pathloss_gain_db`, and `--tx_power_dbm`.
+- **Checkpoint formats**: Teacher checkpoints save under keys like `classifier` or `e2e_proxy`; staged checkpoints store `encoder`/`controller`/`decoder`.
+- **Device consistency**: Keep `--device` consistent across teacher loading and student training.
