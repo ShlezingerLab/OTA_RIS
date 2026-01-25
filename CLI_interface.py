@@ -453,9 +453,9 @@ if __name__ == "__main__":
     IDE_TRAIN_STAGE = 2   # 0: Teacher, 0.5: Complexity Shift, 1: Encoder, 2: Controller, 3: Decoder, 4: Full (1-3)
     train_mode = 'demo'
     combine_mode = 'both'
-    teacher_type = 'heavy_intermediate'
+    teacher_type = 'cnn'
 
-    bottleneck_dim = 64
+    bottleneck_dim = None
     teacher_use_channel = False
     if train_mode == 'full':
         subset_size = 60000
@@ -463,10 +463,10 @@ if __name__ == "__main__":
         channel_sampling_size = 10000
         epochs = 200 if IDE_TRAIN_STAGE == 0 else 200
     elif train_mode == 'demo':
-        subset_size = 100
+        subset_size = 1000
         batchsize = 100
         channel_sampling_size = 100
-        epochs = 200
+        epochs = 30
     elif train_mode == 'debug':
         subset_size = 1
         batchsize = 1
@@ -475,7 +475,7 @@ if __name__ == "__main__":
     IDE_TRAIN_ARGS: dict[str, object] = {
         "--N_t": 10,    # Nt
         "--N_r": 20,   # Nr
-        "--N_m": 25,
+        "--N_m": 100,
         "--subset_size": subset_size,          # 60000
         "--batchsize": batchsize,              #256
         "--channel_sampling_size": channel_sampling_size,  # 10000
@@ -485,7 +485,7 @@ if __name__ == "__main__":
         "--combine_mode": combine_mode,
         "--metasurface_type": "ris",
         "--cotrl_CSI": True,
-        "--cotrl_signal": True,
+        "--cotrl_signal": False,
         "--grad_approx": True, # Toggle here to use gradient approximation
         "--grad_approx_sigma": 0.1,
         "--channel_type": "geometric_ricean",
@@ -513,7 +513,7 @@ if __name__ == "__main__":
         0: { # PHASE 0: Train Teacher
                 "--teacher_type_train": teacher_type,
                 "--teacher_channel_noise_std": 0.1,
-                "--classifier_path": teacher_path,
+                #"--classifier_path": teacher_path,
                 "--plot_path": teacher_plot_path
         },
         0.5: { # PHASE 0.5: Complexity Shift (Fine-tuning Teacher)
@@ -543,6 +543,9 @@ if __name__ == "__main__":
             "--plot_path": plot_path,
         },
     }
+
+    if str(teacher_type).lower() == "heavy_intermediate":
+        STAGED_CONFIGS[2]["--ctrl_train_distance"] = True
 
     if IDE_TRAIN_STAGE in STAGED_CONFIGS:
         IDE_TRAIN_ARGS.update(STAGED_CONFIGS[IDE_TRAIN_STAGE])
@@ -658,14 +661,14 @@ if __name__ == "__main__":
                             config["--plot_path"] = _resolve_generic_path(plot_path_from_config) if plot_path_from_config else _resolve_generic_path(f"plots/phase{stage}_e2e_proxy.png")
 
                     elif str(t_type).lower() == "heavy_intermediate":
-                        default_p = teacher_path if teacher_type == 'heavy_intermediate' else "models_dict/teacher_heavy_intermediate_demo.pth"
-                        c_path = config.get("--classifier_path", default_p)
+                        c_path = config.get("--classifier_path")
                         l_path = config.get("--load_classifier_path")
 
                         config.update({
                             "--train_classifier": True,
-                            "--classifier_path": _resolve_generic_path(c_path),
                         })
+                        if c_path:
+                            config["--classifier_path"] = _resolve_generic_path(c_path)
                         if l_path:
                             config["--load_classifier_path"] = _resolve_generic_path(l_path)
 

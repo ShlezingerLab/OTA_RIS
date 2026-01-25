@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from students import Encoder as StudentEncoder
 
 class RayleighChannelLayer(nn.Module):
     """
@@ -494,6 +495,230 @@ class HeavyRxDecoder(nn.Module):
         logits = self.fc_out(x3)
         return [x2, x3], logits
 
+class MyTeacher(nn.Module):
+    """
+    Simple teacher with:
+      1) Heavy encoder: image -> complex transmit vector s (B, Nt)
+      2) Single linear layer (matrix multiplication): s -> y
+      3) Heavy decoder: received signal -> logits
+    """
+    def __init__(
+        self,
+        n_t: int,
+        n_r: int,
+        n_m: int,
+        num_classes: int = 10,
+        power: float = 1.0,
+        base_channels: int = 64,
+        decoder_hidden: int = 256,
+    ):
+        super().__init__()
+        self.n_t = int(n_t)
+        self.n_r = int(n_r)
+        self.n_m = int(n_m)
+        self.num_classes = int(num_classes)
+        self.power = power
+
+        # Heavy encoder
+        self.encoder = HeavyEncoder(n_t=self.n_t, power=power, base_channels=base_channels)
+
+        # Single linear layer (matrix multiplication)
+        # Encoder outputs complex (B, Nt), we convert to real (B, 2*Nt) for linear layer
+        encoder_out_dim = 2 * self.n_t  # Real and imaginary parts
+        self.linear = nn.Linear(encoder_out_dim, 2 * self.n_r)
+
+        # Heavy decoder
+        self.decoder = HeavyRxDecoder(n_r=self.n_r, num_classes=self.num_classes, hidden_dim=decoder_hidden)
+
+        # Cache for intermediate values (used for regularization)
+        self._cached_s = None
+        self._cached_y = None
+
+    def forward(self, x: torch.Tensor, return_intermediates: bool = False) -> torch.Tensor:
+        """
+        Args:
+            x: (B, 1, H, W) input images
+            return_intermediates: if True, also cache s and y for regularization
+        Returns:
+            logits: (B, num_classes)
+        """
+        # Encoder: image -> complex signal
+        s = self.encoder(x)  # (B, Nt) complex
+
+        # Convert complex to real for linear layer
+        s_real = torch.view_as_real(s)  # (B, Nt, 2)
+        s_flat = s_real.reshape(s.size(0), -1)  # (B, 2*Nt)
+
+        # Linear layer (matrix multiplication)
+        y_flat = self.linear(s_flat)  # (B, 2*Nr)
+
+        # Convert back to complex
+        y = y_flat.reshape(y_flat.size(0), self.n_r, 2)  # (B, Nr, 2)
+        y = torch.view_as_complex(y.contiguous())  # (B, Nr)
+
+        # Cache intermediates if needed
+        if return_intermediates:
+            self._cached_s = s
+            self._cached_y = y
+
+        # Decoder: received signal -> logits
+        logits = self.decoder(y)  # (B, num_classes)
+
+        return logits
+
+    def extract_features(self, x: torch.Tensor, preReLU: bool = True):
+        """
+        Extract intermediate features for distillation.
+
+        Args:
+            x: (B, 1, H, W) input images
+            preReLU: if True, return features before ReLU activation
+
+        Returns:
+            features: list of feature tensors from encoder, linear layer, and decoder
+            logits: (B, num_classes) final output
+        """
+        # Get encoder features
+        enc_feats, s = self.encoder.extract_feature(x, preReLU=preReLU)
+
+        # Convert complex to real for linear layer
+        s_real = torch.view_as_real(s)  # (B, 1, Nt, 2)
+        s_flat = s_real.reshape(s.size(0), -1)  # (B, 2*Nt)
+
+        # Linear layer (this is the "controller" intermediate representation)
+        y_flat = self.linear(s_flat)  # (B, 2*Nr)
+
+        # Convert back to complex
+        y = y_flat.reshape(y_flat.size(0), self.n_r, 2)  # (B, Nr, 2)
+        y = torch.view_as_complex(y.contiguous())  # (B, Nr)
+
+        # Get decoder features
+        dec_feats, logits = self.decoder.extract_features(y)
+
+        # Combine all features: encoder features + linear output + decoder features
+        # The linear layer output (y_flat) can be used for controller distillation
+        all_features = enc_feats + [y_flat] + dec_feats
+
+        return all_features, logits
+
+    def get_l2_regularization(self) -> torch.Tensor:
+        """
+        Compute L2 regularization term (squared Frobenius norm) of the linear layer weights.
+
+        Returns:
+            l2_loss: scalar tensor
+        """
+        return torch.norm(self.linear.weight, p=2) ** 2
+
+    def _optimize_phi_analytical(
+        self,
+        s: torch.Tensor,     # (B, Nt)
+        y: torch.Tensor,     # (B, Nr)
+        H_1: torch.Tensor,   # (B, Nt, Nm)
+        H_2: torch.Tensor,   # (B, Nm, Nr)
+        H_d: torch.Tensor    # (B, Nr, Nt)
+    ) -> torch.Tensor:       # Returns (B, Nm) unit modulus phases
+        """
+        Analytically optimize phi = argmin ||(H1·Φ·H2 + H_d)·s - y||²
+        with constraint |phi_i| = 1 (unit modulus).
+
+        This computes the optimal phase shift for each RIS element to minimize
+        the squared error between the learned output y and the target output
+        from the RIS channel model.
+
+        Args:
+            s: Transmitted signal (B, Nt) complex
+            y: Learned received signal (B, Nr) complex
+            H_1: TX to RIS channel (B, Nt, Nm) complex
+            H_2: RIS to RX channel (B, Nm, Nr) complex
+            H_d: Direct TX to RX channel (B, Nr, Nt) complex
+
+        Returns:
+            phi_optimal: (B, Nm) complex with unit modulus, optimal phase shifts
+        """
+        # Compute residual: y - H_d @ s
+        # This is the part that the RIS needs to match
+        residual = y - torch.bmm(H_d, s.unsqueeze(-1)).squeeze(-1)  # (B, Nr)
+
+        # For the RIS path: y_ris = H_2 @ (Φ @ (H_1 @ s))
+        # where Φ is diagonal with elements φ_i
+        # The gradient w.r.t. φ_m is: ∂L/∂φ_m = -conj((H_2[:, m] · residual)) * (H_1[m, :] · s)
+        #
+        # We compute this more efficiently in batch form:
+        # H_1 @ s gives the signal at each RIS element before phase shift
+        H_1_s = torch.bmm(H_1, s.unsqueeze(-1)).squeeze(-1)  # (B, Nm)
+
+        # H_2^H @ residual gives the "backpropagated" error to each RIS element
+        H_2_conj_T = H_2.conj().transpose(-2, -1)  # (B, Nr, Nm)
+        grad_direction = torch.bmm(H_2_conj_T, residual.unsqueeze(-1)).squeeze(-1)  # (B, Nm)
+
+        # Combine: the optimal direction is conj(grad_direction) * H_1_s
+        # But for unit modulus constraint, we just need the angle
+        # phi_m = exp(j * angle(conj(grad_direction_m) * H_1_s_m))
+        #       = exp(j * angle(grad_direction_m^* * H_1_s_m))
+        optimal_direction = grad_direction.conj() * H_1_s
+
+        # Apply unit modulus constraint: phi = exp(j * angle(optimal_direction))
+        phi_optimal = torch.exp(1j * torch.angle(optimal_direction))
+
+        return phi_optimal  # (B, Nm)
+
+    def get_channel_matching_loss(
+        self,
+        H_d: torch.Tensor,   # (B, Nr, Nt)
+        H_1: torch.Tensor,   # (B, Nt, Nm)
+        H_2: torch.Tensor    # (B, Nm, Nr)
+    ) -> torch.Tensor:
+        """
+        Compute ||(H₁ΦH₂ + H_d)s - y||² with optimal Φ per sample.
+
+        This implements the RIS-aware channel matching loss where Φ is the
+        optimized phase shift matrix for the RIS elements.
+
+        Args:
+            H_d: Direct TX to RX channel (B, Nr, Nt) complex
+            H_1: TX to RIS channel (B, Nt, Nm) complex
+            H_2: RIS to RX channel (B, Nm, Nr) complex
+
+        Returns:
+            loss: scalar tensor measuring deviation from RIS channel model
+        """
+        if self._cached_s is None or self._cached_y is None:
+            raise RuntimeError("Must call forward() with return_intermediates=True before computing channel matching loss")
+
+        s = self._cached_s  # (B, 1, Nt) or (B, Nt) complex
+        y_learned = self._cached_y  # (B, Nr) complex
+
+        # Ensure s is 2D: (B, Nt)
+        if s.dim() == 3:
+            s = s.squeeze(1)  # (B, 1, Nt) -> (B, Nt)
+
+        # Optimize phi for each sample independently
+        # For each i in batch: phi_optimal[i] = argmin ||(H_1[i]·Φ[i]·H_2[i] + H_d[i])·s[i] - y_learned[i]||²
+        phi_optimal = self._optimize_phi_analytical(s, y_learned, H_1, H_2, H_d)  # (B, Nm)
+
+        # Compute y_target = (H1·Φ·H2 + H_d)·s for each sample
+        # 1. RIS path: H_1[i] @ s[i] -> apply phi_optimal[i] -> H_2[i] @ result
+        H_1_s = torch.bmm(H_1, s.unsqueeze(-1)).squeeze(-1)  # (B, Nm): signal at each RIS element
+        phi_H_1_s = H_1_s * phi_optimal  # element-wise, (B, Nm): phase-shifted signal
+        ris_path = torch.bmm(H_2, phi_H_1_s.unsqueeze(-1)).squeeze(-1)  # (B, Nr): received via RIS
+
+        # 2. Direct path: H_d @ s
+        direct_path = torch.bmm(H_d, s.unsqueeze(-1)).squeeze(-1)  # (B, Nr)
+
+        # 3. Combine both paths
+        y_target = ris_path + direct_path  # (B, Nr)
+
+        # Compute MSE loss per sample, then average over batch
+        # loss_per_sample(i) = mean(|y_learned[i] - y_target[i]|^2) over Nr dimension
+        loss_per_sample = torch.mean(torch.abs(y_learned - y_target) ** 2, dim=1)  # (B,)
+
+        # Average over batch: loss = (1/B) * sum(loss_per_sample(i))
+        loss = torch.mean(loss_per_sample)  # scalar
+
+        return loss
+
+
 class HeavyIntermediateTeacher(nn.Module):
     """
     Heavy teacher with:
@@ -521,6 +746,18 @@ class HeavyIntermediateTeacher(nn.Module):
         self.intermediate_dim = 2 * self.n_r * self.n_t
 
         self.encoder = HeavyEncoder(n_t=self.n_t, power=power, base_channels=base_channels)
+        # teacher_ckpt = torch.load("/home/mazya/OTA_RIS/MY_code/models_dict/teacher_heavy_intermediate_demo_previous.pth")
+        # encoder_state = {
+        #     k.replace("encoder.", ""): v
+        #     for k, v in teacher_ckpt["heavy_intermediate"].items()
+        #     if k.startswith("encoder.")
+        # }
+        # self.encoder.load_state_dict(encoder_state, strict=True)
+        # self.encoder = StudentEncoder(Nt=self.n_t, power=power)
+        # self.encoder.load_state_dict(torch.load("/home/mazya/OTA_RIS/MY_code/models_dict/encoder_heavy_intermediate_demo.pth")["encoder"], strict=True)
+        # for p in self.encoder.parameters():
+        #     p.requires_grad = False
+        # self.encoder.eval()
         self.decoder = HeavyRxDecoder(n_r=self.n_r, num_classes=self.num_classes, hidden_dim=decoder_hidden)
 
         self.intermediate_layers = nn.ModuleList()
@@ -584,3 +821,194 @@ class HeavyIntermediateTeacher(nn.Module):
 
     def get_channel_num(self):
         return self.encoder.get_channel_num() + [self.intermediate_dim] * self.intermediate_layers_count
+
+def train_teacher(teacher, train_loader, device, epochs, lr, weight_decay, lambda_l2=0.0, H_d_channel=None, H_1_channel=None, H_2_channel=None, lambda_channel=0.0, save_path=None):
+    """
+    Train teacher model with optional regularization.
+
+    Args:
+        teacher: Model to train
+        train_loader: DataLoader for training data
+        device: Device to train on
+        epochs: Number of training epochs
+        lr: Learning rate
+        weight_decay: Weight decay for optimizer
+        lambda_l2: Weight for L2 regularization on linear layer weights
+        H_d_channel: Direct channel matrix tensor (num_channels, Nr, Nt) complex for cyclic sampling
+        H_1_channel: TX to RIS channel matrix tensor (num_channels, Nt, Nm) complex for cyclic sampling
+        H_2_channel: RIS to RX channel matrix tensor (num_channels, Nm, Nr) complex for cyclic sampling
+        lambda_channel: Weight for RIS channel matching loss ||(H₁ΦH₂ + H_d)s - y||²
+        save_path: Path to save the trained model (optional)
+    """
+    optimizer = optim.Adam(teacher.parameters(), lr=lr, weight_decay=weight_decay)
+    criterion = nn.CrossEntropyLoss()
+
+    use_l2_reg = lambda_l2 > 0 and hasattr(teacher, 'get_l2_regularization')
+    use_channel_reg = lambda_channel > 0 and H_d_channel is not None and H_1_channel is not None and H_2_channel is not None and hasattr(teacher, 'get_channel_matching_loss')
+
+    if use_channel_reg:
+        H_d_channel = H_d_channel.to(device)
+        H_1_channel = H_1_channel.to(device)
+        H_2_channel = H_2_channel.to(device)
+        num_channels = H_d_channel.size(0)
+        channel_cursor = 0
+
+    for epoch in range(epochs):
+        teacher.train()
+        running_loss = 0.0
+        running_ce_loss = 0.0
+        running_l2_loss = 0.0
+        running_channel_loss = 0.0
+        correct = 0
+        total = 0
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
+
+        for images, labels in pbar:
+            images = images.to(device)
+            labels = labels.to(device)
+
+            # Forward pass (with intermediates if channel reg is used)
+            if use_channel_reg:
+                logits = teacher(images, return_intermediates=True)
+            else:
+                logits = teacher(images)
+            loss_ce = criterion(logits, labels)
+
+            # Add L2 regularization if applicable
+            loss = loss_ce
+            if use_l2_reg:
+                loss_l2 = teacher.get_l2_regularization()
+                loss = loss + lambda_l2 * loss_l2
+            else:
+                loss_l2 = torch.tensor(0.0)
+
+            # Add channel matching regularization if applicable
+            if use_channel_reg:
+                # Cyclic channel sampling: each image gets a different channel triple
+                batch_size = images.size(0)
+                idxs = (torch.arange(batch_size, device=device) + channel_cursor) % num_channels
+                channel_cursor = (channel_cursor + batch_size) % num_channels
+
+                H_d_batch = H_d_channel[idxs]  # (batch_size, Nr, Nt)
+                H_1_batch = H_1_channel[idxs]  # (batch_size, Nt, Nm)
+                H_2_batch = H_2_channel[idxs]  # (batch_size, Nm, Nr)
+
+                loss_channel = teacher.get_channel_matching_loss(H_d_batch, H_1_batch, H_2_batch)
+                loss = loss + lambda_channel * loss_channel
+            else:
+                loss_channel = torch.tensor(0.0)
+
+            # Backward pass
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            # Statistics
+            running_loss += loss.item()
+            running_ce_loss += loss_ce.item()
+            running_l2_loss += loss_l2.item()
+            running_channel_loss += loss_channel.item()
+            _, predicted = torch.max(logits.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+            postfix = {
+                'loss': f"{loss.item():.4f}",
+                'acc': f"{100 * correct / total:.2f}%"
+            }
+            if use_l2_reg:
+                postfix['l2'] = f"{loss_l2.item():.4f}"
+            if use_channel_reg:
+                postfix['ch'] = f"{loss_channel.item():.4f}"
+            pbar.set_postfix(postfix)
+
+        epoch_loss = running_loss / len(train_loader)
+        epoch_ce_loss = running_ce_loss / len(train_loader)
+        epoch_l2_loss = running_l2_loss / len(train_loader)
+        epoch_channel_loss = running_channel_loss / len(train_loader)
+        epoch_accuracy = 100 * correct / total
+
+        loss_str = f"Loss: {epoch_loss:.4f} (CE: {epoch_ce_loss:.4f}"
+        if use_l2_reg:
+            loss_str += f", L2: {epoch_l2_loss:.4f}"
+        if use_channel_reg:
+            loss_str += f", Channel: {epoch_channel_loss:.4f}"
+        loss_str += ")"
+        print(f"Epoch {epoch+1}/{epochs} | {loss_str} | Acc: {epoch_accuracy:.2f}%")
+
+    print("\nTraining finished!")
+
+    # Save the model if save_path is provided
+    if save_path:
+        import os
+        save_dir = os.path.dirname(save_path)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+        torch.save({'teacher': teacher.state_dict()}, save_path)
+        print(f"Model saved to: {save_path}")
+
+if __name__ == "__main__":
+    import numpy as np
+    import os
+    from torchvision import datasets, transforms
+    from torch.utils.data import DataLoader, Subset
+    from channels import generate_channel_tensors_by_type
+    #################################################
+    N_t = 10
+    N_r = 20
+    N_m = 100
+    num_classes = 10
+    power = 1.0
+    subset_size = 1000
+    batchsize = 100
+    channel_sampling_size = 100  # Number of different channels to cycle through
+    epochs = 30
+    teacher_suffix = "yaniv_e2eproxy"  # "demo" or "full"
+    #################################################
+    #teacher = MNISTClassifier(num_classes=num_classes)
+    #teacher = MyTeacher(n_t=N_t, n_r=N_r, n_m=N_m, num_classes=num_classes, power=power)
+    teacher = E2EProxyTeacher(nt=N_t, nr=N_r)
+    #################################################
+    import torch.optim as optim
+    from tqdm import tqdm
+    lr = 1e-3
+    weight_decay = 1e-7
+    lambda_l2 = 0.00  # L2 regularization weight
+    lambda_channel = 1.0  # Channel matching regularization weight
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+    teacher = teacher.to(device)
+    #################################################
+    # Set save path
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    save_path = os.path.join(script_dir, "models_dict", f"teacher_{teacher_suffix}.pth")
+    print(f"Model will be saved to: {save_path}")
+    #################################################
+    H_d_all, H_1_all, H_2_all = generate_channel_tensors_by_type(
+        channel_type="geometric_ricean",
+        N_t=N_t,
+        N_r=N_r,
+        N_m=N_m,
+        num_channels=channel_sampling_size,  # Multiple channels for cyclic sampling
+        device=device,
+        k_factor_d_db=3.0,
+        k_factor_h1_db=13.0,
+        k_factor_h2_db=7.0,
+        pathloss_exp=2.0,
+        geo_pathloss_gain_db=60.0,
+    )
+    #################################################
+    transform = transforms.Compose([transforms.ToTensor()])
+    train_dataset = datasets.MNIST(root="./data", train=True, transform=transform, download=True)
+    indices = np.random.choice(len(train_dataset), subset_size, replace=False)
+    train_subset = Subset(train_dataset, indices)
+    train_loader = DataLoader(train_subset, batch_size=batchsize, shuffle=True)
+    #################################################
+    # Training loop with RIS channel matching
+    train_teacher(teacher, train_loader, device, epochs, lr, weight_decay,
+                  lambda_l2=lambda_l2,
+                  H_d_channel=H_d_all,
+                  H_1_channel=H_1_all,
+                  H_2_channel=H_2_all,
+                  lambda_channel=lambda_channel,
+                  save_path=save_path)

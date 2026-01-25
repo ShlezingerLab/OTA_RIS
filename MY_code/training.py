@@ -513,7 +513,7 @@ lambda_teacher: float = 1e-4):
                 elif getattr(controller, "ctrl_full_csi", True):
                     theta_list = controller(H_1=H_1, H_D=H_D_eff, H_2=H_2_eff)
                 else:
-                    theta_list = controller(H_1=H_1)
+                    theta_list = controller(H_1=H_1, H_D=H_D_eff, H_2=H_2_eff)
                 ms_type = str(metasurface_type).lower()
                 if ms_type == "sim":
                     y_ms = physical_sim(s_ms, theta_list)
@@ -1017,6 +1017,147 @@ def train_minn_staged(channel, encoder, decoder, controller, physical_sim, train
     if plot_acc and show_plot_end:
         try: plt.show()
         except: pass
+
+        return history
+
+
+def ctrl_train_distance(
+    channel,
+    encoder,
+    controller,
+    teacher,
+    physical_sim,
+    train_loader,
+    *,
+    num_epochs=10,
+    lr=1e-3,
+    weight_decay=0.0,
+    device="cpu",
+    combine_mode="metanet",
+    H_d_all=None,
+    H_1_all=None,
+    H_2_all=None,
+    tx_power_dbm=30.0,
+    metasurface_type="ris",
+    matrix_distill_lambda: float = 1.0,
+):
+    """
+    Train controller using matrix distance:
+      L = || H2 * Phi(theta) * H1 - W_teacher || (Frobenius, averaged across layers)
+    """
+    if combine_mode not in ["metanet", "both"]:
+        raise ValueError("ctrl_train_distance requires combine_mode 'metanet' or 'both'.")
+    if H_1_all is None or H_2_all is None:
+        raise ValueError("ctrl_train_distance requires H_1_all and H_2_all.")
+    if not hasattr(teacher, "get_intermediate_ws"):
+        raise ValueError("Teacher must implement get_intermediate_ws for matrix distillation.")
+
+    if encoder is not None:
+        encoder.eval()
+        for p in encoder.parameters():
+            p.requires_grad = False
+    controller.train()
+    controller.to(device)
+    teacher.eval()
+    teacher.to(device)
+
+    optimizer = optim.Adam([p for p in controller.parameters() if p.requires_grad], lr=lr, weight_decay=weight_decay)
+    num_channels = H_1_all.size(0)
+    channel_cursor = 0
+    tx_amp_scale = _dbm_to_watt(tx_power_dbm)
+
+    def _theta_to_phi(theta: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        theta = torch.sigmoid(theta) * (2 * torch.pi)
+        return torch.exp(1j * theta).to(dtype)
+
+    def _compute_w_target(H_1, H_2_eff, theta_list):
+        ms_type = str(metasurface_type).lower()
+        if ms_type == "ris":
+            if not isinstance(theta_list, (list, tuple)) or len(theta_list) != 1:
+                raise ValueError(f"RIS expects 1 theta vector (got {len(theta_list) if isinstance(theta_list, (list, tuple)) else 0})")
+            theta = theta_list[0]
+            phi = torch.exp(-1j * theta)
+            H2_phi = H_2_eff * phi.unsqueeze(1)
+            return torch.matmul(H2_phi, H_1)
+        if ms_type == "sim":
+            if physical_sim is None:
+                raise ValueError("metasurface_type='sim' requires physical_sim.")
+            simnet = physical_sim.simnet
+            num_layers = len(simnet.ris_layers)
+            if not isinstance(theta_list, (list, tuple)) or len(theta_list) != num_layers:
+                raise ValueError(f"SIM expects {num_layers} theta layers (got {len(theta_list) if isinstance(theta_list, (list, tuple)) else 0})")
+            phi_list = [_theta_to_phi(t, torch.complex64) for t in theta_list]
+            M = torch.diag_embed(phi_list[0])
+            for i in range(1, num_layers):
+                W = simnet.transmission_layers[i - 1]().to(M.device)
+                if not torch.is_complex(W):
+                    W = W.to(torch.complex64)
+                M = torch.matmul(M, W)
+                D_i = torch.diag_embed(phi_list[i])
+                M = torch.matmul(M, D_i)
+            M_T = M.transpose(1, 2)
+            return torch.matmul(torch.matmul(H_2_eff, M_T), H_1)
+        raise ValueError("metasurface_type must be 'ris' or 'sim'.")
+
+    history = {"epoch": [], "loss_fd": []}
+
+    for epoch in range(num_epochs):
+        running_fd = 0.0
+        pbar = tqdm(train_loader, desc=f"CtrlDist - Epoch {epoch+1}/{num_epochs}")
+        for images, _ in pbar:
+            images = images.to(device)
+
+            s_ms = None
+            if getattr(controller, "cotrl_signal", False):
+                if encoder is None:
+                    raise ValueError("ctrl_train_distance with cotrl_signal=True requires encoder.")
+                with torch.no_grad():
+                    s = encoder(images)
+                s_c = s.to(torch.complex64) if not torch.is_complex(s) else s
+                if tx_amp_scale != 1.0:
+                    s_c = s_c * float(tx_amp_scale)
+
+            batch_size = s.size(0)
+            idxs = (torch.arange(batch_size, device=device) + channel_cursor) % num_channels
+            channel_cursor = (channel_cursor + batch_size) % num_channels
+            H_D = H_d_all[idxs].to(device) if H_d_all is not None else None
+            H_1 = H_1_all[idxs].to(device)
+            H_2 = H_2_all[idxs].to(device)
+
+            pl_ms = float(getattr(channel, "path_loss_ms", 1.0))
+            H_2_eff = H_2 * pl_ms
+
+            if getattr(controller, "cotrl_signal", False):
+                s_ms = torch.matmul(H_1, s_c.transpose(1, 2)).squeeze(-1)
+                if getattr(controller, "ctrl_full_csi", True):
+                    theta_list = controller(H_1=H_1, H_D=H_D, H_2=H_2_eff, s_ms=s_ms)
+                else:
+                    theta_list = controller(H_1=H_1, s_ms=s_ms)
+            elif getattr(controller, "ctrl_full_csi", True):
+                theta_list = controller(H_1=H_1, H_D=H_D, H_2=H_2_eff)
+            else:
+                theta_list = controller(H_1=H_1)
+
+            with torch.no_grad():
+                w_teacher_list = teacher.get_intermediate_ws(images)
+
+            w_target = _compute_w_target(H_1, H_2_eff, theta_list)
+            per_layer = []
+            for w_teacher in w_teacher_list:
+                diff = w_target - w_teacher
+                per_sample = torch.mean(torch.abs(diff) ** 2, dim=(1, 2))
+                per_layer.append(per_sample)
+            loss_fd = torch.stack(per_layer, dim=0).mean(dim=0).mean() * float(matrix_distill_lambda)
+
+            optimizer.zero_grad()
+            loss_fd.backward()
+            optimizer.step()
+
+            running_fd += loss_fd.item()
+            pbar.set_postfix({"loss_fd": f"{loss_fd.item():.4f}"})
+
+        history["epoch"].append(epoch + 1)
+        history["loss_fd"].append(running_fd / max(1, len(train_loader)))
 
     return history
 
@@ -1692,6 +1833,8 @@ if __name__ == '__main__':
     parser.add_argument('--grad_approx_sigma', type=float, default=0.1, help='Sigma (noise std) for gradient approximation stochastic relaxation')
     parser.add_argument('--matrix_distill_lambda', type=float, default=1.0,
                         help='Weight for matrix distillation loss (heavy_intermediate teacher, Stage 2, RIS).')
+    parser.add_argument('--ctrl_train_distance', action='store_true',
+                        help='If set with --stage 2, train controller using matrix distance only.')
     parser.add_argument('--weight_decay', type=float, default=0, help='Weight decay for optimizer')
     parser.add_argument('--device', type=str, default=None, help='Device to use (cuda/cpu). If None, auto-detect')
     parser.add_argument('--save_path', type=str, default=None,
@@ -1988,10 +2131,14 @@ if __name__ == '__main__':
             print(f"[INFO] Teacher using channel layer: noise_std={args.teacher_channel_noise_std}, "
                   f"output_mode={args.teacher_channel_output_mode}")
 
-        classifier_path = args.classifier_path or f"MY_code/models_dict/teacher_{tt}.pth"
+        raw_classifier_path = args.classifier_path
+        if raw_classifier_path is None or raw_classifier_path == "":
+            classifier_path = ""
+        else:
+            classifier_path = raw_classifier_path
 
         # PHASE 2 Check: If we want to skip Phase 1 and just load pre-trained
-        load_path = args.load_classifier_path or (classifier_path if args.load_classifier else None)
+        load_path = args.load_classifier_path or (classifier_path if args.load_classifier and classifier_path else None)
         if load_path:
             if not os.path.exists(load_path):
                 raise RuntimeError(f"Cannot load classifier for Phase 2: {load_path} does not exist.")
@@ -2037,11 +2184,14 @@ if __name__ == '__main__':
             history = shift_history
 
         # Save teacher
-        save_dir = os.path.dirname(classifier_path)
-        if save_dir:
-            os.makedirs(save_dir, exist_ok=True)
-        torch.save({save_key: classifier.state_dict()}, classifier_path)
-        print(f"[INFO] Teacher saved to {classifier_path}")
+        if classifier_path == "":
+            print("[INFO] Skipping teacher save because --classifier_path was set to an empty string.")
+        else:
+            save_dir = os.path.dirname(classifier_path)
+            if save_dir:
+                os.makedirs(save_dir, exist_ok=True)
+            torch.save({save_key: classifier.state_dict()}, classifier_path)
+            print(f"[INFO] Teacher saved to {classifier_path}")
 
         raise SystemExit(0)
 
@@ -2096,6 +2246,7 @@ if __name__ == '__main__':
         )
 
         # ===== DNN stack =====
+        teacher_model = None
         ms_type = str(getattr(cfg, "metasurface_type", "sim")).lower()
         if ms_type == "sim":
             simnet = build_simnet(int(cfg.N_m), lam=float(cfg.lam)).to(device)
@@ -2129,10 +2280,13 @@ if __name__ == '__main__':
 
         # Load trained encoder for Phase 2 (if specified)
         if (not bool(cfg.encoder_distill)) and hasattr(cfg, 'load_encoder') and cfg.load_encoder:
-            print(f"[INFO] Loading trained encoder from {cfg.load_encoder} for Phase 2")
-            encoder_ckpt = torch.load(cfg.load_encoder, map_location=device)
-            encoder.load_state_dict(encoder_ckpt["encoder"], strict=True)
-            print("[INFO] Encoder loaded successfully (will be frozen during training)")
+            if bool(getattr(cfg, "ctrl_train_distance", False)) and int(getattr(cfg, "stage", 0)) == 2:
+                print("[INFO] Skipping --load_encoder for ctrl_train_distance (Stage 2)")
+            else:
+                print(f"[INFO] Loading trained encoder from {cfg.load_encoder} for Phase 2")
+                encoder_ckpt = torch.load(cfg.load_encoder, map_location=device)
+                encoder.load_state_dict(encoder_ckpt["encoder"], strict=True)
+                print("[INFO] Encoder loaded successfully (will be frozen during training)")
 
         # Load generic checkpoint for staged training if specified
         if hasattr(cfg, "load_path") and cfg.load_path and os.path.exists(cfg.load_path):
@@ -2437,12 +2591,20 @@ if __name__ == '__main__':
 
         extra_kwargs = {}
         if getattr(cfg, "stage", None) in [1, 2, 3, 4]:
-            train_fn = train_minn_staged
-            extra_kwargs["stage"] = int(cfg.stage)
-            extra_kwargs["controller_distiller"] = controller_distiller
-            extra_kwargs["grad_approx"] = bool(getattr(cfg, "grad_approx", False))
-            extra_kwargs["grad_approx_sigma"] = float(getattr(cfg, "grad_approx_sigma", 0.1))
-            extra_kwargs["matrix_distill_lambda"] = float(getattr(cfg, "matrix_distill_lambda", 1.0))
+            stage_val = int(cfg.stage)
+            if stage_val == 2 and bool(getattr(cfg, "ctrl_train_distance", False)):
+                if teacher_model is None:
+                    raise RuntimeError("ctrl_train_distance requires a loaded teacher model.")
+                train_fn = ctrl_train_distance
+                extra_kwargs["teacher"] = teacher_model
+                extra_kwargs["matrix_distill_lambda"] = float(getattr(cfg, "matrix_distill_lambda", 1.0))
+            else:
+                train_fn = train_minn_staged
+                extra_kwargs["stage"] = stage_val
+                extra_kwargs["controller_distiller"] = controller_distiller
+                extra_kwargs["grad_approx"] = bool(getattr(cfg, "grad_approx", False))
+                extra_kwargs["grad_approx_sigma"] = float(getattr(cfg, "grad_approx_sigma", 0.1))
+                extra_kwargs["matrix_distill_lambda"] = float(getattr(cfg, "matrix_distill_lambda", 1.0))
         elif getattr(cfg, "alternating_train", False):
             train_fn = train_minn_alter
             print("[INFO] Using alternating training strategy (0.5 epoch per phase)")
@@ -2451,31 +2613,52 @@ if __name__ == '__main__':
         else:
             train_fn = train_minn
 
-        history = train_fn(
-            channel_params,
-            encoder,
-            decoder,
-            controller,
-            physical_sim,
-            train_loader,
-            num_epochs=int(cfg.epochs),
-            lr=float(cfg.lr),
-            weight_decay=float(cfg.weight_decay),
-            device=device,
-            combine_mode=str(cfg.combine_mode),
-            H_d_all=H_d_all,
-            H_1_all=H_1_all,
-            H_2_all=H_2_all,
-            encoder_distiller=encoder_distiller,
-            tx_power_dbm=float(getattr(cfg, "tx_power_dbm", 30.0)),
-            metasurface_type=str(getattr(cfg, "metasurface_type", "sim")),
-            # For compare runs, we plot once at the end; disable internal plotting.
-            plot_acc=False,
-            plot_path=None,
-            plot_live=False,
-            show_plot_end=False,
-            **extra_kwargs
-        )
+        if train_fn == ctrl_train_distance:
+            history = train_fn(
+                channel_params,
+                encoder,
+                controller,
+                teacher=extra_kwargs.pop("teacher"),
+                physical_sim=physical_sim,
+                train_loader=train_loader,
+                num_epochs=int(cfg.epochs),
+                lr=float(cfg.lr),
+                weight_decay=float(cfg.weight_decay),
+                device=device,
+                combine_mode=str(cfg.combine_mode),
+                H_d_all=H_d_all,
+                H_1_all=H_1_all,
+                H_2_all=H_2_all,
+                tx_power_dbm=float(getattr(cfg, "tx_power_dbm", 30.0)),
+                metasurface_type=str(getattr(cfg, "metasurface_type", "sim")),
+                matrix_distill_lambda=float(getattr(cfg, "matrix_distill_lambda", 1.0)),
+            )
+        else:
+            history = train_fn(
+                channel_params,
+                encoder,
+                decoder,
+                controller,
+                physical_sim,
+                train_loader,
+                num_epochs=int(cfg.epochs),
+                lr=float(cfg.lr),
+                weight_decay=float(cfg.weight_decay),
+                device=device,
+                combine_mode=str(cfg.combine_mode),
+                H_d_all=H_d_all,
+                H_1_all=H_1_all,
+                H_2_all=H_2_all,
+                encoder_distiller=encoder_distiller,
+                tx_power_dbm=float(getattr(cfg, "tx_power_dbm", 30.0)),
+                metasurface_type=str(getattr(cfg, "metasurface_type", "sim")),
+                # For compare runs, we plot once at the end; disable internal plotting.
+                plot_acc=False,
+                plot_path=None,
+                plot_live=False,
+                show_plot_end=False,
+                **extra_kwargs
+            )
 
         # Save model (optional) per run
         suffix = None
@@ -2504,7 +2687,7 @@ if __name__ == '__main__':
         values = [str(v) for v in args.compare_arg[1:]]
 
         def _cast(name: str, raw: str):
-            if name in {"encoder_distill", "cotrl_CSI", "alternating_train", "grad_approx"}:
+            if name in {"encoder_distill", "cotrl_CSI", "alternating_train", "grad_approx", "ctrl_train_distance"}:
                 return _parse_bool(raw)
             if name in {"channel_type", "teacher_type"}:
                 return str(raw)
@@ -2571,21 +2754,30 @@ if __name__ == '__main__':
             any_fd = any(_has_fd(h) for _, h in histories)
             for label, hist in histories:
                 xs = hist["epoch"]
-                ax_acc.plot(xs, hist["acc"], label=label)
-                ax_loss.plot(xs, hist["loss_total"], label=f"{label} (L_total)")
+                if "acc" in hist:
+                    ax_acc.plot(xs, hist["acc"], label=label)
+                ax_loss_plotted = False
+                if "loss_total" in hist:
+                    ax_loss.plot(xs, hist["loss_total"], label=f"{label} (L_total)")
+                    ax_loss_plotted = True
                 # When distillation is enabled, include L_fd on the loss subplot.
                 if any_fd and _has_fd(hist):
+                    ax_loss.plot(xs, hist["loss_fd"], linestyle="--", label=f"{label} (L_fd)")
+                    ax_loss_plotted = True
+                if not ax_loss_plotted and "loss_fd" in hist:
                     ax_loss.plot(xs, hist["loss_fd"], linestyle="--", label=f"{label} (L_fd)")
             ax_acc.grid(True)
             ax_acc.set_ylim(0.0, 100.0)
             ax_acc.set_ylabel("acc (%)")
             ax_acc.set_title("Training curves (comparison)")
-            ax_acc.legend(loc="best")
+            if ax_acc.get_legend_handles_labels()[0]:
+                ax_acc.legend(loc="best")
 
             ax_loss.grid(True)
             ax_loss.set_xlabel("epoch")
             ax_loss.set_ylabel("loss")
-            ax_loss.legend(loc="best")
+            if ax_loss.get_legend_handles_labels()[0]:
+                ax_loss.legend(loc="best")
             fig.tight_layout()
 
             if args.plot_path != "":
@@ -2613,24 +2805,30 @@ if __name__ == '__main__':
         import matplotlib.pyplot as plt
         fig, (ax_acc, ax_loss) = plt.subplots(nrows=2, ncols=1, figsize=(8, 8), sharex=True)
         xs = history["epoch"]
-        ax_acc.plot(xs, history["acc"], label="acc (%)")
+        if "acc" in history:
+            ax_acc.plot(xs, history["acc"], label="acc (%)")
         ax_acc.grid(True)
         ax_acc.set_ylim(0.0, 100.0)
         ax_acc.set_ylabel("acc (%)")
         ax_acc.set_title("Training curves")
-        ax_acc.legend(loc="best")
+        if ax_acc.get_legend_handles_labels()[0]:
+            ax_acc.legend(loc="best")
 
-        ax_loss.plot(xs, history["loss_total"], label="L_total")
+        if "loss_total" in history:
+            ax_loss.plot(xs, history["loss_total"], label="L_total")
         # Include L_fd when encoder distillation is active (best-effort: detect non-zero).
         try:
             if any(abs(float(x)) > 1e-12 for x in history.get("loss_fd", [])):
                 ax_loss.plot(xs, history["loss_fd"], linestyle="--", label="L_fd")
         except Exception:
             pass
+        if "loss_total" not in history and "loss_fd" in history:
+            ax_loss.plot(xs, history["loss_fd"], linestyle="--", label="L_fd")
         ax_loss.grid(True)
         ax_loss.set_xlabel("epoch")
         ax_loss.set_ylabel("loss")
-        ax_loss.legend(loc="best")
+        if ax_loss.get_legend_handles_labels()[0]:
+            ax_loss.legend(loc="best")
         fig.tight_layout()
         if args.plot_path != "":
             os.makedirs(os.path.dirname(args.plot_path) or ".", exist_ok=True)

@@ -630,7 +630,7 @@ class chennel_params():
         self.path_loss_direct = 10 ** (-path_loss_direct_db / 20.0)
         self.path_loss_ms = 10 ** (-path_loss_ms_db / 20.0)
 
-def build_simnet(N_m, lam=0.125):
+def build_simnet(N_m, lam=0.125, num_layers=3):
     n_side = int(math.isqrt(N_m)) if N_m is not None else None
-    layers = [RisLayer(n_side, n_side) for _ in range(3)]
+    layers = [RisLayer(n_side, n_side) for _ in range(num_layers)]
     return SimNet(layers=layers, layer_dist=0.01, wavelength=lam, elem_area=1e-4, elem_dist=1e-2, layers_orientation_plane='yz', first_layer_central_coords=(0.0, 0.0, 0.0), input_module=None, output_module=None, complex_dtype=torch.complex64)
