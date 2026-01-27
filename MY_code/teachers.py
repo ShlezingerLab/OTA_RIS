@@ -954,20 +954,20 @@ if __name__ == "__main__":
     from torch.utils.data import DataLoader, Subset
     from channels import generate_channel_tensors_by_type
     #################################################
-    N_t = 10
-    N_r = 20
-    N_m = 100
+    N_t = 20
+    N_r = 10
+    N_m = 20
     num_classes = 10
     power = 1.0
     subset_size = 1000
     batchsize = 100
     channel_sampling_size = 100  # Number of different channels to cycle through
     epochs = 30
-    teacher_suffix = "yaniv_e2eproxy"  # "demo" or "full"
+    teacher_suffix = "yaniv_27.1.2026"  # "demo" or "full"
     #################################################
     #teacher = MNISTClassifier(num_classes=num_classes)
-    #teacher = MyTeacher(n_t=N_t, n_r=N_r, n_m=N_m, num_classes=num_classes, power=power)
-    teacher = E2EProxyTeacher(nt=N_t, nr=N_r)
+    teacher = MyTeacher(n_t=N_t, n_r=N_r, n_m=N_m, num_classes=num_classes, power=power)
+    #teacher = E2EProxyTeacher(nt=N_t, nr=N_r)
     #################################################
     import torch.optim as optim
     from tqdm import tqdm

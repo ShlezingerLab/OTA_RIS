@@ -1304,13 +1304,11 @@ if __name__ == "__main__":
 
     from training import train_minn_phases
     from channels import build_simnet
-
     # Build SimNet for SIM metasurface
     simnet = build_simnet(N_m=N_m, lam=0.125, num_layers=num_sim_layers)
     simnet.to(device)
     physical_sim = Physical_SIM(simnet)
     physical_sim.to(device)
-
     encoder_path = os.path.join(script_dir, "models_dict", "encoder_e2e_full_64_True.pth")
     checkpoint = torch.load(encoder_path, map_location=device)
     if isinstance(checkpoint, dict) and "encoder" in checkpoint:
@@ -1318,7 +1316,6 @@ if __name__ == "__main__":
     else:
         encoder.load_state_dict(checkpoint)
     encoder.to(device)
-
     train_results = train_minn_phases(
         channel=channel,
         encoder=encoder,
