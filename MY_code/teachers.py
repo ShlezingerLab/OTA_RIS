@@ -662,8 +662,64 @@ class MyTeacher(nn.Module):
         phi_optimal = torch.exp(1j * torch.angle(optimal_direction))
 
         return phi_optimal  # (B, Nm)
-
     def get_channel_matching_loss(
+        self,
+        H_d: torch.Tensor,   # (N_ch, Nr, Nt)
+        H_1: torch.Tensor,   # (N_ch, Nt, Nm)
+        H_2: torch.Tensor    # (N_ch, Nm, Nr)
+    ) -> torch.Tensor:
+        """
+        Compute average loss over ALL provided channels for EVERY sample in the batch.
+        Total comparisons: Batch_Size * Num_Channels
+        """
+        if self._cached_s is None or self._cached_y is None:
+            raise RuntimeError("Must call forward() with return_intermediates=True")
+
+        s = self._cached_s  # (B, Nt) or (B, 1, Nt)
+        y_learned = self._cached_y  # (B, Nr)
+
+        if s.dim() == 3:
+            s = s.squeeze(1)  # Ensure (B, Nt)
+
+        batch_size = s.size(0)
+        num_channels = H_d.size(0)
+
+        # --- EXPANSION STEP ---
+        # 1. Expand s and y: Repeat each sample N_ch times contiguously
+        # Result: s_0, s_0, ..., s_1, s_1, ...
+        s_expanded = s.repeat_interleave(num_channels, dim=0)  # (B * N_ch, Nt)
+        y_expanded = y_learned.repeat_interleave(num_channels, dim=0)  # (B * N_ch, Nr)
+
+        # 2. Expand H: Repeat the whole channel set B times
+        # Result: H_0..H_N, H_0..H_N, ...
+        # (N_ch, ...) -> (B * N_ch, ...)
+        H_d_expanded = H_d.repeat(batch_size, 1, 1)
+        H_1_expanded = H_1.repeat(batch_size, 1, 1)
+        H_2_expanded = H_2.repeat(batch_size, 1, 1)
+
+        # --- OPTIMIZATION & LOSS ---
+        # Now we have aligned tensors of size (B * N_ch), so we can treat them
+        # as one giant batch for the analytical calculation.
+
+        # 1. Optimize phi for all B * N_ch pairs
+        phi_optimal = self._optimize_phi_analytical(
+            s_expanded, y_expanded, H_1_expanded, H_2_expanded, H_d_expanded
+        )
+
+        # 2. Compute y_target (RIS output)
+        H_1_s = torch.bmm(H_1_expanded, s_expanded.unsqueeze(-1)).squeeze(-1)
+        phi_H_1_s = H_1_s * phi_optimal
+        ris_path = torch.bmm(H_2_expanded, phi_H_1_s.unsqueeze(-1)).squeeze(-1)
+        direct_path = torch.bmm(H_d_expanded, s_expanded.unsqueeze(-1)).squeeze(-1)
+        y_target = ris_path + direct_path
+
+        # 3. Compute MSE
+        loss_all = torch.mean(torch.abs(y_expanded - y_target) ** 2, dim=1) # (B * N_ch,)
+
+        # 4. Return mean (this averages over both Batch and Channels)
+        return torch.mean(loss_all)
+
+    def get_channel_matching_loss_ver1(
         self,
         H_d: torch.Tensor,   # (B, Nr, Nt)
         H_1: torch.Tensor,   # (B, Nt, Nm)
@@ -884,16 +940,9 @@ def train_teacher(teacher, train_loader, device, epochs, lr, weight_decay, lambd
 
             # Add channel matching regularization if applicable
             if use_channel_reg:
-                # Cyclic channel sampling: each image gets a different channel triple
-                batch_size = images.size(0)
-                idxs = (torch.arange(batch_size, device=device) + channel_cursor) % num_channels
-                channel_cursor = (channel_cursor + batch_size) % num_channels
-
-                H_d_batch = H_d_channel[idxs]  # (batch_size, Nr, Nt)
-                H_1_batch = H_1_channel[idxs]  # (batch_size, Nt, Nm)
-                H_2_batch = H_2_channel[idxs]  # (batch_size, Nm, Nr)
-
-                loss_channel = teacher.get_channel_matching_loss(H_d_batch, H_1_batch, H_2_batch)
+                # We simply pass the FULL channel tensors (H_d_all, H_1_all, H_2_all)
+                # The expansion happens inside the model function now.
+                loss_channel = teacher.get_channel_matching_loss(H_d_channel, H_1_channel, H_2_channel)
                 loss = loss + lambda_channel * loss_channel
             else:
                 loss_channel = torch.tensor(0.0)
@@ -963,7 +1012,7 @@ if __name__ == "__main__":
     batchsize = 100
     channel_sampling_size = 100  # Number of different channels to cycle through
     epochs = 30
-    teacher_suffix = "yaniv_27.1.2026"  # "demo" or "full"
+    teacher_suffix = "yaniv_27.1.2026_testme"  # "demo" or "full"
     #################################################
     #teacher = MNISTClassifier(num_classes=num_classes)
     teacher = MyTeacher(n_t=N_t, n_r=N_r, n_m=N_m, num_classes=num_classes, power=power)
