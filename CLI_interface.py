@@ -450,10 +450,10 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     IDE_COMMAND = "train"
-    IDE_TRAIN_STAGE = 2   # 0: Teacher, 0.5: Complexity Shift, 1: Encoder, 2: Controller, 3: Decoder, 4: Full (1-3)
+    IDE_TRAIN_STAGE = 3   # 0: Teacher, 0.5: Complexity Shift, 1: Encoder, 2: Controller, 3: Decoder, 4: Full (1-3)
     train_mode = 'demo'
-    combine_mode = 'both'
-    teacher_type = 'cnn'
+    combine_mode = 'direct'
+    teacher_type = 'e2e_proxy'
 
     bottleneck_dim = None
     teacher_use_channel = False
@@ -466,7 +466,7 @@ if __name__ == "__main__":
         subset_size = 1000
         batchsize = 100
         channel_sampling_size = 100
-        epochs = 30
+        epochs = 100
     elif train_mode == 'debug':
         subset_size = 1
         batchsize = 1
@@ -506,14 +506,14 @@ if __name__ == "__main__":
     teacher_plot_path = f"plots/teacher_{teacher_type}_{train_mode}.png"
     encoder_path = f"models_dict/encoder_{teacher_type}_{train_mode}.pth"
     ctrl_path = f"models_dict/ctrl_{teacher_type}_{train_mode}.pth"
-    plot_path_ctrl = f"plots/ctrl_{teacher_type}_{train_mode}.png"
-    plot_path = f"plots/decoder_{teacher_type}_{train_mode}.png"
+    # plot_path_ctrl = f"plots/ctrl_{teacher_type}_{train_mode}.png"
+    # plot_path = f"plots/decoder_{teacher_type}_{train_mode}.png"
     decoder_path = f"models_dict/decoder_{teacher_type}_{train_mode}.pth"
     STAGED_CONFIGS = {
         0: { # PHASE 0: Train Teacher
                 "--teacher_type_train": teacher_type,
                 "--teacher_channel_noise_std": 0.1,
-                #"--classifier_path": teacher_path,
+                "--classifier_path": teacher_path,
                 "--plot_path": teacher_plot_path
         },
         0.5: { # PHASE 0.5: Complexity Shift (Fine-tuning Teacher)
@@ -522,7 +522,7 @@ if __name__ == "__main__":
                 "--complexity_shift": True,
                 "--lambda_complexity": 0.01,
                 "--complexity_type": "l1",
-                "--plot_path": "plots/teacher_cnn_shifted.png"
+                #"--plot_path": "plots/teacher_cnn_shifted.png"
         },
         1: { # PHASE 1: Train Encoder via Distillation
             "--stage": 1,
@@ -534,13 +534,13 @@ if __name__ == "__main__":
             "--teacher_path": teacher_path,
             "--load_encoder": encoder_path,
             "--save_ctrl": ctrl_path,
-            "--plot_path": plot_path_ctrl,
+            #"--plot_path": plot_path_ctrl,
         },
         3: { # PHASE 3: Train Decoder
             "--stage": 3,
             "--load_encoder": encoder_path,
-            "--load_ctrl": ctrl_path,
-            "--plot_path": plot_path,
+            #"--load_ctrl": ctrl_path,
+            #"--plot_path": plot_path,
         },
     }
 

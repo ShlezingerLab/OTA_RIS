@@ -17,7 +17,7 @@ def test_physical_channel():
     batch_size = 100
     noise_std = 0.01  # Set to 0.0 for a pure sanity check
 
-    teacher_suffix = "yaniv_27.1.2026"
+    teacher_suffix = "yaniv_testme_lambda"
     script_dir = os.path.dirname(os.path.abspath(__file__))
     model_path = os.path.join(script_dir, "models_dict", f"teacher_{teacher_suffix}.pth")
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -37,36 +37,42 @@ def test_physical_channel():
     H_d_all, H_1_all, H_2_all = generate_channel_tensors_by_type(
         channel_type="geometric_ricean",
         N_t=N_t, N_r=N_r, N_m=N_m,
-        num_channels=1, device=device
+        num_channels=100, device=device
     )
     H_d, H_1, H_2 = H_d_all[0], H_1_all[0], H_2_all[0]
+    C = H_d_all.shape[0]
+    #H_d = torch.load('OTA_RIS/MY_code/H_d_all.pt', map_location=device)
 
     # ---------------- Evaluation Loop ---------------- #
     correct = 0
     total = 0
+    sample_idx = 0  # Counter for cycling through H_d samples
 
     print(f"Testing Physical Path: Enc -> (Hd + H2*Phi*H1) -> Dec")
 
     with torch.no_grad():
         for images, labels in test_loader:
             images, labels = images.to(device), labels.to(device)
-            outputs = teacher(images, return_intermediates=True)
-            # B = images.size(0)
+            #outputs = teacher(images, return_intermediates=True)
+            B = images.size(0)
 
-            # # 1. ENCODE: Image -> s (complex)
-            # s = teacher.encoder(images)
-            # if s.dim() == 3: s = s.squeeze(1)
+            # 1. ENCODE: Image -> s (complex)
+            s = teacher.encoder(images)
+            if s.dim() == 3:
+                s = s.squeeze(1)
 
-            # # 2. TARGET: Get 'y_learned' (The signal the linear layer would have made)
-            # # This is what we try to match with the RIS
-            # s_real = torch.view_as_real(s).reshape(B, -1)
-            # y_flat = teacher.linear(s_real)
-            # y_learned = y_flat.reshape(B, N_r, 2)
-            # y_learned = torch.view_as_complex(y_learned.contiguous())
+            # 2. TARGET: Get 'y_learned' (The signal the linear layer would have made)
+            # This is what we try to match with the RIS
+            s_real = torch.view_as_real(s).reshape(B, -1)
+            y_flat = teacher.linear(s_real)
+            y_learned = y_flat.reshape(B, N_r, 2)
+            y_learned = torch.view_as_complex(y_learned.contiguous())
 
-            # # 3. OPTIMIZE RIS: Find optimal Phi for this specific batch and channel
-            # # We must batch the channels to (B, Nr, Nt) to use the analytical function
-            # H_d_batched = H_d.unsqueeze(0).expand(B, -1, -1)
+            # 3. OPTIMIZE RIS: Find optimal Phi for this specific batch and channel
+            # We must batch the channels to (B, Nr, Nt) to use the analytical function
+            # Cyclically assign H_d samples to each batch element
+            H_d_batched = torch.stack([H_d_all[(sample_idx + i) % C] for i in range(B)], dim=0)
+            sample_idx += B  # Update counter for next batch
             # H_1_batched = H_1.unsqueeze(0).expand(B, -1, -1)
             # H_2_batched = H_2.unsqueeze(0).expand(B, -1, -1)
 
@@ -80,14 +86,14 @@ def test_physical_channel():
             # phi_H1_s = H1_s * phi_opt
             # # H_2_batched is (B, Nr, Nm), we need it to be (B, Nm, Nr) for the multiplication
             # y_ris = torch.bmm(phi_H1_s.unsqueeze(1), H_2_batched.transpose(1, 2)).squeeze(1) # (B, Nr)
-            # # Direct Path: s -> Hd
-            # y_direct = torch.bmm(s.unsqueeze(1), H_d_batched.transpose(1, 2)).squeeze(1) # (B, Nr)
+            # Direct Path: s -> Hd
+            y_direct = torch.bmm(s.unsqueeze(1), H_d_batched.transpose(1, 2)).squeeze(1) # (B, Nr)
 
-            # # 5. NOISE & DECODE
-            # noise = (torch.randn_like(y_direct, dtype=torch.complex64) * (noise_std / math.sqrt(2)))
-            # y_received = y_ris + y_direct + noise
+            # 5. NOISE & DECODE
+            noise = (torch.randn_like(y_direct, dtype=torch.complex64) * (noise_std / math.sqrt(2)))
+            y_received = y_direct#+y_ris + noise
 
-            # outputs = teacher.decoder(y_received)
+            outputs = teacher.decoder(y_received)
 
             _, predicted = torch.max(outputs.data, 1)
             total += labels.size(0)

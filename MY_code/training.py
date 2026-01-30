@@ -1018,7 +1018,7 @@ def train_minn_staged(channel, encoder, decoder, controller, physical_sim, train
         try: plt.show()
         except: pass
 
-        return history
+    return history
 
 
 def ctrl_train_distance(
@@ -1117,7 +1117,7 @@ def ctrl_train_distance(
                 if tx_amp_scale != 1.0:
                     s_c = s_c * float(tx_amp_scale)
 
-            batch_size = s.size(0)
+            batch_size = images.size(0)
             idxs = (torch.arange(batch_size, device=device) + channel_cursor) % num_channels
             channel_cursor = (channel_cursor + batch_size) % num_channels
             H_D = H_d_all[idxs].to(device) if H_d_all is not None else None

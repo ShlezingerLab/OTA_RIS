@@ -521,11 +521,21 @@ class MyTeacher(nn.Module):
 
         # Heavy encoder
         self.encoder = HeavyEncoder(n_t=self.n_t, power=power, base_channels=base_channels)
+        self.linear = nn.Linear(2 * self.n_t, 2 * self.n_r)
 
-        # Single linear layer (matrix multiplication)
-        # Encoder outputs complex (B, Nt), we convert to real (B, 2*Nt) for linear layer
-        encoder_out_dim = 2 * self.n_t  # Real and imaginary parts
-        self.linear = nn.Linear(encoder_out_dim, 2 * self.n_r)
+        # Physical channel H_d (Direct TX to RX) instead of learnable linear layer
+        # Generate one realization of the channel
+        from channels import generate_channel_tensors_by_type
+        H_d_all, _, _ = generate_channel_tensors_by_type(
+            channel_type="geometric_ricean",
+            N_t=self.n_t,
+            N_r=self.n_r,
+            N_m=self.n_m,
+            num_channels=1,
+            device="cpu"  # Will be moved to correct device when model is moved
+        )
+        # H_d is (Nr, Nt) complex, register as buffer (non-trainable)
+        self.register_buffer('H_d', H_d_all[0])
 
         # Heavy decoder
         self.decoder = HeavyRxDecoder(n_r=self.n_r, num_classes=self.num_classes, hidden_dim=decoder_hidden)
@@ -544,18 +554,15 @@ class MyTeacher(nn.Module):
         """
         # Encoder: image -> complex signal
         s = self.encoder(x)  # (B, Nt) complex
-
-        # Convert complex to real for linear layer
+        #y = torch.matmul(s.squeeze(1), self.H_d.t())  # (B, Nt) @ (Nt, Nr) = (B, Nr)
         s_real = torch.view_as_real(s)  # (B, Nt, 2)
         s_flat = s_real.reshape(s.size(0), -1)  # (B, 2*Nt)
-
         # Linear layer (matrix multiplication)
         y_flat = self.linear(s_flat)  # (B, 2*Nr)
 
         # Convert back to complex
         y = y_flat.reshape(y_flat.size(0), self.n_r, 2)  # (B, Nr, 2)
         y = torch.view_as_complex(y.contiguous())  # (B, Nr)
-
         # Cache intermediates if needed
         if return_intermediates:
             self._cached_s = s
@@ -672,8 +679,6 @@ class MyTeacher(nn.Module):
         Compute average loss over ALL provided channels for EVERY sample in the batch.
         Total comparisons: Batch_Size * Num_Channels
         """
-        if self._cached_s is None or self._cached_y is None:
-            raise RuntimeError("Must call forward() with return_intermediates=True")
 
         s = self._cached_s  # (B, Nt) or (B, 1, Nt)
         y_learned = self._cached_y  # (B, Nr)
@@ -705,17 +710,14 @@ class MyTeacher(nn.Module):
         phi_optimal = self._optimize_phi_analytical(
             s_expanded, y_expanded, H_1_expanded, H_2_expanded, H_d_expanded
         )
-
         # 2. Compute y_target (RIS output)
         H_1_s = torch.bmm(H_1_expanded, s_expanded.unsqueeze(-1)).squeeze(-1)
         phi_H_1_s = H_1_s * phi_optimal
         ris_path = torch.bmm(H_2_expanded, phi_H_1_s.unsqueeze(-1)).squeeze(-1)
         direct_path = torch.bmm(H_d_expanded, s_expanded.unsqueeze(-1)).squeeze(-1)
-        y_target = ris_path + direct_path
-
+        y_target = direct_path#+ris_path TODO
         # 3. Compute MSE
         loss_all = torch.mean(torch.abs(y_expanded - y_target) ** 2, dim=1) # (B * N_ch,)
-
         # 4. Return mean (this averages over both Batch and Channels)
         return torch.mean(loss_all)
 
@@ -929,19 +931,8 @@ def train_teacher(teacher, train_loader, device, epochs, lr, weight_decay, lambd
             else:
                 logits = teacher(images)
             loss_ce = criterion(logits, labels)
-
-            # Add L2 regularization if applicable
             loss = loss_ce
-            if use_l2_reg:
-                loss_l2 = teacher.get_l2_regularization()
-                loss = loss + lambda_l2 * loss_l2
-            else:
-                loss_l2 = torch.tensor(0.0)
-
-            # Add channel matching regularization if applicable
             if use_channel_reg:
-                # We simply pass the FULL channel tensors (H_d_all, H_1_all, H_2_all)
-                # The expansion happens inside the model function now.
                 loss_channel = teacher.get_channel_matching_loss(H_d_channel, H_1_channel, H_2_channel)
                 loss = loss + lambda_channel * loss_channel
             else:
@@ -955,7 +946,6 @@ def train_teacher(teacher, train_loader, device, epochs, lr, weight_decay, lambd
             # Statistics
             running_loss += loss.item()
             running_ce_loss += loss_ce.item()
-            running_l2_loss += loss_l2.item()
             running_channel_loss += loss_channel.item()
             _, predicted = torch.max(logits.data, 1)
             total += labels.size(0)
@@ -965,8 +955,6 @@ def train_teacher(teacher, train_loader, device, epochs, lr, weight_decay, lambd
                 'loss': f"{loss.item():.4f}",
                 'acc': f"{100 * correct / total:.2f}%"
             }
-            if use_l2_reg:
-                postfix['l2'] = f"{loss_l2.item():.4f}"
             if use_channel_reg:
                 postfix['ch'] = f"{loss_channel.item():.4f}"
             pbar.set_postfix(postfix)
@@ -1007,12 +995,13 @@ if __name__ == "__main__":
     N_r = 10
     N_m = 20
     num_classes = 10
-    power = 1.0
     subset_size = 1000
     batchsize = 100
-    channel_sampling_size = 100  # Number of different channels to cycle through
-    epochs = 30
-    teacher_suffix = "yaniv_27.1.2026_testme"  # "demo" or "full"
+    channel_sampling_size = 1000  # Number of different channels to cycle through
+    lambda_channel = 0.1
+    epochs = 100
+    teacher_suffix = "yaniv_testme_lambda"  # "demo" or "full"
+    power = 1.0
     #################################################
     #teacher = MNISTClassifier(num_classes=num_classes)
     teacher = MyTeacher(n_t=N_t, n_r=N_r, n_m=N_m, num_classes=num_classes, power=power)
@@ -1022,8 +1011,6 @@ if __name__ == "__main__":
     from tqdm import tqdm
     lr = 1e-3
     weight_decay = 1e-7
-    lambda_l2 = 0.00  # L2 regularization weight
-    lambda_channel = 1.0  # Channel matching regularization weight
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     teacher = teacher.to(device)
@@ -1047,6 +1034,7 @@ if __name__ == "__main__":
         geo_pathloss_gain_db=60.0,
     )
     #################################################
+    #torch.save(H_d_all, 'H_d_all.pt')
     transform = transforms.Compose([transforms.ToTensor()])
     train_dataset = datasets.MNIST(root="./data", train=True, transform=transform, download=True)
     indices = np.random.choice(len(train_dataset), subset_size, replace=False)
@@ -1055,7 +1043,6 @@ if __name__ == "__main__":
     #################################################
     # Training loop with RIS channel matching
     train_teacher(teacher, train_loader, device, epochs, lr, weight_decay,
-                  lambda_l2=lambda_l2,
                   H_d_channel=H_d_all,
                   H_1_channel=H_1_all,
                   H_2_channel=H_2_all,
