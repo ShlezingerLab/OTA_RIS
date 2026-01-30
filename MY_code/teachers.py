@@ -998,7 +998,7 @@ if __name__ == "__main__":
     subset_size = 1000
     batchsize = 100
     channel_sampling_size = 1000  # Number of different channels to cycle through
-    lambda_channel = 0.1
+    lambda_channel = 0.25
     epochs = 100
     teacher_suffix = "yaniv_testme_lambda"  # "demo" or "full"
     power = 1.0

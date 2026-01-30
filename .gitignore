@@ -22,6 +22,7 @@ env/
 *~
 
 # Large files and models
+*.pth
 *.pt
 *.h5
 *.ckpt
