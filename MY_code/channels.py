@@ -194,8 +194,7 @@ def _mimo_geometric_channel(
     los = math.sqrt(kappa / (kappa + 1.0)) * a
 
     nlos_scaled = math.sqrt(1.0 / (kappa + 1.0)) * nlos
-    pl=1.0 #TODO
-    h = math.sqrt(pl) * (los + nlos_scaled)
+    h = (los + nlos_scaled) *math.sqrt(pl) #TODO
     return h.T
 
 # --- Tensor Generation Dispatcher (from channel_tensors.py) ---

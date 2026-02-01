@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from students import Encoder as StudentEncoder
-
+import random
 class RayleighChannelLayer(nn.Module):
     """
     Rayleigh fading channel layer for CNN feature maps.
@@ -521,7 +521,7 @@ class MyTeacher(nn.Module):
 
         # Heavy encoder
         self.encoder = HeavyEncoder(n_t=self.n_t, power=power, base_channels=base_channels)
-        self.linear = nn.Linear(2 * self.n_t, 2 * self.n_r)
+        self.linear = nn.Linear(2 * self.n_t, 2 * self.n_r, bias=False)
 
         # Physical channel H_d (Direct TX to RX) instead of learnable linear layer
         # Generate one realization of the channel
@@ -559,10 +559,20 @@ class MyTeacher(nn.Module):
         s_flat = s_real.reshape(s.size(0), -1)  # (B, 2*Nt)
         # Linear layer (matrix multiplication)
         y_flat = self.linear(s_flat)  # (B, 2*Nr)
-
-        # Convert back to complex
+        y_flat = y_flat + torch.randn_like(y_flat) * 0.05
+        # Convert to complex first
         y = y_flat.reshape(y_flat.size(0), self.n_r, 2)  # (B, Nr, 2)
-        y = torch.view_as_complex(y.contiguous())  # (B, Nr)
+        y = torch.view_as_complex(y.contiguous())  # (B, Nr) complex
+
+        # Add phase noise
+        # div = torch.rand(y.size(0), device=y.device) * 6 + 2
+        # std_rad = div * (math.pi / 180.0) #TODO- phase noise std
+        # noise_phase = torch.randn_like(y.real) * std_rad.unsqueeze(1)
+        max_std = (5.0 * 1.0) * (math.pi / 180.0)
+        std_rad = torch.rand(y.size(0), device=y.device) * max_std
+        noise_phase = torch.randn_like(y.real) * std_rad.unsqueeze(1)
+        rotation = torch.exp(1j * noise_phase)  # (B, Nr) complex
+        y = y * rotation  # (B, Nr) complex
         # Cache intermediates if needed
         if return_intermediates:
             self._cached_s = s
@@ -617,58 +627,91 @@ class MyTeacher(nn.Module):
         """
         return torch.norm(self.linear.weight, p=2) ** 2
 
-    def _optimize_phi_analytical(
-        self,
-        s: torch.Tensor,     # (B, Nt)
-        y: torch.Tensor,     # (B, Nr)
-        H_1: torch.Tensor,   # (B, Nt, Nm)
-        H_2: torch.Tensor,   # (B, Nm, Nr)
-        H_d: torch.Tensor    # (B, Nr, Nt)
-    ) -> torch.Tensor:       # Returns (B, Nm) unit modulus phases
+    # def _optimize_phi_analytical( #TODO- version with H_d. check both analytical procedure
+    #     self,
+    #     s: torch.Tensor,     # (B, Nt)
+    #     y: torch.Tensor,     # (B, Nr)
+    #     H_1: torch.Tensor,   # (B, Nt, Nm)
+    #     H_2: torch.Tensor,   # (B, Nm, Nr)
+    #     H_d: torch.Tensor    # (B, Nr, Nt)
+    # ) -> torch.Tensor:       # Returns (B, Nm) unit modulus phases
+    #     """
+    #     Analytically optimize phi = argmin ||(H1·Φ·H2 + H_d)·s - y||²
+    #     with constraint |phi_i| = 1 (unit modulus).
+
+    #     This computes the optimal phase shift for each RIS element to minimize
+    #     the squared error between the learned output y and the target output
+    #     from the RIS channel model.
+
+    #     Args:
+    #         s: Transmitted signal (B, Nt) complex
+    #         y: Learned received signal (B, Nr) complex
+    #         H_1: TX to RIS channel (B, Nt, Nm) complex
+    #         H_2: RIS to RX channel (B, Nm, Nr) complex
+    #         H_d: Direct TX to RX channel (B, Nr, Nt) complex
+
+    #     Returns:
+    #         phi_optimal: (B, Nm) complex with unit modulus, optimal phase shifts
+    #     """
+    #     # Compute residual: y - H_d @ s
+    #     # This is the part that the RIS needs to match
+    #     residual = y - torch.bmm(H_d, s.unsqueeze(-1)).squeeze(-1)  # (B, Nr)
+
+    #     # For the RIS path: y_ris = H_2 @ (Φ @ (H_1 @ s))
+    #     # where Φ is diagonal with elements φ_i
+    #     # The gradient w.r.t. φ_m is: ∂L/∂φ_m = -conj((H_2[:, m] · residual)) * (H_1[m, :] · s)
+    #     #
+    #     # We compute this more efficiently in batch form:
+    #     # H_1 @ s gives the signal at each RIS element before phase shift
+    #     H_1_s = torch.bmm(H_1, s.unsqueeze(-1)).squeeze(-1)  # (B, Nm)
+
+    #     # H_2^H @ residual gives the "backpropagated" error to each RIS element
+    #     H_2_conj_T = H_2.conj().transpose(-2, -1)  # (B, Nr, Nm)
+    #     grad_direction = torch.bmm(H_2_conj_T, residual.unsqueeze(-1)).squeeze(-1)  # (B, Nm)
+
+    #     # Combine: the optimal direction is conj(grad_direction) * H_1_s
+    #     # But for unit modulus constraint, we just need the angle
+    #     # phi_m = exp(j * angle(conj(grad_direction_m) * H_1_s_m))
+    #     #       = exp(j * angle(grad_direction_m^* * H_1_s_m))
+    #     optimal_direction = grad_direction.conj() * H_1_s
+
+    #     # Apply unit modulus constraint: phi = exp(j * angle(optimal_direction))
+    #     phi_optimal = torch.exp(1j * torch.angle(optimal_direction))
+    #     return phi_optimal  # (B, Nm)
+
+    def _optimize_phi_analytical( #TODO- this version is without H_d
+    self,
+    s: torch.Tensor,     # (B, Nt)
+    y: torch.Tensor,     # (B, Nr)
+    H_1: torch.Tensor,   # (B, Nt, Nm)
+    H_2: torch.Tensor,   # (B, Nm, Nr)
+    H_d: torch.Tensor    # (B, Nr, Nt)
+) -> torch.Tensor:       # Returns (B, Nm) unit modulus phases
+        """ #
+        Optimizes phi to match the RIS path to the Linear Layer output.
+        Solves: min || H2 * diag(phi) * H1 * s - y_learned ||^2
         """
-        Analytically optimize phi = argmin ||(H1·Φ·H2 + H_d)·s - y||²
-        with constraint |phi_i| = 1 (unit modulus).
+        # 1. Signal at the RIS elements: (B, Nm)
+        # H1 is (B, Nt, Nm), s is (B, Nt) -> (B, 1, Nt) @ (B, Nt, Nm)
+        a = torch.bmm(s.unsqueeze(1), H_1.transpose(-2, -1)).squeeze(1)
 
-        This computes the optimal phase shift for each RIS element to minimize
-        the squared error between the learned output y and the target output
-        from the RIS channel model.
+        # 2. Construct the effective mapping matrix 'A' for each RIS element
+        # For each sample, the contribution of phi_i to the output is:
+        # (column_i of H2) * a_i
+        # H2 is (B, Nr, Nm). We scale each column by a_i.
+        # A shape: (B, Nr, Nm)
+        A = H_2 * a.unsqueeze(1)
 
-        Args:
-            s: Transmitted signal (B, Nt) complex
-            y: Learned received signal (B, Nr) complex
-            H_1: TX to RIS channel (B, Nt, Nm) complex
-            H_2: RIS to RX channel (B, Nm, Nr) complex
-            H_d: Direct TX to RX channel (B, Nr, Nt) complex
+        # 3. Compute the "Gradient Direction"
+        # We want to align the columns of A with the target y_learned (b)
+        # Target b is y_learned: (B, Nr)
+        # optimal_direction = A^H @ b
+        A_hermitian = A.conj().transpose(-2, -1) # (B, Nm, Nr)
+        optimal_direction = torch.bmm(A_hermitian, y.unsqueeze(-1)).squeeze(-1) # (B, Nm)
+        # 4. Project onto Unit Circle
+        phi_optimal = torch.exp(1j * torch.angle(optimal_direction)) #TODO very important, dont change the sign
+        return phi_optimal
 
-        Returns:
-            phi_optimal: (B, Nm) complex with unit modulus, optimal phase shifts
-        """
-        # Compute residual: y - H_d @ s
-        # This is the part that the RIS needs to match
-        residual = y - torch.bmm(H_d, s.unsqueeze(-1)).squeeze(-1)  # (B, Nr)
-
-        # For the RIS path: y_ris = H_2 @ (Φ @ (H_1 @ s))
-        # where Φ is diagonal with elements φ_i
-        # The gradient w.r.t. φ_m is: ∂L/∂φ_m = -conj((H_2[:, m] · residual)) * (H_1[m, :] · s)
-        #
-        # We compute this more efficiently in batch form:
-        # H_1 @ s gives the signal at each RIS element before phase shift
-        H_1_s = torch.bmm(H_1, s.unsqueeze(-1)).squeeze(-1)  # (B, Nm)
-
-        # H_2^H @ residual gives the "backpropagated" error to each RIS element
-        H_2_conj_T = H_2.conj().transpose(-2, -1)  # (B, Nr, Nm)
-        grad_direction = torch.bmm(H_2_conj_T, residual.unsqueeze(-1)).squeeze(-1)  # (B, Nm)
-
-        # Combine: the optimal direction is conj(grad_direction) * H_1_s
-        # But for unit modulus constraint, we just need the angle
-        # phi_m = exp(j * angle(conj(grad_direction_m) * H_1_s_m))
-        #       = exp(j * angle(grad_direction_m^* * H_1_s_m))
-        optimal_direction = grad_direction.conj() * H_1_s
-
-        # Apply unit modulus constraint: phi = exp(j * angle(optimal_direction))
-        phi_optimal = torch.exp(1j * torch.angle(optimal_direction))
-
-        return phi_optimal  # (B, Nm)
     def get_channel_matching_loss(
         self,
         H_d: torch.Tensor,   # (N_ch, Nr, Nt)
@@ -707,19 +750,28 @@ class MyTeacher(nn.Module):
         # as one giant batch for the analytical calculation.
 
         # 1. Optimize phi for all B * N_ch pairs
-        phi_optimal = self._optimize_phi_analytical(
-            s_expanded, y_expanded, H_1_expanded, H_2_expanded, H_d_expanded
-        )
+        with torch.no_grad(): #TODO
+            phi_optimal = self._optimize_phi_analytical(
+                s_expanded, y_expanded, H_1_expanded, H_2_expanded, H_d_expanded)
         # 2. Compute y_target (RIS output)
         H_1_s = torch.bmm(H_1_expanded, s_expanded.unsqueeze(-1)).squeeze(-1)
         phi_H_1_s = H_1_s * phi_optimal
         ris_path = torch.bmm(H_2_expanded, phi_H_1_s.unsqueeze(-1)).squeeze(-1)
         direct_path = torch.bmm(H_d_expanded, s_expanded.unsqueeze(-1)).squeeze(-1)
-        y_target = direct_path#+ris_path TODO
-        # 3. Compute MSE
-        loss_all = torch.mean(torch.abs(y_expanded - y_target) ** 2, dim=1) # (B * N_ch,)
-        # 4. Return mean (this averages over both Batch and Channels)
-        return torch.mean(loss_all)
+        y_target = direct_path#+ris_path #TODO - and should I add noise?
+
+        #loss = torch.mean(torch.abs(y_expanded - y_target) ** 2, dim=1) # (B * N_ch,)
+        with torch.no_grad():
+            scale = y_target.abs().mean() / (y_expanded.abs().mean() + 1e-8)
+        # 1. Compute vector norms (magnitude of the whole vector)
+        norm_learned = torch.linalg.vector_norm(y_expanded, dim=-1, keepdim=True) + 1e-8
+        norm_target = torch.linalg.vector_norm(y_target, dim=-1, keepdim=True) + 1e-8
+        y_l_norm = y_expanded / norm_learned
+        y_t_norm = y_target / norm_target
+        cosine_sim = torch.real(torch.sum(y_l_norm.conj() * y_t_norm, dim=-1))
+        loss_magnitude = torch.mean(torch.abs(y_expanded - y_target) ** 2)
+        loss_phase = torch.mean(1.0 - cosine_sim)
+        return loss_phase+loss_magnitude #TODO - whould I add magnitude or MSE?
 
     def get_channel_matching_loss_ver1(
         self,
@@ -880,7 +932,8 @@ class HeavyIntermediateTeacher(nn.Module):
     def get_channel_num(self):
         return self.encoder.get_channel_num() + [self.intermediate_dim] * self.intermediate_layers_count
 
-def train_teacher(teacher, train_loader, device, epochs, lr, weight_decay, lambda_l2=0.0, H_d_channel=None, H_1_channel=None, H_2_channel=None, lambda_channel=0.0, save_path=None):
+def train_teacher(teacher, train_loader, device, epochs, lr, weight_decay, lambda_l2=0.0,
+H_d_channel=None, H_1_channel=None, H_2_channel=None, lambda_class=0.0, save_path=None):
     """
     Train teacher model with optional regularization.
 
@@ -902,7 +955,7 @@ def train_teacher(teacher, train_loader, device, epochs, lr, weight_decay, lambd
     criterion = nn.CrossEntropyLoss()
 
     use_l2_reg = lambda_l2 > 0 and hasattr(teacher, 'get_l2_regularization')
-    use_channel_reg = lambda_channel > 0 and H_d_channel is not None and H_1_channel is not None and H_2_channel is not None and hasattr(teacher, 'get_channel_matching_loss')
+    use_channel_reg = lambda_class > 0 and H_d_channel is not None and H_1_channel is not None and H_2_channel is not None and hasattr(teacher, 'get_channel_matching_loss')
 
     if use_channel_reg:
         H_d_channel = H_d_channel.to(device)
@@ -934,7 +987,7 @@ def train_teacher(teacher, train_loader, device, epochs, lr, weight_decay, lambd
             loss = loss_ce
             if use_channel_reg:
                 loss_channel = teacher.get_channel_matching_loss(H_d_channel, H_1_channel, H_2_channel)
-                loss = loss + lambda_channel * loss_channel
+                loss = lambda_class*loss + loss_channel
             else:
                 loss_channel = torch.tensor(0.0)
 
@@ -993,15 +1046,13 @@ if __name__ == "__main__":
     #################################################
     N_t = 20
     N_r = 10
-    N_m = 20
+    N_m = 9 #TODO: why increasing N_m doesnt improve me
     num_classes = 10
-    subset_size = 1000
-    batchsize = 100
-    channel_sampling_size = 1000  # Number of different channels to cycle through
-    lambda_channel = 0.25
-    epochs = 100
-    teacher_suffix = "yaniv_testme_lambda"  # "demo" or "full"
-    power = 1.0
+    subset_size = 60000
+    batchsize = 256
+    channel_sampling_size = 10000  # Number of different channels to cycle through
+    epochs = 200
+    power = 3.0
     #################################################
     #teacher = MNISTClassifier(num_classes=num_classes)
     teacher = MyTeacher(n_t=N_t, n_r=N_r, n_m=N_m, num_classes=num_classes, power=power)
@@ -1017,8 +1068,6 @@ if __name__ == "__main__":
     #################################################
     # Set save path
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    save_path = os.path.join(script_dir, "models_dict", f"teacher_{teacher_suffix}.pth")
-    print(f"Model will be saved to: {save_path}")
     #################################################
     H_d_all, H_1_all, H_2_all = generate_channel_tensors_by_type(
         channel_type="geometric_ricean",
@@ -1031,7 +1080,7 @@ if __name__ == "__main__":
         k_factor_h1_db=13.0,
         k_factor_h2_db=7.0,
         pathloss_exp=2.0,
-        geo_pathloss_gain_db=60.0,
+        geo_pathloss_gain_db=0.0,
     )
     #################################################
     #torch.save(H_d_all, 'H_d_all.pt')
@@ -1042,9 +1091,14 @@ if __name__ == "__main__":
     train_loader = DataLoader(train_subset, batch_size=batchsize, shuffle=True)
     #################################################
     # Training loop with RIS channel matching
-    train_teacher(teacher, train_loader, device, epochs, lr, weight_decay,
-                  H_d_channel=H_d_all,
-                  H_1_channel=H_1_all,
-                  H_2_channel=H_2_all,
-                  lambda_channel=lambda_channel,
-                  save_path=save_path)
+    lambda_classes = [0.1, 0.5, 1.0, 5.0, 10.0] #TODO
+    for lambda_class in lambda_classes:
+        teacher_suffix = f"testme_full_lambda_class={lambda_class}"  # "demo" or "full"
+        save_path = os.path.join(script_dir, "models_dict", f"teacher_{teacher_suffix}.pth")
+        print(f"Model will be saved to: {save_path}")
+        train_teacher(teacher, train_loader, device, epochs, lr, weight_decay,
+                    H_d_channel=H_d_all,
+                    H_1_channel=H_1_all,
+                    H_2_channel=H_2_all,
+                    lambda_class=lambda_class,
+                    save_path=save_path)
