@@ -1,0 +1,88 @@
+{
+  "os":  "Linux-5.14.0-570.55.1.el9_6.x86_64-x86_64-with-glibc2.34",
+  "python":  "CPython 3.10.19",
+  "startedAt":  "2026-02-03T05:23:46.456503Z",
+  "args":  [
+    "--lambda_class",
+    "2e-1"
+  ],
+  "program":  "/home/mazya/OTA_RIS/MY_code/teachers.py",
+  "codePath":  "MY_code/teachers.py",
+  "codePathLocal":  "MY_code/teachers.py",
+  "git":  {
+    "remote":  "https://github.com/ShlezingerLab/OTA_RIS.git",
+    "commit":  "fea6a423349a86c7a83c9a8142e1b9931d7a4621"
+  },
+  "email":  "mazya@post.bgu.ac.il",
+  "root":  "/home/mazya/OTA_RIS",
+  "host":  "cs-pheno-03.auth.ad.bgu.ac.il",
+  "executable":  "/home/mazya/.conda/envs/py310/bin/python",
+  "cpu_count":  6,
+  "cpu_count_logical":  12,
+  "gpu":  "NVIDIA GeForce GTX 1080 Ti",
+  "gpu_count":  1,
+  "disk":  {
+    "/":  {
+      "total":  "361207922688",
+      "used":  "17127391232"
+    }
+  },
+  "memory":  {
+    "total":  "134413385728"
+  },
+  "gpu_nvidia":  [
+    {
+      "name":  "NVIDIA GeForce GTX 1080 Ti",
+      "memoryTotal":  "11811160064",
+      "cudaCores":  3584,
+      "architecture":  "Pascal",
+      "uuid":  "GPU-b73cddee-9e69-d6cd-de5e-c5b5532d3a65"
+    }
+  ],
+  "cudaVersion":  "12.4",
+  "slurm":  {
+    "array_job_id":  "14168594",
+    "array_task_count":  "6",
+    "array_task_id":  "2",
+    "array_task_max":  "5",
+    "array_task_min":  "0",
+    "array_task_step":  "1",
+    "cluster_name":  "cluster",
+    "conf":  "/var/spool/slurmd/conf-cache/slurm.conf",
+    "cpus_on_node":  "6",
+    "gpus":  "1",
+    "gpus_on_node":  "1",
+    "gtids":  "0",
+    "job_account":  "tirzar",
+    "job_cpus_per_node":  "6",
+    "job_end_time":  "1770134016",
+    "job_gid":  "1945600513",
+    "job_gpus":  "1",
+    "job_id":  "14168597",
+    "job_name":  "minn_train",
+    "job_nodelist":  "cs-pheno-03",
+    "job_num_nodes":  "1",
+    "job_partition":  "gpu",
+    "job_qos":  "normal",
+    "job_start_time":  "1770096216",
+    "job_uid":  "343830305",
+    "job_user":  "mazya",
+    "jobid":  "14168597",
+    "localid":  "0",
+    "mem_per_node":  "32768",
+    "nnodes":  "1",
+    "nodeid":  "0",
+    "nodelist":  "cs-pheno-03",
+    "oom_kill_step":  "0",
+    "prio_process":  "0",
+    "procid":  "0",
+    "script_context":  "prolog_task",
+    "submit_dir":  "/home/mazya",
+    "submit_host":  "ise-pheno-12.auth.ad.bgu.ac.il",
+    "task_pid":  "2727811",
+    "tasks_per_node":  "3",
+    "topology_addr":  "cs-pheno-03",
+    "topology_addr_pattern":  "node"
+  },
+  "writerId":  "qsaqejxd609pwyucmjd7rhq09t1vw8jl"
+}

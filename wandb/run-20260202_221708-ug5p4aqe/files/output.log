@@ -1,0 +1,11 @@
+Epoch 1/100:   0%|          | 0/98 [00:00<?, ?it/s]
+Traceback (most recent call last):
+  File "/home/mazya/OTA_RIS/MY_code/teachers.py", line 1172, in <module>
+    train_teacher(teacher, train_loader, device, epochs, lr, weight_decay,
+  File "/home/mazya/OTA_RIS/MY_code/teachers.py", line 991, in train_teacher
+    loss_channel = teacher.get_channel_matching_loss(H_d_channel, H_1_channel, H_2_channel)
+  File "/home/mazya/OTA_RIS/MY_code/teachers.py", line 755, in get_channel_matching_loss
+    phi_optimal = self._optimize_phi_analytical(
+  File "/home/mazya/OTA_RIS/MY_code/teachers.py", line 711, in _optimize_phi_analytical
+    optimal_direction = torch.bmm(A_hermitian, y.unsqueeze(-1)).squeeze(-1) # (B, Nm)
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 3.66 GiB. GPU 0 has a total capacity of 10.90 GiB of which 1017.38 MiB is free. Including non-PyTorch memory, this process has 9.91 GiB memory in use. Of the allocated memory 9.71 GiB is allocated by PyTorch, and 32.91 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)

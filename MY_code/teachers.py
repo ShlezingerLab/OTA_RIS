@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import math
 from students import Encoder as StudentEncoder
 import random
+import wandb
 class RayleighChannelLayer(nn.Module):
     """
     Rayleigh fading channel layer for CNN feature maps.
@@ -933,7 +934,7 @@ class HeavyIntermediateTeacher(nn.Module):
         return self.encoder.get_channel_num() + [self.intermediate_dim] * self.intermediate_layers_count
 
 def train_teacher(teacher, train_loader, device, epochs, lr, weight_decay, lambda_l2=0.0,
-H_d_channel=None, H_1_channel=None, H_2_channel=None, lambda_class=0.0, save_path=None):
+H_d_channel=None, H_1_channel=None, H_2_channel=None, lambda_class=0.0, save_path=None, wandb_run=None):
     """
     Train teacher model with optional regularization.
 
@@ -950,6 +951,7 @@ H_d_channel=None, H_1_channel=None, H_2_channel=None, lambda_class=0.0, save_pat
         H_2_channel: RIS to RX channel matrix tensor (num_channels, Nm, Nr) complex for cyclic sampling
         lambda_channel: Weight for RIS channel matching loss ||(H₁ΦH₂ + H_d)s - y||²
         save_path: Path to save the trained model (optional)
+        wandb_run: wandb run object for logging (optional)
     """
     optimizer = optim.Adam(teacher.parameters(), lr=lr, weight_decay=weight_decay)
     criterion = nn.CrossEntropyLoss()
@@ -1012,6 +1014,15 @@ H_d_channel=None, H_1_channel=None, H_2_channel=None, lambda_class=0.0, save_pat
                 postfix['ch'] = f"{loss_channel.item():.4f}"
             pbar.set_postfix(postfix)
 
+            # Log batch metrics to wandb
+            if wandb_run is not None:
+                wandb_run.log({
+                    "batch/loss": loss.item(),
+                    "batch/ce_loss": loss_ce.item(),
+                    "batch/channel_loss": loss_channel.item() if use_channel_reg else 0.0,
+                    "batch/accuracy": 100 * correct / total
+                })
+
         epoch_loss = running_loss / len(train_loader)
         epoch_ce_loss = running_ce_loss / len(train_loader)
         epoch_l2_loss = running_l2_loss / len(train_loader)
@@ -1026,6 +1037,20 @@ H_d_channel=None, H_1_channel=None, H_2_channel=None, lambda_class=0.0, save_pat
         loss_str += ")"
         print(f"Epoch {epoch+1}/{epochs} | {loss_str} | Acc: {epoch_accuracy:.2f}%")
 
+        # Log epoch metrics to wandb
+        if wandb_run is not None:
+            epoch_metrics = {
+                "epoch": epoch + 1,
+                "epoch/loss": epoch_loss,
+                "epoch/ce_loss": epoch_ce_loss,
+                "epoch/accuracy": epoch_accuracy
+            }
+            if use_l2_reg:
+                epoch_metrics["epoch/l2_loss"] = epoch_l2_loss
+            if use_channel_reg:
+                epoch_metrics["epoch/channel_loss"] = epoch_channel_loss
+            wandb_run.log(epoch_metrics)
+
     print("\nTraining finished!")
 
     # Save the model if save_path is provided
@@ -1037,21 +1062,43 @@ H_d_channel=None, H_1_channel=None, H_2_channel=None, lambda_class=0.0, save_pat
         torch.save({'teacher': teacher.state_dict()}, save_path)
         print(f"Model saved to: {save_path}")
 
+        # Log model artifact to wandb
+        if wandb_run is not None:
+            wandb_run.save(save_path)
+            print(f"Model artifact logged to wandb")
+
 if __name__ == "__main__":
+    import argparse
     import numpy as np
     import os
     from torchvision import datasets, transforms
     from torch.utils.data import DataLoader, Subset
     from channels import generate_channel_tensors_by_type
+
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description='Train teacher model with different lambda_class values')
+    parser.add_argument('--lambda_class', type=float, default=1e-2, help='Lambda class value for channel matching loss')
+    parser.add_argument('--mode', type=str, default='debug', choices=['debug', 'full'], help='Training mode (debug or full)')
+    args = parser.parse_args()
+
     #################################################
-    N_t = 20
+    N_t = 20 #TODO N_t should be low
     N_r = 10
     N_m = 9 #TODO: why increasing N_m doesnt improve me
     num_classes = 10
-    subset_size = 60000
-    batchsize = 256
-    channel_sampling_size = 10000  # Number of different channels to cycle through
-    epochs = 200
+    mode = "full"#args.mode
+    if mode == "full":
+        subset_size = 60000
+        batchsize = 256
+        channel_sampling_size = 10000  # Number of different channels to cycle through
+        epochs = 200
+    elif mode == "debug":
+        subset_size = 10000
+        batchsize = 256
+        channel_sampling_size = 6000  # Number of different channels to cycle through
+        epochs = 100
+    else:
+        raise ValueError(f"Invalid mode: {mode}")
     power = 3.0
     #################################################
     #teacher = MNISTClassifier(num_classes=num_classes)
@@ -1090,15 +1137,46 @@ if __name__ == "__main__":
     train_subset = Subset(train_dataset, indices)
     train_loader = DataLoader(train_subset, batch_size=batchsize, shuffle=True)
     #################################################
-    # Training loop with RIS channel matching
-    lambda_classes = [0.1, 0.5, 1.0, 5.0, 10.0] #TODO
-    for lambda_class in lambda_classes:
-        teacher_suffix = f"testme_full_lambda_class={lambda_class}"  # "demo" or "full"
-        save_path = os.path.join(script_dir, "models_dict", f"teacher_{teacher_suffix}.pth")
-        print(f"Model will be saved to: {save_path}")
-        train_teacher(teacher, train_loader, device, epochs, lr, weight_decay,
-                    H_d_channel=H_d_all,
-                    H_1_channel=H_1_all,
-                    H_2_channel=H_2_all,
-                    lambda_class=lambda_class,
-                    save_path=save_path)
+    # Training with specified lambda_class value
+    lambda_class = args.lambda_class
+    teacher_suffix = f"testme_{mode}_lambda_class={lambda_class}_daily"  # "demo" or "full"
+    save_path = os.path.join(script_dir, "models_dict", f"teacher_{teacher_suffix}.pth")
+    print(f"Lambda class: {lambda_class}")
+    print(f"Model will be saved to: {save_path}")
+
+    # Initialize wandb
+    run = wandb.init(
+        entity="mazya-ben-gurion-university-of-the-negev",
+        project="ota-ris-teacher-training",
+        name=f"teacher_{teacher_suffix}",
+        config={
+            "N_t": N_t,
+            "N_r": N_r,
+            "N_m": N_m,
+            "num_classes": num_classes,
+            "mode": mode,
+            "subset_size": subset_size,
+            "batch_size": batchsize,
+            "channel_sampling_size": channel_sampling_size,
+            "epochs": epochs,
+            "power": power,
+            "lr": lr,
+            "weight_decay": weight_decay,
+            "lambda_class": lambda_class,
+            "device": device,
+            "model_type": "MyTeacher",
+            "teacher_suffix": teacher_suffix
+        }
+    )
+
+    train_teacher(teacher, train_loader, device, epochs, lr, weight_decay,
+                H_d_channel=H_d_all,
+                H_1_channel=H_1_all,
+                H_2_channel=H_2_all,
+                lambda_class=lambda_class,
+                save_path=save_path,
+                wandb_run=run)
+
+    # Finish the wandb run
+    run.finish()
+    print("Wandb run finished!")

@@ -1,0 +1,130 @@
+_wandb:
+    value:
+        cli_version: 0.24.1
+        e:
+            gnat7uuo19llncx5fs70mqgo2qbmgu5r:
+                args:
+                    - --lambda_class
+                    - "7.5e-2"
+                codePath: MY_code/teachers.py
+                codePathLocal: MY_code/teachers.py
+                cpu_count: 6
+                cpu_count_logical: 12
+                cudaVersion: "12.5"
+                disk:
+                    /:
+                        total: "361207922688"
+                        used: "16798580736"
+                email: mazya@post.bgu.ac.il
+                executable: /home/mazya/.conda/envs/py310/bin/python
+                git:
+                    commit: fea6a423349a86c7a83c9a8142e1b9931d7a4621
+                    remote: https://github.com/ShlezingerLab/OTA_RIS.git
+                gpu: NVIDIA GeForce GTX 1080 Ti
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Pascal
+                      cudaCores: 3584
+                      memoryTotal: "11811160064"
+                      name: NVIDIA GeForce GTX 1080 Ti
+                      uuid: GPU-fd2f4130-5fb6-12e5-575c-06fd2c616bd8
+                host: ise-pheno-06.auth.ad.bgu.ac.il
+                memory:
+                    total: "134416510976"
+                os: Linux-5.14.0-503.40.1.el9_5.x86_64-x86_64-with-glibc2.34
+                program: /home/mazya/OTA_RIS/MY_code/teachers.py
+                python: CPython 3.10.19
+                root: /home/mazya/OTA_RIS
+                slurm:
+                    array_job_id: "14148671"
+                    array_task_count: "1"
+                    array_task_id: "0"
+                    array_task_max: "0"
+                    array_task_min: "0"
+                    array_task_step: "1"
+                    cluster_name: cluster
+                    conf: /var/spool/slurmd/conf-cache/slurm.conf
+                    cpus_on_node: "6"
+                    gpus: "1"
+                    gpus_on_node: "1"
+                    gtids: "0"
+                    job_account: tirzar
+                    job_cpus_per_node: "6"
+                    job_end_time: "1770101178"
+                    job_gid: "1945600513"
+                    job_gpus: "1"
+                    job_id: "14148671"
+                    job_name: minn_train
+                    job_nodelist: ise-pheno-06
+                    job_num_nodes: "1"
+                    job_partition: gpu
+                    job_qos: normal
+                    job_start_time: "1770063378"
+                    job_uid: "343830305"
+                    job_user: mazya
+                    jobid: "14148671"
+                    localid: "0"
+                    mem_per_node: "32768"
+                    nnodes: "1"
+                    nodeid: "0"
+                    nodelist: ise-pheno-06
+                    oom_kill_step: "0"
+                    prio_process: "0"
+                    procid: "0"
+                    script_context: prolog_task
+                    submit_dir: /home/mazya
+                    submit_host: cs-pheno-05.auth.ad.bgu.ac.il
+                    task_pid: "3216266"
+                    tasks_per_node: "3"
+                    topology_addr: ise-pheno-06
+                    topology_addr_pattern: node
+                startedAt: "2026-02-02T20:16:26.532398Z"
+                writerId: gnat7uuo19llncx5fs70mqgo2qbmgu5r
+        m: []
+        python_version: 3.10.19
+        t:
+            "1":
+                - 1
+                - 41
+            "2":
+                - 1
+                - 41
+            "3":
+                - 13
+                - 16
+            "4": 3.10.19
+            "5": 0.24.1
+            "12": 0.24.1
+            "13": linux-x86_64
+N_m:
+    value: 16
+N_r:
+    value: 20
+N_t:
+    value: 4
+batch_size:
+    value: 256
+channel_sampling_size:
+    value: 6000
+device:
+    value: cuda
+epochs:
+    value: 100
+lambda_class:
+    value: 0.075
+lr:
+    value: 0.001
+mode:
+    value: debug
+model_type:
+    value: MyTeacher
+num_classes:
+    value: 10
+power:
+    value: 3
+subset_size:
+    value: 25000
+teacher_suffix:
+    value: testme_debug_lambda_class=0.075_nightly
+weight_decay:
+    value: 1e-07

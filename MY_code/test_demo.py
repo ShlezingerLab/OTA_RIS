@@ -10,7 +10,7 @@ from teachers import MyTeacher
 from channels import generate_channel_tensors_by_type
 import matplotlib.pyplot as plt
 
-def test_physical_channel(lambda_class):
+def test_physical_channel(teacher_suffix):
     # ---------------- Configuration ---------------- #
     N_t, N_r, N_m = 20, 10, 9
     num_classes = 10
@@ -22,7 +22,6 @@ def test_physical_channel(lambda_class):
     # ---------------- Load Model & Data ---------------- #
     teacher = MyTeacher(n_t=N_t, n_r=N_r, n_m=N_m, num_classes=num_classes, power=power).to(device)
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    teacher_suffix = f"testme_debug_lambda_class={lambda_class}"
     model_path = os.path.join(script_dir, "models_dict", f"teacher_{teacher_suffix}.pth")
     checkpoint = torch.load(model_path, map_location=device)
     teacher.load_state_dict(checkpoint['teacher'] if 'teacher' in checkpoint else checkpoint)
@@ -118,22 +117,25 @@ def test_physical_channel(lambda_class):
     #print(f"Physical Test Accuracy: {100 * correct / total:.2f}%")
 
 if __name__ == "__main__":
-    lambda_classes = [0.1, 0.5, 1.0, 5.0, 10.0]
+    # teacher_suffix = "testme_debug_lambda_class=0.85_parallel_wb"
+    # accuracy, accuracy_learned = test_physical_channel(teacher_suffix)
+    # print(f"Accuracy: {accuracy}")
+    # print(f"Accuracy Learned: {accuracy_learned}")
+    lambda_classes = [0.1,0.5]
     accuracies = []
     accuracies_learned = []
     for lambda_class in lambda_classes:
-        accuracy, accuracy_learned = test_physical_channel(lambda_class)
+        accuracy, accuracy_learned = test_physical_channel(f"testme_full_lambda_class={lambda_class}_parallel")
         accuracies.append(accuracy)
         accuracies_learned.append(accuracy_learned)
     plt.figure(figsize=(10, 6))
-    plt.plot(lambda_classes, accuracies, marker='o', linewidth=2, markersize=8, label='Physical Test Accuracy')
-    plt.plot(lambda_classes, accuracies_learned, marker='o', linewidth=2, markersize=8, label='Learned Test Accuracy')
+    plt.plot(lambda_classes, accuracies, marker='o', linewidth=2, markersize=8, label='Physical Test')
+    plt.plot(lambda_classes, accuracies_learned, marker='o', linewidth=2, markersize=8, label='Synthetic Test')
     plt.legend(fontsize=12)
     plt.xlabel('Lambda Class', fontsize=12)
     plt.ylabel('Accuracy', fontsize=12)
-    plt.title('Physical Test Accuracy vs Lambda Class', fontsize=14)
     plt.grid(True, alpha=0.3)
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    plot_path = os.path.join(script_dir, "accuracy_vs_lambda.png")
+    plot_path = os.path.join(script_dir, "accuracy_vs_lambda_note.png")
     plt.savefig(plot_path, dpi=150, bbox_inches='tight')
     print(f"\nPlot saved to: {plot_path}")
