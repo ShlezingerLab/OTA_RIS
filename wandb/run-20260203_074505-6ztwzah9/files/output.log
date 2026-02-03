@@ -1,0 +1,66 @@
+Epoch 1/30: 100%|██████████| 40/40 [00:12<00:00,  3.27it/s, loss=1.0166, acc=26.98%, ch=0.1460]
+Epoch 1/30 | Loss: 1.1456 (CE: 1.9587, Channel: 0.1663) | Acc: 26.98%
+Epoch 2/30: 100%|██████████| 40/40 [00:11<00:00,  3.45it/s, loss=0.5609, acc=67.66%, ch=0.1561]
+Epoch 2/30 | Loss: 0.6463 (CE: 0.9702, Channel: 0.1612) | Acc: 67.66%
+Epoch 3/30: 100%|██████████| 40/40 [00:11<00:00,  3.44it/s, loss=0.4388, acc=92.15%, ch=0.1566]
+Epoch 3/30 | Loss: 0.3323 (CE: 0.3299, Channel: 0.1674) | Acc: 92.15%
+Epoch 4/30: 100%|██████████| 40/40 [00:11<00:00,  3.42it/s, loss=0.2852, acc=94.58%, ch=0.1569]
+Epoch 4/30 | Loss: 0.2662 (CE: 0.2018, Channel: 0.1653) | Acc: 94.58%
+Epoch 5/30: 100%|██████████| 40/40 [00:11<00:00,  3.42it/s, loss=0.1659, acc=96.20%, ch=0.1513]
+Epoch 5/30 | Loss: 0.2328 (CE: 0.1465, Channel: 0.1595) | Acc: 96.20%
+Epoch 6/30: 100%|██████████| 40/40 [00:11<00:00,  3.42it/s, loss=0.3491, acc=97.28%, ch=0.1379]
+Epoch 6/30 | Loss: 0.2041 (CE: 0.1114, Channel: 0.1484) | Acc: 97.28%
+Epoch 7/30: 100%|██████████| 40/40 [00:11<00:00,  3.41it/s, loss=0.3682, acc=96.67%, ch=0.1341]
+Epoch 7/30 | Loss: 0.2156 (CE: 0.1273, Channel: 0.1519) | Acc: 96.67%
+Epoch 8/30: 100%|██████████| 40/40 [00:11<00:00,  3.41it/s, loss=0.2515, acc=96.11%, ch=0.1399]
+Epoch 8/30 | Loss: 0.2438 (CE: 0.1401, Channel: 0.1738) | Acc: 96.11%
+Epoch 9/30: 100%|██████████| 40/40 [00:11<00:00,  3.41it/s, loss=0.1663, acc=96.58%, ch=0.1480]
+Epoch 9/30 | Loss: 0.2249 (CE: 0.1281, Channel: 0.1608) | Acc: 96.58%
+Epoch 10/30: 100%|██████████| 40/40 [00:11<00:00,  3.41it/s, loss=0.1796, acc=98.34%, ch=0.1396]
+Epoch 10/30 | Loss: 0.1755 (CE: 0.0687, Channel: 0.1411) | Acc: 98.34%
+Epoch 11/30: 100%|██████████| 40/40 [00:11<00:00,  3.41it/s, loss=0.1410, acc=98.37%, ch=0.1324]
+Epoch 11/30 | Loss: 0.1708 (CE: 0.0598, Channel: 0.1409) | Acc: 98.37%
+Epoch 12/30: 100%|██████████| 40/40 [00:11<00:00,  3.41it/s, loss=0.1516, acc=99.03%, ch=0.1399]
+Epoch 12/30 | Loss: 0.1577 (CE: 0.0414, Channel: 0.1371) | Acc: 99.03%
+Epoch 13/30: 100%|██████████| 40/40 [00:11<00:00,  3.41it/s, loss=0.1522, acc=99.04%, ch=0.1480]
+Epoch 13/30 | Loss: 0.1568 (CE: 0.0377, Channel: 0.1380) | Acc: 99.04%
+Epoch 14/30: 100%|██████████| 40/40 [00:11<00:00,  3.40it/s, loss=0.1500, acc=99.34%, ch=0.1317]
+Epoch 14/30 | Loss: 0.1485 (CE: 0.0287, Channel: 0.1342) | Acc: 99.34%
+Epoch 15/30: 100%|██████████| 40/40 [00:11<00:00,  3.41it/s, loss=0.1424, acc=99.32%, ch=0.1335]
+Epoch 15/30 | Loss: 0.1491 (CE: 0.0305, Channel: 0.1338) | Acc: 99.32%
+Epoch 16/30: 100%|██████████| 40/40 [00:11<00:00,  3.41it/s, loss=0.1596, acc=99.14%, ch=0.1268]
+Epoch 16/30 | Loss: 0.1483 (CE: 0.0339, Channel: 0.1314) | Acc: 99.14%
+Epoch 17/30: 100%|██████████| 40/40 [00:11<00:00,  3.40it/s, loss=0.1343, acc=98.52%, ch=0.1300]
+Epoch 17/30 | Loss: 0.1679 (CE: 0.0632, Channel: 0.1363) | Acc: 98.52%
+Epoch 18/30: 100%|██████████| 40/40 [00:11<00:00,  3.40it/s, loss=0.1362, acc=99.07%, ch=0.1302]
+Epoch 18/30 | Loss: 0.1517 (CE: 0.0363, Channel: 0.1336) | Acc: 99.07%
+Epoch 19/30: 100%|██████████| 40/40 [00:11<00:00,  3.40it/s, loss=0.2317, acc=99.34%, ch=0.1315]
+Epoch 19/30 | Loss: 0.1470 (CE: 0.0313, Channel: 0.1313) | Acc: 99.34%
+Epoch 20/30: 100%|██████████| 40/40 [00:11<00:00,  3.40it/s, loss=0.1634, acc=98.92%, ch=0.1442]
+Epoch 20/30 | Loss: 0.1568 (CE: 0.0411, Channel: 0.1363) | Acc: 98.92%
+Epoch 21/30: 100%|██████████| 40/40 [00:11<00:00,  3.40it/s, loss=0.4119, acc=99.13%, ch=0.1352]
+Epoch 21/30 | Loss: 0.1550 (CE: 0.0461, Channel: 0.1320) | Acc: 99.13%
+Epoch 22/30: 100%|██████████| 40/40 [00:11<00:00,  3.40it/s, loss=0.1419, acc=99.34%, ch=0.1394]
+Epoch 22/30 | Loss: 0.1470 (CE: 0.0262, Channel: 0.1339) | Acc: 99.34%
+Epoch 23/30: 100%|██████████| 40/40 [00:11<00:00,  3.40it/s, loss=0.1294, acc=99.51%, ch=0.1238]
+Epoch 23/30 | Loss: 0.1370 (CE: 0.0165, Channel: 0.1288) | Acc: 99.51%
+Epoch 24/30: 100%|██████████| 40/40 [00:11<00:00,  3.40it/s, loss=0.1254, acc=99.61%, ch=0.1247]
+Epoch 24/30 | Loss: 0.1355 (CE: 0.0169, Channel: 0.1270) | Acc: 99.61%
+Epoch 25/30: 100%|██████████| 40/40 [00:11<00:00,  3.40it/s, loss=0.1631, acc=99.45%, ch=0.1384]
+Epoch 25/30 | Loss: 0.1388 (CE: 0.0208, Channel: 0.1284) | Acc: 99.45%
+Epoch 26/30: 100%|██████████| 40/40 [00:11<00:00,  3.40it/s, loss=0.1345, acc=99.00%, ch=0.1331]
+Epoch 26/30 | Loss: 0.1549 (CE: 0.0377, Channel: 0.1360) | Acc: 99.00%
+Epoch 27/30: 100%|██████████| 40/40 [00:11<00:00,  3.40it/s, loss=0.1440, acc=99.35%, ch=0.1429]
+Epoch 27/30 | Loss: 0.1413 (CE: 0.0219, Channel: 0.1304) | Acc: 99.35%
+Epoch 28/30: 100%|██████████| 40/40 [00:11<00:00,  3.40it/s, loss=0.1340, acc=99.24%, ch=0.1331]
+Epoch 28/30 | Loss: 0.1418 (CE: 0.0274, Channel: 0.1281) | Acc: 99.24%
+Epoch 29/30: 100%|██████████| 40/40 [00:11<00:00,  3.41it/s, loss=0.1728, acc=99.16%, ch=0.1251]
+Epoch 29/30 | Loss: 0.1464 (CE: 0.0335, Channel: 0.1297) | Acc: 99.16%
+Epoch 30/30: 100%|██████████| 40/40 [00:11<00:00,  3.41it/s, loss=0.1413, acc=99.02%, ch=0.1256]
+Epoch 30/30 | Loss: 0.1547 (CE: 0.0344, Channel: 0.1374) | Acc: 99.02%
+
+Training finished!
+Model saved to: /home/mazya/OTA_RIS/MY_code/models_dict/teacher_testme_debug_lambda_class=0.5_yaniv.pth
+wandb: WARNING Saving files without folders. If you want to preserve subdirectories pass base_path to wandb.save, i.e. wandb.save("/mnt/folder/file.h5", base_path="/mnt")
+wandb: WARNING Symlinked 1 file into the W&B run directory; call wandb.save again to sync new files.
+Model artifact logged to wandb

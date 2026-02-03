@@ -80,7 +80,7 @@ def test_physical_channel(teacher_suffix):
             H_2_batched = torch.stack([H_2_all[(sample_idx + i) % C] for i in range(B)], dim=0)
             sample_idx += B
             with torch.no_grad():
-                phi_opt = teacher._optimize_phi_analytical(
+                phi_opt = teacher._optimize_phi_analytical( #TODO
                     s, y_learned, H_1_batched, H_2_batched, H_d_batched
                 )
 
@@ -121,11 +121,12 @@ if __name__ == "__main__":
     # accuracy, accuracy_learned = test_physical_channel(teacher_suffix)
     # print(f"Accuracy: {accuracy}")
     # print(f"Accuracy Learned: {accuracy_learned}")
-    lambda_classes = [0.1,0.5]
+    lambda_classes = [5e-2, 1e-1, 5e-1, 7e-1, 8e-1, 9e-1]
+    mode, suffix ="debug", "yaniv"
     accuracies = []
     accuracies_learned = []
     for lambda_class in lambda_classes:
-        accuracy, accuracy_learned = test_physical_channel(f"testme_full_lambda_class={lambda_class}_parallel")
+        accuracy, accuracy_learned = test_physical_channel(f"testme_{mode}_lambda_class={lambda_class}_{suffix}")
         accuracies.append(accuracy)
         accuracies_learned.append(accuracy_learned)
     plt.figure(figsize=(10, 6))
@@ -136,6 +137,6 @@ if __name__ == "__main__":
     plt.ylabel('Accuracy', fontsize=12)
     plt.grid(True, alpha=0.3)
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    plot_path = os.path.join(script_dir, "accuracy_vs_lambda_note.png")
+    plot_path = os.path.join(script_dir, f"accuracy_vs_lambda_{mode}_{suffix}.png")
     plt.savefig(plot_path, dpi=150, bbox_inches='tight')
     print(f"\nPlot saved to: {plot_path}")

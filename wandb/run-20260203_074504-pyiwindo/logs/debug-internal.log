@@ -1,0 +1,12 @@
+{"time":"2026-02-03T07:45:04.729055077+02:00","level":"INFO","msg":"stream: starting","core version":"0.24.1"}
+{"time":"2026-02-03T07:45:05.144784534+02:00","level":"INFO","msg":"stream: created new stream","id":"pyiwindo"}
+{"time":"2026-02-03T07:45:05.144834324+02:00","level":"INFO","msg":"handler: started","stream_id":"pyiwindo"}
+{"time":"2026-02-03T07:45:05.146788319+02:00","level":"INFO","msg":"stream: started","id":"pyiwindo"}
+{"time":"2026-02-03T07:45:05.146840027+02:00","level":"INFO","msg":"writer: started","stream_id":"pyiwindo"}
+{"time":"2026-02-03T07:45:05.146842368+02:00","level":"INFO","msg":"sender: started","stream_id":"pyiwindo"}
+{"time":"2026-02-03T07:51:06.17275599+02:00","level":"INFO","msg":"fileTransfer: Close: file transfer manager closed"}
+{"time":"2026-02-03T07:51:06.402565229+02:00","level":"INFO","msg":"handler: operation stats","stats":{}}
+{"time":"2026-02-03T07:51:06.407639314+02:00","level":"INFO","msg":"stream: closing","id":"pyiwindo"}
+{"time":"2026-02-03T07:51:06.407661462+02:00","level":"INFO","msg":"handler: closed","stream_id":"pyiwindo"}
+{"time":"2026-02-03T07:51:06.413010234+02:00","level":"INFO","msg":"sender: closed","stream_id":"pyiwindo"}
+{"time":"2026-02-03T07:51:06.41305156+02:00","level":"INFO","msg":"stream: closed","id":"pyiwindo"}

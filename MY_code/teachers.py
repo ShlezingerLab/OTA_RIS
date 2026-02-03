@@ -561,10 +561,8 @@ class MyTeacher(nn.Module):
         # Linear layer (matrix multiplication)
         y_flat = self.linear(s_flat)  # (B, 2*Nr)
         y_flat = y_flat + torch.randn_like(y_flat) * 0.05
-        # Convert to complex first
         y = y_flat.reshape(y_flat.size(0), self.n_r, 2)  # (B, Nr, 2)
         y = torch.view_as_complex(y.contiguous())  # (B, Nr) complex
-
         # Add phase noise
         # div = torch.rand(y.size(0), device=y.device) * 6 + 2
         # std_rad = div * (math.pi / 180.0) #TODO- phase noise std
@@ -578,10 +576,8 @@ class MyTeacher(nn.Module):
         if return_intermediates:
             self._cached_s = s
             self._cached_y = y
-
         # Decoder: received signal -> logits
         logits = self.decoder(y)  # (B, num_classes)
-
         return logits
 
     def extract_features(self, x: torch.Tensor, preReLU: bool = True):
@@ -759,7 +755,7 @@ class MyTeacher(nn.Module):
         phi_H_1_s = H_1_s * phi_optimal
         ris_path = torch.bmm(H_2_expanded, phi_H_1_s.unsqueeze(-1)).squeeze(-1)
         direct_path = torch.bmm(H_d_expanded, s_expanded.unsqueeze(-1)).squeeze(-1)
-        y_target = direct_path#+ris_path #TODO - and should I add noise?
+        y_target = ris_path #direct_path+ TODO - and should I add noise? Note: some simulations worked as it was direct only!!
 
         #loss = torch.mean(torch.abs(y_expanded - y_target) ** 2, dim=1) # (B * N_ch,)
         with torch.no_grad():
@@ -1086,17 +1082,19 @@ if __name__ == "__main__":
     N_r = 10
     N_m = 9 #TODO: why increasing N_m doesnt improve me
     num_classes = 10
-    mode = "full"#args.mode
+    mode = "debug"#args.mode
     if mode == "full":
+        suffix = "daily"
         subset_size = 60000
         batchsize = 256
         channel_sampling_size = 10000  # Number of different channels to cycle through
         epochs = 200
     elif mode == "debug":
+        suffix = "yaniv"
         subset_size = 10000
         batchsize = 256
         channel_sampling_size = 6000  # Number of different channels to cycle through
-        epochs = 100
+        epochs = 30
     else:
         raise ValueError(f"Invalid mode: {mode}")
     power = 3.0
@@ -1139,7 +1137,7 @@ if __name__ == "__main__":
     #################################################
     # Training with specified lambda_class value
     lambda_class = args.lambda_class
-    teacher_suffix = f"testme_{mode}_lambda_class={lambda_class}_daily"  # "demo" or "full"
+    teacher_suffix = f"testme_{mode}_lambda_class={lambda_class}_{suffix}"  # "demo" or "full"
     save_path = os.path.join(script_dir, "models_dict", f"teacher_{teacher_suffix}.pth")
     print(f"Lambda class: {lambda_class}")
     print(f"Model will be saved to: {save_path}")
