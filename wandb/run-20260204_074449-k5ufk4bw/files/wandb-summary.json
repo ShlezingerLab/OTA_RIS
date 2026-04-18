@@ -1,0 +1,1 @@
+{"batch/ce_loss":0.01290000881999731,"epoch/channel_loss":0.13293176591396333,"batch/accuracy":99.63,"epoch/loss":0.14287603907287122,"_step":1229,"epoch":30,"batch/channel_loss":0.12726181745529175,"_timestamp":1.7701840105043094e+09,"epoch/accuracy":99.63,"_runtime":119,"batch/loss":0.13629181683063507,"epoch/ce_loss":0.01420610458299052,"_wandb":{"runtime":119}}

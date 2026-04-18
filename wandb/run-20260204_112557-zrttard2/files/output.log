@@ -1,0 +1,5 @@
+Epoch 1/1: 100%|██████████| 40/40 [00:03<00:00, 11.32it/s, loss=0.3497, acc=9.74%, ch=0.1225] 
+Epoch 1/1 | Loss: 0.3920 (CE: 2.3166, Channel: 0.1603) | Acc: 9.74%
+
+Training finished!
+Model saved to: /home/mazya/OTA_RIS/MY_code/simulations/20260204_1125/teacher_debug_lambda_class=0.1.pth

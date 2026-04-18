@@ -17,3 +17,8 @@ config: {'N_t': 20, 'N_r': 10, 'N_m': 9, 'num_classes': 10, 'mode': 'full', 'sub
 2026-02-03 07:23:47,373 INFO    MainThread:2597572 [wandb_run.py:_redirect():2446] Wrapping output streams.
 2026-02-03 07:23:47,373 INFO    MainThread:2597572 [wandb_run.py:_redirect():2469] Redirects installed.
 2026-02-03 07:23:47,378 INFO    MainThread:2597572 [wandb_init.py:init():1082] run started, returning control to user process
+2026-02-03 09:11:29,267 INFO    MainThread:2597572 [wandb_run.py:_finish():2295] finishing run mazya-ben-gurion-university-of-the-negev/ota-ris-teacher-training/891tqkah
+2026-02-03 09:11:29,267 INFO    MainThread:2597572 [wandb_run.py:_atexit_cleanup():2494] got exitcode: 0
+2026-02-03 09:11:29,267 INFO    MainThread:2597572 [wandb_run.py:_restore():2476] restore
+2026-02-03 09:11:29,267 INFO    MainThread:2597572 [wandb_run.py:_restore():2482] restore done
+2026-02-03 09:11:34,016 INFO    MainThread:2597572 [wandb_run.py:_footer_sync_info():3871] logging synced files

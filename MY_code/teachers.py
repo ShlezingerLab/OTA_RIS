@@ -1,10 +1,88 @@
+import sionna as sn
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import os
 from students import Encoder as StudentEncoder
 import random
 import wandb
+import yaml
+
+# from sionna.phy.channel.tr38901 import Antenna, AntennaArray, CDL
+
+# # Antenna array configuration for the transmitter and receiver
+# bs_array = AntennaArray(
+#     antenna=Antenna(pattern="38.901", polarization="dual"),
+#     num_rows=4,
+#     num_cols=4,
+# )
+# ut_array = AntennaArray(
+#     antenna=Antenna(pattern="omni", polarization="single"),
+#     num_rows=1,
+#     num_cols=1,
+# )
+
+# # CDL channel model
+# cdl = CDL(
+#     model="A",
+#     delay_spread=300e-9,
+#     carrier_frequency=3.5e9,
+#     ut_array=ut_array,
+#     bs_array=bs_array,
+#     direction="uplink",
+# )
+
+# # Generate channel impulse response
+# a, tau = cdl(batch_size=64, num_time_steps=100, sampling_frequency=1e6)
+
+
+class ChannelGenerator(nn.Module):
+    """
+    Input: transmit signal s + received pilot yp + noise z. [cite: 93, 220]
+    Condition m = concat(s, yp). [cite: 226, 229]
+    Follows Table I: 3 hidden layers of 128 neurons.
+    """
+    def __init__(self, n_t, n_r, latent_dim=16):
+        super().__init__()
+        self.latent_dim = latent_dim
+        # Input size: 2*Nt (s) + 2*Nr (yp) + latent_dim (z) [cite: 229, 292]
+        self.net = nn.Sequential(
+            nn.Linear(2 * n_t + 2 * n_r + latent_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, 2 * n_r)
+        )
+
+    def forward(self, s_flat, yp_flat, z):
+        m_z = torch.cat([s_flat, yp_flat, z], dim=1)
+        return self.net(m_z)
+
+class ChannelDiscriminator(nn.Module):
+    """
+    Distinguishes Real (s, yp, y_real) from Fake (s, yp, y_fake).
+    Follows Table I: 3 hidden layers of 32 neurons.
+    """
+    def __init__(self, n_t, n_r):
+        super().__init__()
+        # Input: 2*Nt (s) + 2*Nr (yp) + 2*Nr (y)
+        self.net = nn.Sequential(
+            nn.Linear(2 * n_t + 4 * n_r, 32),
+            nn.ReLU(),
+            nn.Linear(32, 32),
+            nn.ReLU(),
+            nn.Linear(32, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1) # Output logit for BCEWithLogitsLoss
+        )
+
+    def forward(self, s_flat, yp_flat, y_flat):
+        combined = torch.cat([s_flat, yp_flat, y_flat], dim=1)
+        return self.net(combined)
+
 class RayleighChannelLayer(nn.Module):
     """
     Rayleigh fading channel layer for CNN feature maps.
@@ -483,6 +561,8 @@ class HeavyRxDecoder(nn.Module):
 
     def forward(self, y: torch.Tensor) -> torch.Tensor:
         y_ri = torch.cat([y.real, y.imag], dim=1)
+        eps = 1e-8
+        y_ri = y_ri / (y_ri.std(dim=1, keepdim=True) + eps) #important!
         x1 = F.leaky_relu(self.ln1(self.fc1(y_ri)), 0.2)
         x2 = F.leaky_relu(self.ln2(self.fc2(x1)), 0.2)
         x3 = F.leaky_relu(self.ln3(self.fc3(x2)), 0.2)
@@ -495,6 +575,28 @@ class HeavyRxDecoder(nn.Module):
         x3 = F.leaky_relu(self.ln3(self.fc3(x2)), 0.2)
         logits = self.fc_out(x3)
         return [x2, x3], logits
+
+class phase_train(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int, hidden: int = 256):
+        super().__init__()
+        self.in_dim = int(in_dim)
+        self.out_dim = int(out_dim)
+        self.hidden = int(hidden)
+        self.mid_hidden = max(128, self.hidden // 2)
+        self.net = nn.Sequential(
+            nn.LayerNorm(self.in_dim),
+            nn.Linear(self.in_dim, self.hidden),
+            nn.GELU(),
+            nn.LayerNorm(self.hidden),
+            nn.Linear(self.hidden, self.hidden),
+            nn.GELU(),
+            nn.Linear(self.hidden, self.mid_hidden),
+            nn.GELU(),
+            nn.Linear(self.mid_hidden, self.out_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
 
 class MyTeacher(nn.Module):
     """
@@ -512,6 +614,8 @@ class MyTeacher(nn.Module):
         power: float = 1.0,
         base_channels: int = 64,
         decoder_hidden: int = 256,
+        target_snr_db: float = 0.0,
+        gan_checkpoint_path: str = None,
     ):
         super().__init__()
         self.n_t = int(n_t)
@@ -519,10 +623,16 @@ class MyTeacher(nn.Module):
         self.n_m = int(n_m)
         self.num_classes = int(num_classes)
         self.power = power
+        self.target_snr_db = float(target_snr_db)
 
         # Heavy encoder
         self.encoder = HeavyEncoder(n_t=self.n_t, power=power, base_channels=base_channels)
         self.linear = nn.Linear(2 * self.n_t, 2 * self.n_r, bias=False)
+        self.generator = ChannelGenerator(n_t=self.n_t, n_r=self.n_r)
+        self.discriminator = ChannelDiscriminator(n_t=self.n_t, n_r=self.n_r)
+        self.decoder = HeavyRxDecoder(n_r=self.n_r, num_classes=self.num_classes, hidden_dim=decoder_hidden)
+
+        self.register_buffer('current_target_p', torch.tensor(1.0))
 
         # Physical channel H_d (Direct TX to RX) instead of learnable linear layer
         # Generate one realization of the channel
@@ -532,20 +642,87 @@ class MyTeacher(nn.Module):
             N_t=self.n_t,
             N_r=self.n_r,
             N_m=self.n_m,
-            num_channels=1,
+            num_channels=10000,
             device="cpu"  # Will be moved to correct device when model is moved
         )
+        self.H_d_avg = torch.mean(H_d_all, dim=0)
+        self.H_d_all = H_d_all
+
         # H_d is (Nr, Nt) complex, register as buffer (non-trainable)
         self.register_buffer('H_d', H_d_all[0])
+        self.gan_checkpoint_path = gan_checkpoint_path
+        if gan_checkpoint_path is not None:
+            object.__setattr__(self, "_gan_generator", self._load_gan_generator(gan_checkpoint_path))
+        else:
+            object.__setattr__(self, "_gan_generator", ChannelGenerator(n_t=self.n_t, n_r=self.n_r))
 
-        # Heavy decoder
-        self.decoder = HeavyRxDecoder(n_r=self.n_r, num_classes=self.num_classes, hidden_dim=decoder_hidden)
 
         # Cache for intermediate values (used for regularization)
         self._cached_s = None
         self._cached_y = None
+        self._cached_y_channel = None
+        self.sim_loss_cfg = {
+            "carrier_freq_hz": 28e9,
+            "sim_num_layers": 3,
+            "sim_layer_dist_lambda": 5.0,
+            "sim_elem_width_lambda": 0.5,
+            "sim_elem_dist_lambda": 0.5,
+            "sim_orientation_plane": "yz",
+            "inner_steps": 50,
+            "inner_lr": 1e-3,
+        }
+        self.sim_net = _build_teacher_sim_net(
+            teacher=self,
+            device="cpu",
+            carrier_freq_hz=self.sim_loss_cfg["carrier_freq_hz"],
+            sim_num_layers=self.sim_loss_cfg["sim_num_layers"],
+            sim_layer_dist_lambda=self.sim_loss_cfg["sim_layer_dist_lambda"],
+            sim_elem_width_lambda=self.sim_loss_cfg["sim_elem_width_lambda"],
+            sim_elem_dist_lambda=self.sim_loss_cfg["sim_elem_dist_lambda"],
+            sim_orientation_plane=self.sim_loss_cfg["sim_orientation_plane"],
+        )
+
+    def _load_gan_generator(self, checkpoint_path: str) -> ChannelGenerator:
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"GAN checkpoint not found: {checkpoint_path}")
+
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        if isinstance(checkpoint, dict) and "generator" in checkpoint:
+            generator_state = checkpoint["generator"]
+            config = checkpoint.get("config", {})
+        else:
+            generator_state = checkpoint
+            config = {}
+
+        if not isinstance(generator_state, dict):
+            raise TypeError(f"Unsupported GAN checkpoint format: {type(generator_state)}")
+
+        if "n_t" in config and int(config["n_t"]) != self.n_t:
+            raise ValueError(f"GAN checkpoint n_t={config['n_t']} does not match teacher n_t={self.n_t}")
+        if "n_r" in config and int(config["n_r"]) != self.n_r:
+            raise ValueError(f"GAN checkpoint n_r={config['n_r']} does not match teacher n_r={self.n_r}")
+
+        first_weight = generator_state.get("net.0.weight")
+        if first_weight is None:
+            raise KeyError("GAN checkpoint is missing net.0.weight")
+        hidden_dim = int(first_weight.shape[0])
+        latent_dim = int(first_weight.shape[1]) - (2 * self.n_t + 2 * self.n_r)
+        if latent_dim <= 0:
+            raise ValueError(f"Invalid latent_dim inferred from GAN checkpoint: {latent_dim}")
+
+        generator = ChannelGenerator(
+            n_t=self.n_t,
+            n_r=self.n_r,
+            latent_dim=latent_dim,
+            hidden_dim=hidden_dim,
+        )
+        generator.load_state_dict(generator_state)
+        generator.eval()
+        generator.requires_grad_(False)
+        return generator
 
     def forward(self, x: torch.Tensor, return_intermediates: bool = False) -> torch.Tensor:
+        #Yaniv teacher forward
         """
         Args:
             x: (B, 1, H, W) input images
@@ -553,29 +730,63 @@ class MyTeacher(nn.Module):
         Returns:
             logits: (B, num_classes)
         """
+        B = x.size(0)
+        channel_indices = torch.randint(0, self.H_d_all.size(0), (B,))
+        H_d_batch = self.H_d_all[channel_indices].to(x.device)
         # Encoder: image -> complex signal
-        s = self.encoder(x)  # (B, Nt) complex
+        s = self.encoder(x)  # (B, 1, Nt) or (B, Nt) complex
+        if s.dim() == 3:
+            s = s.squeeze(1)
+
         #y = torch.matmul(s.squeeze(1), self.H_d.t())  # (B, Nt) @ (Nt, Nr) = (B, Nr)
+
         s_real = torch.view_as_real(s)  # (B, Nt, 2)
         s_flat = s_real.reshape(s.size(0), -1)  # (B, 2*Nt)
-        # Linear layer (matrix multiplication)
-        y_flat = self.linear(s_flat)  # (B, 2*Nr)
-        y_flat = y_flat + torch.randn_like(y_flat) * 0.05
-        y = y_flat.reshape(y_flat.size(0), self.n_r, 2)  # (B, Nr, 2)
-        y = torch.view_as_complex(y.contiguous())  # (B, Nr) complex
+        y_flat_nn = self.linear(s_flat)  # (B, 2*Nr)
+        y_complex = y_flat_nn.reshape(y_flat_nn.size(0), self.n_r, 2)  # (B, Nr, 2)
+        y_complex = torch.view_as_complex(y_complex.contiguous())  # (B, Nr) complex
+
+        #y_complex = torch.bmm(H_d_batch, s.unsqueeze(-1)).squeeze(-1)
+
+        # s_flat = torch.view_as_real(s).reshape(B, -1)
+        # x_p = torch.ones(B, self.n_t, 1, device=x.device, dtype=H_d_batch.dtype)
+        # yp = torch.bmm(H_d_batch, x_p).squeeze(-1)
+        # yp_flat = torch.view_as_real(yp).reshape(B, -1)
+        # z = torch.randn(s_flat.size(0), self.generator.latent_dim, device=s_flat.device)
+        # y_flat = self.generator(s_flat, yp_flat, z)
+        # y_complex = y_flat.reshape(B, self.n_r, 2)
+        # y_complex = torch.view_as_complex(y_complex.contiguous())
+
+        target_snr_db = self.target_snr_db
+        p_signal = torch.mean(torch.abs(y_complex) ** 2)
+        sigma_sqr = p_signal / (10 ** (target_snr_db / 10.0))
+        noise_std = torch.sqrt(sigma_sqr)
+        noise = (
+            torch.randn_like(y_complex.real) + 1j * torch.randn_like(y_complex.real)
+        ) * (noise_std / math.sqrt(2.0))
+        y_clean = y_complex
+        y = y_complex + noise
+        #print(f"SNR: {10 * torch.log10(p_signal / sigma_sqr)} dB")
+        #y_clean = y_flat_nn.reshape(y_flat_nn.size(0), self.n_r, 2)  # (B, Nr, 2)
+        #y_clean = torch.view_as_complex(y_clean.contiguous())  # (B, Nr) complex
+        #y = y_flat.reshape(y_flat.size(0), self.n_r, 2)  # (B, Nr, 2)
+        #y = torch.view_as_complex(y.contiguous())  # (B, Nr) complex
         # Add phase noise
         # div = torch.rand(y.size(0), device=y.device) * 6 + 2
         # std_rad = div * (math.pi / 180.0) #TODO- phase noise std
         # noise_phase = torch.randn_like(y.real) * std_rad.unsqueeze(1)
-        max_std = (5.0 * 1.0) * (math.pi / 180.0)
-        std_rad = torch.rand(y.size(0), device=y.device) * max_std
-        noise_phase = torch.randn_like(y.real) * std_rad.unsqueeze(1)
-        rotation = torch.exp(1j * noise_phase)  # (B, Nr) complex
-        y = y * rotation  # (B, Nr) complex
+        # max_std = (5.0 * 1.0) * (math.pi / 180.0)
+        # std_rad = torch.rand(y.size(0), device=y.device) * max_std
+        # noise_phase = torch.randn_like(y.real) * std_rad.unsqueeze(1)
+        # rotation = torch.exp(1j * noise_phase)  # (B, Nr) complex
+        # y = y #* rotation  # (B, Nr) complex
+        #y_power = torch.mean(torch.abs(y) ** 2, dim=-1, keepdim=True)
+        #y = y #/ torch.sqrt(y_power)  #TODO- its cancel path loss
         # Cache intermediates if needed
         if return_intermediates:
             self._cached_s = s
             self._cached_y = y
+            self._cached_y_channel = y_clean
         # Decoder: received signal -> logits
         logits = self.decoder(y)  # (B, num_classes)
         return logits
@@ -614,15 +825,6 @@ class MyTeacher(nn.Module):
         all_features = enc_feats + [y_flat] + dec_feats
 
         return all_features, logits
-
-    def get_l2_regularization(self) -> torch.Tensor:
-        """
-        Compute L2 regularization term (squared Frobenius norm) of the linear layer weights.
-
-        Returns:
-            l2_loss: scalar tensor
-        """
-        return torch.norm(self.linear.weight, p=2) ** 2
 
     # def _optimize_phi_analytical( #TODO- version with H_d. check both analytical procedure
     #     self,
@@ -691,7 +893,6 @@ class MyTeacher(nn.Module):
         # 1. Signal at the RIS elements: (B, Nm)
         # H1 is (B, Nt, Nm), s is (B, Nt) -> (B, 1, Nt) @ (B, Nt, Nm)
         a = torch.bmm(s.unsqueeze(1), H_1.transpose(-2, -1)).squeeze(1)
-
         # 2. Construct the effective mapping matrix 'A' for each RIS element
         # For each sample, the contribution of phi_i to the output is:
         # (column_i of H2) * a_i
@@ -709,66 +910,188 @@ class MyTeacher(nn.Module):
         phi_optimal = torch.exp(1j * torch.angle(optimal_direction)) #TODO very important, dont change the sign
         return phi_optimal
 
+    def _optimize_phi_gd(
+        self,
+        s: torch.Tensor,     # (B, Nt)
+        y: torch.Tensor,     # (B, Nr)
+        H_1: torch.Tensor,   # (B, Nt, Nm)
+        H_2: torch.Tensor,   # (B, Nr, Nm)
+        iters: int = 1000,
+        step_size: float = 0.1
+    ) -> torch.Tensor:
+        # Isolate inner phi-optimization from the outer training graph.
+        s = s.detach()
+        y = y.detach()
+        H_1 = H_1.detach()
+        H_2 = H_2.detach()
+        batch_size = s.size(0)
+        theta = torch.randn((batch_size, self.n_m), device=s.device, requires_grad=True)
+        optimizer = torch.optim.Adam([theta], lr=step_size)
+        H_1_s = torch.bmm(H_1, s.unsqueeze(-1)).squeeze(-1)
+
+        with torch.enable_grad():
+            for _ in range(iters):
+                phi = torch.exp(1j * theta)
+                phi_H_1_s = H_1_s * phi
+                y_ris = torch.bmm(H_2, phi_H_1_s.unsqueeze(-1)).squeeze(-1)
+                optimizer.zero_grad()
+                y_real = torch.view_as_real(y).reshape(y.size(0), -1)
+                y_ris_real = torch.view_as_real(y_ris).reshape(y_ris.size(0), -1)
+                cosine_sim = F.cosine_similarity(y_real, y_ris_real, dim=1)
+                loss = torch.mean(1.0 - cosine_sim)
+                loss.backward()
+                optimizer.step()
+
+        #print(f"loss: {loss.item()}")
+        return torch.exp(1j * theta).detach()
+
+    def _optimize_phi_manifold_gd(
+    self,
+    s: torch.Tensor,     # (B, Nt)
+    y: torch.Tensor,     # (B, Nr)
+    H_1: torch.Tensor,   # (B, Nt, Nm)
+    H_2: torch.Tensor,   # (B, Nr, Nm)
+    H_d: torch.Tensor,   # (B, Nr, Nt)
+    iters: int = 10,
+    step_size: float = 0.1
+) -> torch.Tensor:
+        # 1. Precompute the effective channel matrix A and residual b
+        y_direct = torch.bmm(H_d, s.unsqueeze(-1)).squeeze(-1)
+        b = (y - y_direct).unsqueeze(-1) # (B, Nr, 1)
+        a = torch.bmm(H_1, s.unsqueeze(-1)).squeeze(-1)
+        A = H_2 * a.unsqueeze(1) # (B, Nr, Nm)
+
+        # Precompute A^H * A and A^H * b to speed up the gradient calc
+        # This turns the loop into simple matrix-vector products
+        A_H = A.conj().transpose(-2, -1)
+        R = torch.bmm(A_H, A)     # (B, Nm, Nm)
+        q = torch.bmm(A_H, b)     # (B, Nm, 1)
+
+        # 2. Initialization (The "Analytical" Guess)
+        # This puts us in the [-pi, pi] valley that is most likely the global optimum
+        phi = torch.exp(1j * torch.angle(q.squeeze(-1)))
+
+        # 3. Iterative Manifold Update
+        # We don't need a formal optimizer; a simple power-iteration style update works
+        for _ in range(iters):
+            # The gradient of ||A phi - b||^2 w.r.t phi* is: R @ phi - q
+            grad = torch.bmm(R, phi.unsqueeze(-1)) - q
+
+            # Step (using a simple heuristic or fixed step size)
+            phi = phi - step_size * grad.squeeze(-1)
+
+            # Projection step: Snap back to unit modulus
+            # This is where we enforce the "theta" logic implicitly
+            phi = phi / torch.abs(phi)
+
+        return phi
+
+    def _compute_sim_target(
+        self,
+        s: torch.Tensor,
+        H_1: torch.Tensor,
+        H_2: torch.Tensor,
+    ) -> torch.Tensor:
+        H_1_s = torch.bmm(H_1, s.unsqueeze(-1)).squeeze(-1)
+        sim_out = self.sim_net(H_1_s)
+        return torch.bmm(H_2, sim_out.unsqueeze(-1)).squeeze(-1)
+
     def get_channel_matching_loss(
         self,
         H_d: torch.Tensor,   # (N_ch, Nr, Nt)
         H_1: torch.Tensor,   # (N_ch, Nt, Nm)
-        H_2: torch.Tensor    # (N_ch, Nm, Nr)
+        H_2: torch.Tensor,   # (N_ch, Nm, Nr)
+        num_channels_sample: int = None,
     ) -> torch.Tensor:
         """
-        Compute average loss over ALL provided channels for EVERY sample in the batch.
-        Total comparisons: Batch_Size * Num_Channels
+        Compute average loss over cyclically assigned channels for every sample.
+        Sample i is paired with channel i % N_ch. If
+        num_channels_sample > 1, each sample uses consecutive channels in the
+        same cyclic manner.
         """
 
         s = self._cached_s  # (B, Nt) or (B, 1, Nt)
-        y_learned = self._cached_y  # (B, Nr)
+        y_learned = self._cached_y_channel  # (B, Nr)
 
         if s.dim() == 3:
             s = s.squeeze(1)  # Ensure (B, Nt)
 
         batch_size = s.size(0)
-        num_channels = H_d.size(0)
+        num_channels_pool = H_d.size(0)
 
-        # --- EXPANSION STEP ---
-        # 1. Expand s and y: Repeat each sample N_ch times contiguously
-        # Result: s_0, s_0, ..., s_1, s_1, ...
-        s_expanded = s.repeat_interleave(num_channels, dim=0)  # (B * N_ch, Nt)
-        y_expanded = y_learned.repeat_interleave(num_channels, dim=0)  # (B * N_ch, Nr)
+        num_channels_sample = int(num_channels_sample)
 
-        # 2. Expand H: Repeat the whole channel set B times
-        # Result: H_0..H_N, H_0..H_N, ...
-        # (N_ch, ...) -> (B * N_ch, ...)
-        H_d_expanded = H_d.repeat(batch_size, 1, 1)
-        H_1_expanded = H_1.repeat(batch_size, 1, 1)
-        H_2_expanded = H_2.repeat(batch_size, 1, 1)
+        sample_offsets = torch.arange(batch_size, device=H_d.device).unsqueeze(1)
+        channel_offsets = torch.arange(num_channels_sample, device=H_d.device).unsqueeze(0)
+        channel_indices = (sample_offsets + channel_offsets) % num_channels_pool
+
+        flat_indices = channel_indices.reshape(-1)
+
+        H_d_expanded = H_d[flat_indices]
+        H_1_expanded = H_1[flat_indices]
+        H_2_expanded = H_2[flat_indices]
+        s_expanded = s.repeat_interleave(num_channels_sample, dim=0)
+        y_expanded = y_learned.repeat_interleave(num_channels_sample, dim=0)
+        y_real = torch.view_as_real(y_expanded).reshape(y_expanded.size(0), -1) # (B*N_ch, 2*Nr)
 
         # --- OPTIMIZATION & LOSS ---
-        # Now we have aligned tensors of size (B * N_ch), so we can treat them
+        # Now we have aligned tensors of size (B * num_channels_sample), so we can treat them
         # as one giant batch for the analytical calculation.
 
-        # 1. Optimize phi for all B * N_ch pairs
-        with torch.no_grad(): #TODO
-            phi_optimal = self._optimize_phi_analytical(
-                s_expanded, y_expanded, H_1_expanded, H_2_expanded, H_d_expanded)
-        # 2. Compute y_target (RIS output)
-        H_1_s = torch.bmm(H_1_expanded, s_expanded.unsqueeze(-1)).squeeze(-1)
-        phi_H_1_s = H_1_s * phi_optimal
-        ris_path = torch.bmm(H_2_expanded, phi_H_1_s.unsqueeze(-1)).squeeze(-1)
-        direct_path = torch.bmm(H_d_expanded, s_expanded.unsqueeze(-1)).squeeze(-1)
-        y_target = ris_path #direct_path+ TODO - and should I add noise? Note: some simulations worked as it was direct only!!
+        # # 1. Propagate through the trainable SIM module.
+        # y_target = self._compute_sim_target(s_expanded,H_1_expanded,H_2_expanded)
+        H1_s = torch.bmm(H_1_expanded, s_expanded.unsqueeze(2)).squeeze(2) # (B, Nm)
+        phi_opt = self._optimize_phi_gd(s_expanded,y_expanded,H_1_expanded,H_2_expanded,iters=10)
+        phi_H1_s = H1_s * phi_opt
+        y_target = torch.bmm(H_2_expanded, phi_H1_s.unsqueeze(-1)).squeeze(-1)
 
-        #loss = torch.mean(torch.abs(y_expanded - y_target) ** 2, dim=1) # (B * N_ch,)
-        with torch.no_grad():
-            scale = y_target.abs().mean() / (y_expanded.abs().mean() + 1e-8)
-        # 1. Compute vector norms (magnitude of the whole vector)
-        norm_learned = torch.linalg.vector_norm(y_expanded, dim=-1, keepdim=True) + 1e-8
-        norm_target = torch.linalg.vector_norm(y_target, dim=-1, keepdim=True) + 1e-8
-        y_l_norm = y_expanded / norm_learned
-        y_t_norm = y_target / norm_target
-        cosine_sim = torch.real(torch.sum(y_l_norm.conj() * y_t_norm, dim=-1))
-        loss_magnitude = torch.mean(torch.abs(y_expanded - y_target) ** 2)
+        y_ris_real = torch.view_as_real(y_target).reshape(y_target.size(0), -1)
+        cosine_sim = F.cosine_similarity(y_real, y_ris_real, dim=1)
+
         loss_phase = torch.mean(1.0 - cosine_sim)
-        return loss_phase+loss_magnitude #TODO - whould I add magnitude or MSE?
+
+        # # Already have normalized versions (lines 801-804)
+        # loss_magnitude = torch.mean(torch.abs(y_expanded - y_target) ** 2)
+        # y_l_norm = y_expanded / norm_learned
+        # y_t_norm = y_target / norm_target
+
+        # # Compute effective channel matrix: H_eff = H_2 * diag(phi) * H_1
+        # # H_1_expanded: (B*N_ch, Nm, Nt), H_2_expanded: (B*N_ch, Nr, Nm), phi_optimal: (B*N_ch, Nm)
+        # # We need to compute H_2 @ diag(phi) @ H_1 for each sample
+        # # diag(phi) * H_1 can be done as: phi.unsqueeze(-1) * H_1 -> (B*N_ch, Nm, Nt)
+        # phi_H1 = phi_optimal.unsqueeze(-1) * H_1_expanded  # (B*N_ch, Nm, Nt)
+        # H_eff = torch.bmm(H_2_expanded, phi_H1)  # (B*N_ch, Nr, Nt) complex
+
+        # # Convert complex H_eff to real representation to match linear.weight format
+        # # linear.weight is (2*Nr, 2*Nt) in the format: [real; imag] for each dimension
+        # # Convert H_eff from (Nr, Nt) complex to (2*Nr, 2*Nt) real
+        # H_eff_real = torch.zeros(H_eff.size(0), 2*self.n_r, 2*self.n_t, device=H_eff.device)
+        # # Top-left: real part of H_eff
+        # H_eff_real[:, :self.n_r, :self.n_t] = H_eff.real
+        # # Top-right: -imag part of H_eff
+        # H_eff_real[:, :self.n_r, self.n_t:] = -H_eff.imag
+        # # Bottom-left: imag part of H_eff
+        # H_eff_real[:, self.n_r:, :self.n_t] = H_eff.imag
+        # # Bottom-right: real part of H_eff
+        # H_eff_real[:, self.n_r:, self.n_t:] = H_eff.real
+
+        # # Get linear weights
+        # W = self.linear.weight  # (2*Nr, 2*Nt)
+
+        # # Amplitude matching: Force ||W||_F to match average ||H_eff||_F (path loss)
+        # W_frobenius_norm = torch.norm(W, p='fro')
+        # H_eff_frobenius_norms = torch.norm(H_eff_real, p='fro', dim=(1,2))  # (B*N_ch,)
+        # avg_H_eff_frobenius_norm = torch.mean(H_eff_frobenius_norms)
+        # loss_amplitude = (W_frobenius_norm - avg_H_eff_frobenius_norm) ** 2
+
+        # # Update target path loss for constraint (detached for use in projection)
+        # # Use .data to avoid in-place operation error during backprop
+        # self.current_target_p.data.copy_(avg_H_eff_frobenius_norm.detach())
+
+        # Combined loss: phase alignment + amplitude matching (reflecting path loss)
+        #print(f"W_norm: {W_frobenius_norm}, H_eff_norm: {avg_H_eff_frobenius_norm}")
+        return loss_phase#loss_phase + loss_amplitude
+
 
     def get_channel_matching_loss_ver1(
         self,
@@ -790,11 +1113,11 @@ class MyTeacher(nn.Module):
         Returns:
             loss: scalar tensor measuring deviation from RIS channel model
         """
-        if self._cached_s is None or self._cached_y is None:
+        if self._cached_s is None or self._cached_y_channel is None:
             raise RuntimeError("Must call forward() with return_intermediates=True before computing channel matching loss")
 
         s = self._cached_s  # (B, 1, Nt) or (B, Nt) complex
-        y_learned = self._cached_y  # (B, Nr) complex
+        y_learned = self._cached_y_channel  # (B, Nr) complex
 
         # Ensure s is 2D: (B, Nt)
         if s.dim() == 3:
@@ -929,8 +1252,31 @@ class HeavyIntermediateTeacher(nn.Module):
     def get_channel_num(self):
         return self.encoder.get_channel_num() + [self.intermediate_dim] * self.intermediate_layers_count
 
-def train_teacher(teacher, train_loader, device, epochs, lr, weight_decay, lambda_l2=0.0,
-H_d_channel=None, H_1_channel=None, H_2_channel=None, lambda_class=0.0, save_path=None, wandb_run=None):
+def opt_phi(teacher, train_loader, device, epochs, lr, weight_decay, lambda_l2=0.0,
+H_d_channel=None, H_1_channel=None, H_2_channel=None, lambda_class=0.0, num_channels_sample=None, save_path=None, wandb_run=None):
+    use_channel_reg = H_d_channel is not None and H_1_channel is not None and H_2_channel is not None and hasattr(teacher, 'get_channel_matching_loss')
+
+    if use_channel_reg:
+        H_d_channel = H_d_channel.to(device)#*gain_factor
+        H_1_channel = H_1_channel.to(device)#*gain_factor
+        H_2_channel = H_2_channel.to(device)#*gain_factor
+
+    for epoch in range(epochs):
+        teacher.train()
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
+
+        for images, labels in pbar:
+            images = images.to(device)
+            labels = labels.to(device)
+            loss_channel = teacher.get_channel_matching_loss(
+                H_d_channel,
+                H_1_channel,
+                H_2_channel,
+                num_channels_sample=num_channels_sample,
+            )
+
+def train_teacher(teacher, train_loader, device, epochs, lr, weight_decay, lambda_l2=0.0, use_channel_reg=False,
+H_d_channel=None, H_1_channel=None, H_2_channel=None, lambda_class=0.0 , save_path=None, wandb_run=None):
     """
     Train teacher model with optional regularization.
 
@@ -953,14 +1299,13 @@ H_d_channel=None, H_1_channel=None, H_2_channel=None, lambda_class=0.0, save_pat
     criterion = nn.CrossEntropyLoss()
 
     use_l2_reg = lambda_l2 > 0 and hasattr(teacher, 'get_l2_regularization')
-    use_channel_reg = lambda_class > 0 and H_d_channel is not None and H_1_channel is not None and H_2_channel is not None and hasattr(teacher, 'get_channel_matching_loss')
 
-    if use_channel_reg:
-        H_d_channel = H_d_channel.to(device)
-        H_1_channel = H_1_channel.to(device)
-        H_2_channel = H_2_channel.to(device)
-        num_channels = H_d_channel.size(0)
-        channel_cursor = 0
+    H_d_channel = H_d_channel.to(device)
+    H_1_channel = H_1_channel.to(device)
+    H_2_channel = H_2_channel.to(device)
+    num_channels = H_d_channel.size(0)
+    channel_cursor = 0
+
 
     for epoch in range(epochs):
         teacher.train()
@@ -975,39 +1320,35 @@ H_d_channel=None, H_1_channel=None, H_2_channel=None, lambda_class=0.0, save_pat
         for images, labels in pbar:
             images = images.to(device)
             labels = labels.to(device)
-
-            # Forward pass (with intermediates if channel reg is used)
-            if use_channel_reg:
-                logits = teacher(images, return_intermediates=True)
-            else:
-                logits = teacher(images)
+            logits = teacher(images, return_intermediates=True)
             loss_ce = criterion(logits, labels)
-            loss = loss_ce
             if use_channel_reg:
-                loss_channel = teacher.get_channel_matching_loss(H_d_channel, H_1_channel, H_2_channel)
-                loss = lambda_class*loss + loss_channel
+                loss_channel = teacher.get_channel_matching_loss(
+                    H_d_channel,
+                    H_1_channel,
+                    H_2_channel,
+                    num_channels_sample=num_channels,
+                )
+                loss = lambda_class*loss_ce + loss_channel
             else:
-                loss_channel = torch.tensor(0.0)
-
-            # Backward pass
+                loss = loss_ce
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-
-            # Statistics
             running_loss += loss.item()
             running_ce_loss += loss_ce.item()
-            running_channel_loss += loss_channel.item()
+            running_channel_loss += loss_channel.item() if use_channel_reg else 0.0
             _, predicted = torch.max(logits.data, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
+            if use_channel_reg:
+                channel_cursor = (channel_cursor + labels.size(0)) % num_channels
 
             postfix = {
                 'loss': f"{loss.item():.4f}",
                 'acc': f"{100 * correct / total:.2f}%"
             }
-            if use_channel_reg:
-                postfix['ch'] = f"{loss_channel.item():.4f}"
+            postfix['ch'] = f"{loss_channel.item():.4f}" if use_channel_reg else "0.0000"
             pbar.set_postfix(postfix)
 
             # Log batch metrics to wandb
@@ -1015,7 +1356,7 @@ H_d_channel=None, H_1_channel=None, H_2_channel=None, lambda_class=0.0, save_pat
                 wandb_run.log({
                     "batch/loss": loss.item(),
                     "batch/ce_loss": loss_ce.item(),
-                    "batch/channel_loss": loss_channel.item() if use_channel_reg else 0.0,
+                    "batch/channel_loss": loss_channel.item(),
                     "batch/accuracy": 100 * correct / total
                 })
 
@@ -1028,8 +1369,7 @@ H_d_channel=None, H_1_channel=None, H_2_channel=None, lambda_class=0.0, save_pat
         loss_str = f"Loss: {epoch_loss:.4f} (CE: {epoch_ce_loss:.4f}"
         if use_l2_reg:
             loss_str += f", L2: {epoch_l2_loss:.4f}"
-        if use_channel_reg:
-            loss_str += f", Channel: {epoch_channel_loss:.4f}"
+        loss_str += f", Channel: {epoch_channel_loss:.4f}" if use_channel_reg else ""
         loss_str += ")"
         print(f"Epoch {epoch+1}/{epochs} | {loss_str} | Acc: {epoch_accuracy:.2f}%")
 
@@ -1043,8 +1383,7 @@ H_d_channel=None, H_1_channel=None, H_2_channel=None, lambda_class=0.0, save_pat
             }
             if use_l2_reg:
                 epoch_metrics["epoch/l2_loss"] = epoch_l2_loss
-            if use_channel_reg:
-                epoch_metrics["epoch/channel_loss"] = epoch_channel_loss
+            epoch_metrics["epoch/channel_loss"] = epoch_channel_loss
             wandb_run.log(epoch_metrics)
 
     print("\nTraining finished!")
@@ -1058,116 +1397,547 @@ H_d_channel=None, H_1_channel=None, H_2_channel=None, lambda_class=0.0, save_pat
         torch.save({'teacher': teacher.state_dict()}, save_path)
         print(f"Model saved to: {save_path}")
 
-        # Log model artifact to wandb
-        if wandb_run is not None:
-            wandb_run.save(save_path)
-            print(f"Model artifact logged to wandb")
+
+def test_optimize_phi_gd(teacher, train_loader, H_1_all, H_2_all, device, iters: int = 2000):
+    import torch
+    import matplotlib.pyplot as plt
+    import os
+
+    images, _ = next(iter(train_loader))
+    # Use a small batch so we can test cyclic channel-realization indexing.
+    # This function performs an inner optimization loop, so keep B modest.
+    B = min(4, images.size(0))
+    images = images[:B].to(device)
+
+    teacher.eval()
+    with torch.no_grad():
+        _ = teacher(images, return_intermediates=True)
+        s_ref = teacher._cached_s
+        if s_ref.dim() == 3:
+            s_ref = s_ref.squeeze(1)
+        s = s_ref[:B].detach()  # Detach to remove from computation graph
+        s_real = torch.view_as_real(s).reshape(s.size(0), -1)         # (1, 2*Nt)
+        y_flat = teacher.linear(s_real)                               # (1, 2*Nr)
+        y = torch.view_as_complex(y_flat.reshape(y_flat.size(0), teacher.n_r, 2).contiguous()).detach()
+
+    # Cyclic initialization over channel realizations (instead of always `[:1]`).
+    num_channels_pool = H_1_all.size(0)
+    if num_channels_pool <= 0:
+        raise ValueError("H_1_all is empty")
+    idx = torch.arange(B, device=device) % num_channels_pool
+    H_1 = H_1_all[idx]
+    H_2 = H_2_all[idx]
+    H_1_s = torch.bmm(H_1, s.unsqueeze(-1)).squeeze(-1)  # (B, Nm)
+    theta = torch.randn((B, teacher.n_m), device=device, requires_grad=True)
+    #phi_hist = []
+    optimizer = torch.optim.Adam([theta], lr=0.01)
+
+    for t in range(iters):
+        # Rebuild phi from current theta each iteration to avoid reusing a freed autograd graph.
+        phi = torch.exp(1j * theta)
+        phi_H_1_s = H_1_s * phi
+        y_ris = torch.bmm(H_2, phi_H_1_s.unsqueeze(-1)).squeeze(-1)
+        optimizer.zero_grad()
+        y_real = torch.view_as_real(y).reshape(y.size(0), -1)
+        y_ris_real = torch.view_as_real(y_ris).reshape(y_ris.size(0), -1)
+        cosine_sim = F.cosine_similarity(y_real, y_ris_real, dim=1)
+        loss = torch.mean(1.0 - cosine_sim)
+        #loss = torch.norm(error)**2
+        loss.backward()
+        optimizer.step()
+        #phi_hist.append(phi[0, 0].detach().cpu())
+
+        if t % 10 == 0:
+            theta_first_deg = torch.rad2deg(theta[0, 2]).item()
+            # cosine_val = cosine_sim.item()
+            print(f"Iter {t}: Loss = {loss.item():.8f}, cos = {cosine_sim.mean().item():.8f}, theta[0,2] = {theta_first_deg:.2f}°")
+
+    # phi_optimal = torch.exp(1j * theta).detach()
+    # phi_hist = torch.stack(phi_hist)
+    # angles = torch.rad2deg(torch.angle(phi_hist)).numpy()
+    # save_dir = "/home/mazya/OTA_RIS/MY_code/plots/phi"
+    # os.makedirs(save_dir, exist_ok=True)
+    # plt.figure(figsize=(8, 4))
+    # plt.plot(angles, marker="o")
+    # plt.title("Convergence of phi[0,0] angle (degrees)")
+    # plt.xlabel("Iteration")
+    # plt.ylabel("Angle [deg]")
+    # plt.grid(True)
+    # plt.tight_layout()
+    # angle_path = os.path.join(save_dir, "phi_convergence.png")
+    # plt.savefig(angle_path, dpi=150)
+    # plt.close()
+
+    # print(f"_optimize_phi_manifold_gd test done. phi shape: {phi_optimal.shape}")
+    # print(f"Saved plots: {angle_path}")
+
+def _split_to_close_to_square_factors(n: int) -> tuple[int, int]:
+    n = int(n)
+    if n <= 0:
+        raise ValueError("n must be positive")
+
+    root = int(math.isqrt(n))
+    for rows in range(root, 0, -1):
+        if n % rows == 0:
+            return int(rows), int(n // rows)
+
+    return 1, n
+
+
+def _build_teacher_sim_net(
+    teacher,
+    device,
+    carrier_freq_hz: float,
+    sim_num_layers: int = 3,
+    sim_layer_dist_lambda: float = 5.0,
+    sim_elem_width_lambda: float = 0.5,
+    sim_elem_dist_lambda: float | None = None,
+    sim_orientation_plane: str = "yz",
+    sim_first_layer_central_coords: tuple[float, float, float] = (0.0, 0.0, 0.0),
+):
+    from CODE_EXAMPLE.simnet import SimNet, RisLayer
+
+    c_light = 299_792_458.0
+    wavelength = c_light / float(carrier_freq_hz)
+    elem_dist_lambda = (
+        float(sim_elem_width_lambda)
+        if sim_elem_dist_lambda is None
+        else float(sim_elem_dist_lambda)
+    )
+    n_rows, n_cols = _split_to_close_to_square_factors(teacher.n_m)
+    layers = [RisLayer(n_rows, n_cols) for _ in range(int(sim_num_layers))]
+
+    return SimNet(
+        layers=layers,
+        layer_dist=float(sim_layer_dist_lambda) * wavelength,
+        wavelength=wavelength,
+        elem_area=(float(sim_elem_width_lambda) * wavelength) ** 2,
+        elem_dist=elem_dist_lambda * wavelength,
+        layers_orientation_plane=sim_orientation_plane,
+        first_layer_central_coords=sim_first_layer_central_coords,
+        complex_dtype=torch.complex64,
+    ).to(device)
+
+
+def _first_sim_theta_deg(sim_net) -> float:
+    first_theta = sim_net.ris_layers[0].theta.detach().reshape(-1)[0]
+    return torch.rad2deg(first_theta).item()
+
+
+def _optimize_phi_train(
+    teacher,
+    train_loader,
+    save_theta_net_path,
+    H_1_all,
+    H_2_all,
+    device,
+    epochs: int = 10,
+    lr: float = 1e-3,
+    noise_std: float = 0.0,
+    carrier_freq_hz: float = 28e9,
+    sim_num_layers: int = 3,
+    sim_layer_dist_lambda: float = 5.0,
+    sim_elem_width_lambda: float = 0.5,
+    sim_elem_dist_lambda: float | None = None,
+    sim_orientation_plane: str = "yz",
+):
+
+    teacher.eval()
+    H_1_all = H_1_all.detach().to(device)
+    H_2_all = H_2_all.detach().to(device)
+    if H_1_all.dim() == 2:
+        H_1_all = H_1_all.unsqueeze(0)
+    if H_2_all.dim() == 2:
+        H_2_all = H_2_all.unsqueeze(0)
+    if H_1_all.dim() != 3 or H_2_all.dim() != 3:
+        raise ValueError("H_1_all and H_2_all must be channel pools with shape (J, ..., ...)")
+    if H_1_all.size(0) != H_2_all.size(0):
+        raise ValueError("H_1_all and H_2_all must have the same number of channels")
+    if H_1_all.size(1) != teacher.n_m:
+        raise ValueError(f"H_1_all second dimension must equal teacher.n_m={teacher.n_m}")
+    if H_2_all.size(2) != teacher.n_m:
+        raise ValueError(f"H_2_all third dimension must equal teacher.n_m={teacher.n_m}")
+
+    sim_net = _build_teacher_sim_net(
+        teacher=teacher,
+        device=device,
+        carrier_freq_hz=carrier_freq_hz,
+        sim_num_layers=sim_num_layers,
+        sim_layer_dist_lambda=sim_layer_dist_lambda,
+        sim_elem_width_lambda=sim_elem_width_lambda,
+        sim_elem_dist_lambda=sim_elem_dist_lambda,
+        sim_orientation_plane=sim_orientation_plane,
+    )
+    optimizer = torch.optim.Adam(sim_net.parameters(), lr=lr)
+    num_channels = H_1_all.size(0)
+
+
+    for epoch in range(epochs):
+        running_loss = 0.0
+        running_cosine = 0.0
+
+        for images, _ in train_loader:
+            images = images.to(device)
+
+            with torch.no_grad():
+                s_batch = teacher.encoder(images).detach()
+                if s_batch.dim() == 3:
+                    s_batch = s_batch.squeeze(1)
+                y_learned_flat = teacher.linear(torch.view_as_real(s_batch).reshape(s_batch.size(0), -1))
+                y_learned = torch.view_as_complex(
+                    y_learned_flat.reshape(s_batch.size(0), teacher.n_r, 2).contiguous()
+                )
+
+            y_real = torch.view_as_real(y_learned).reshape(y_learned.size(0), -1)
+            batch_size = s_batch.size(0)
+            channel_indices = torch.randint(0, num_channels, (batch_size,), device=device)
+            H_1_batch = H_1_all[channel_indices]
+            H_2_batch = H_2_all[channel_indices]
+
+            H1_s = torch.bmm(H_1_batch, s_batch.unsqueeze(-1)).squeeze(-1)
+            sim_out = sim_net(H1_s)
+            y_ris_all = torch.bmm(H_2_batch, sim_out.unsqueeze(-1)).squeeze(-1)
+            if noise_std > 0.0:
+                y_ris_all = y_ris_all + noise_std * torch.randn_like(y_ris_all)
+
+            y_ris_real_all = torch.view_as_real(y_ris_all).reshape(y_ris_all.size(0), -1)
+            avg_cosine = F.cosine_similarity(y_real, y_ris_real_all, dim=1).mean()
+            loss = 1.0 - avg_cosine
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item()
+            running_cosine += avg_cosine.item()
+
+        epoch_loss = running_loss / len(train_loader)
+        epoch_cosine = running_cosine / len(train_loader)
+        theta_first_deg = _first_sim_theta_deg(sim_net)
+        print(
+            f"Epoch {epoch+1}/{epochs}: loss(1-cos) = {epoch_loss:.8f}, avg_cosine = {epoch_cosine:.6f}, "
+            f"sim_layers = {sim_num_layers}, first_theta = {theta_first_deg:.2f}°"
+        )
+
+    if save_theta_net_path:
+        os.makedirs(os.path.dirname(save_theta_net_path), exist_ok=True)
+        torch.save(
+            {
+                "sim_state_dict": sim_net.state_dict(),
+                "sim_num_layers": int(sim_num_layers),
+                "sim_layer_dist_lambda": float(sim_layer_dist_lambda),
+                "sim_elem_width_lambda": float(sim_elem_width_lambda),
+                "sim_elem_dist_lambda": (
+                    None if sim_elem_dist_lambda is None else float(sim_elem_dist_lambda)
+                ),
+                "sim_orientation_plane": sim_orientation_plane,
+                "carrier_freq_hz": float(carrier_freq_hz),
+            },
+            save_theta_net_path,
+        )
+        print(f"SIM state saved to: {save_theta_net_path}")
+
+def train_gan_phase(
+    teacher: MyTeacher,
+    generator: ChannelGenerator,
+    discriminator: ChannelDiscriminator,
+    train_loader,
+    H_d_all: torch.Tensor,
+    device,
+    epochs: int = 100,
+    lr: float = 1e-3,
+    target_snr_db: float = 0.0,
+    lambda_adv: float = 0.01,
+    save_path: str | None = None,
+):
+    """
+    Phase 2: Train the generator with MSE + adversarial (BCE) loss.
+
+    Generator loss = MSE(G(s), H_d@s+n) + lambda_adv * BCE(D(s,G(s)), 1)
+    Discriminator loss = [BCE(D(s,y_real), 1) + BCE(D(s,y_fake), 0)] / 2
+
+    Args:
+        teacher: Trained MyTeacher whose encoder is frozen.
+        generator: ChannelGenerator to train.
+        discriminator: ChannelDiscriminator (standard, with Sigmoid).
+        train_loader: DataLoader yielding (images, labels).
+        H_d_all: Pool of physical channel matrices (J, Nr, Nt) complex.
+        device: torch device.
+        epochs: Training epochs.
+        lr: Learning rate.
+        target_snr_db: Target SNR for AWGN on real channel output.
+        lambda_adv: Weight of the adversarial term in the generator loss.
+        save_path: Optional path to save state dicts.
+    """
+    for p in teacher.encoder.parameters():
+        p.requires_grad = False
+    teacher.encoder.eval()
+
+    optimizer_G = torch.optim.Adam(generator.parameters(), lr=lr, betas=(0.5, 0.999))
+    optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=lr, betas=(0.5, 0.999))
+    bce = nn.BCELoss()
+
+    num_channels_pool = H_d_all.size(0)
+
+    for epoch in range(epochs):
+        running_mse = 0.0
+        running_adv = 0.0
+        running_loss_D = 0.0
+        running_loss_G = 0.0
+        running_cosine = 0.0
+        num_batches = 0
+
+        for images, _ in train_loader:
+            batch_size = images.size(0)
+            images = images.to(device)
+            ones = torch.ones(batch_size, 1, device=device)
+            zeros = torch.zeros(batch_size, 1, device=device)
+
+            # --- Prepare real data (frozen encoder + physical channel) ---
+            with torch.no_grad():
+                s = teacher.encoder(images)                             # (B, 1, Nt) complex
+                s_flat = torch.view_as_real(s).reshape(batch_size, -1)  # (B, 2*Nt)
+
+                idx = torch.randint(0, num_channels_pool, (batch_size,), device=device)
+                H_d_batch = H_d_all[idx]                                # (B, Nr, Nt)
+
+                y_real_complex = torch.bmm(
+                    H_d_batch, s.squeeze(1).unsqueeze(-1)
+                ).squeeze(-1)                                           # (B, Nr)
+
+                y_target = torch.view_as_real(y_real_complex).reshape(batch_size, -1)
+                p_signal = torch.mean(y_target ** 2)
+                sigma_sqr = p_signal / (10 ** (target_snr_db / 10.0))
+                noise_std = torch.sqrt(sigma_sqr)
+                y_target = y_target #+ torch.randn_like(y_target) * noise_std
+
+            # --- Train Discriminator ---
+            optimizer_D.zero_grad()
+            y_fake_d = generator(s_flat).detach()
+
+            loss_D = (bce(discriminator(s_flat, y_target), ones)
+                      + bce(discriminator(s_flat, y_fake_d), zeros)) / 2
+            loss_D.backward()
+            optimizer_D.step()
+
+            # --- Train Generator (MSE + adversarial) ---
+            optimizer_G.zero_grad()
+            y_fake = generator(s_flat)
+
+            loss_mse = F.mse_loss(y_fake, y_target)
+            loss_adv = bce(discriminator(s_flat, y_fake), ones)
+            loss_G = loss_adv#loss_mse + lambda_adv * loss_adv
+
+            loss_G.backward()
+            optimizer_G.step()
+
+            running_mse += loss_mse.item()
+            running_loss_G += loss_adv.item()
+            running_loss_D += loss_D.item()
+            with torch.no_grad():
+                cos = F.cosine_similarity(y_fake, y_target, dim=1).mean().item()
+            running_cosine += abs(cos)
+            num_batches += 1
+
+        n = max(num_batches, 1)
+        print(f"[GAN] Epoch {epoch+1}/{epochs} | "
+            #   f"MSE: {running_mse/n:.6f} | "
+              f"D: {running_loss_D/n:.4f} | "
+              f"G: {running_loss_G/n:.4f} | "
+              f"cos: {running_cosine/n:.4f}")
+
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        torch.save({
+            "generator": generator.state_dict(),
+            "discriminator": discriminator.state_dict(),
+        }, save_path)
+        print(f"GAN checkpoint saved to: {save_path}")
+
+
+def forward_with_gan_channel(
+    teacher: MyTeacher,
+    generator: ChannelGenerator,
+    images: torch.Tensor,
+    phase_noise_max_std_deg: float = 5.0,
+) -> torch.Tensor:
+    """
+    Phase 3 inference: replace teacher.linear with the trained GAN generator.
+
+    The generator produces y_flat, then the same phase-noise and
+    power-normalization pipeline from MyTeacher.forward is applied before
+    feeding into the decoder.
+
+    Args:
+        teacher: Trained MyTeacher (encoder + decoder used, linear skipped).
+        generator: Trained ChannelGenerator.
+        images: Input images (B, 1, H, W).
+        phase_noise_max_std_deg: Max phase-noise std in degrees.
+
+    Returns:
+        logits: (B, num_classes)
+    """
+    device = images.device
+    s = teacher.encoder(images)                              # (B, 1, Nt) complex
+    s_flat = torch.view_as_real(s).reshape(s.size(0), -1)    # (B, 2*Nt)
+
+    y_flat = generator(s_flat)                               # (B, 2*Nr)
+
+    # Reshape to complex
+    y = y_flat.reshape(y_flat.size(0), teacher.n_r, 2)
+    y = torch.view_as_complex(y.contiguous())                # (B, Nr) complex
+
+    # Phase noise (same as MyTeacher.forward)
+    max_std_rad = phase_noise_max_std_deg * (math.pi / 180.0)
+    std_rad = torch.rand(y.size(0), device=device) * max_std_rad
+    noise_phase = torch.randn_like(y.real) * std_rad.unsqueeze(1)
+    rotation = torch.exp(1j * noise_phase)
+    y = y * rotation
+
+    # Power normalization
+    y_power = torch.mean(torch.abs(y) ** 2, dim=-1, keepdim=True)
+    y = y / torch.sqrt(y_power)
+
+    logits = teacher.decoder(y)
+    return logits
+
 
 if __name__ == "__main__":
+    import torch.optim as optim
+    from tqdm import tqdm
     import argparse
     import numpy as np
     import os
+    from datetime import datetime
     from torchvision import datasets, transforms
     from torch.utils.data import DataLoader, Subset
     from channels import generate_channel_tensors_by_type
-
-    # Parse command-line arguments
+    #################################################
     parser = argparse.ArgumentParser(description='Train teacher model with different lambda_class values')
     parser.add_argument('--lambda_class', type=float, default=1e-2, help='Lambda class value for channel matching loss')
     parser.add_argument('--mode', type=str, default='debug', choices=['debug', 'full'], help='Training mode (debug or full)')
+    parser.add_argument('--num_channels_sample', type=int, default=None, help='Number of channels to sample per batch sample (None = use all)')
+    parser.add_argument('--target_snr_db', type=float, default=0.0, help='Target SNR in dB for training')
+    parser.add_argument(
+        '--freeze_linear_from_ckpt',
+        type=str,
+        default="/home/mazya/OTA_RIS/MY_code/simulations/20260411_1100/w_frobenius.pth",
+        help='Path to W-frobenius checkpoint used to initialize and freeze teacher.linear',
+    )
     args = parser.parse_args()
-
     #################################################
-    N_t = 20 #TODO N_t should be low
-    N_r = 10
-    N_m = 9 #TODO: why increasing N_m doesnt improve me
-    num_classes = 10
+    param_name = "target_snr_db"  #modify it for simulations
+    param_value = getattr(args, param_name)
     mode = "debug"#args.mode
+    lambda_class = 0.25#args.lambda_class
+    target_snr_db = param_value
+    wandb = False
+    save = True
+    use_channel_reg = False
+    freeze_linear_from_ckpt = None
+    #################################################
+    N_t, N_r, N_m = 20, 10, 16 #TODO N_t should be low, TODO: why increasing N_m doesnt improve me
+    wireless_dict = dict(power=1.0, lambda_class=lambda_class, use_channel_reg=use_channel_reg, freq_hz=28e9, k_factor_d_db=3.0, k_factor_h1_db=13.0,
+    k_factor_h2_db=7.0,pathloss_exp=2.0, geo_pathloss_gain_db=0.0, target_snr_db=target_snr_db)
+
     if mode == "full":
-        suffix = "daily"
-        subset_size = 60000
-        batchsize = 256
-        channel_sampling_size = 10000  # Number of different channels to cycle through
-        epochs = 200
+        data_dict = dict(subset_size=60000, batchsize=256, channel_sampling_size=10000, epochs=200)  #args.num_channels_sample  #None = use all channels
     elif mode == "debug":
-        suffix = "yaniv"
-        subset_size = 10000
-        batchsize = 256
-        channel_sampling_size = 6000  # Number of different channels to cycle through
-        epochs = 30
-    else:
-        raise ValueError(f"Invalid mode: {mode}")
-    power = 3.0
+        data_dict = dict(subset_size=1000, batchsize=100, channel_sampling_size=10000, epochs=20)
     #################################################
-    #teacher = MNISTClassifier(num_classes=num_classes)
-    teacher = MyTeacher(n_t=N_t, n_r=N_r, n_m=N_m, num_classes=num_classes, power=power)
-    #teacher = E2EProxyTeacher(nt=N_t, nr=N_r)
-    #################################################
-    import torch.optim as optim
-    from tqdm import tqdm
+    teacher = MyTeacher(n_t=N_t, n_r=N_r, n_m=N_m, power=wireless_dict["power"],
+                        target_snr_db=wireless_dict["target_snr_db"])
     lr = 1e-3
     weight_decay = 1e-7
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     teacher = teacher.to(device)
-    #################################################
-    # Set save path
+    if freeze_linear_from_ckpt:
+        linear_ckpt = torch.load(args.freeze_linear_from_ckpt, map_location=device)
+        if isinstance(linear_ckpt, dict) and "teacher_linear_weight" in linear_ckpt:
+            linear_weight = linear_ckpt["teacher_linear_weight"]
+        elif isinstance(linear_ckpt, dict) and "teacher" in linear_ckpt and "linear.weight" in linear_ckpt["teacher"]:
+            linear_weight = linear_ckpt["teacher"]["linear.weight"]
+        elif isinstance(linear_ckpt, dict) and "linear.weight" in linear_ckpt:
+            linear_weight = linear_ckpt["linear.weight"]
+        else:
+            raise KeyError(
+                f"Could not find linear weights in checkpoint: {args.freeze_linear_from_ckpt}"
+            )
+        if linear_weight.shape != teacher.linear.weight.shape:
+            raise ValueError(
+                f"linear weight shape mismatch: ckpt={tuple(linear_weight.shape)} "
+                f"teacher={tuple(teacher.linear.weight.shape)}"
+            )
+        with torch.no_grad():
+            teacher.linear.weight.copy_(linear_weight.to(device=device, dtype=teacher.linear.weight.dtype))
+        teacher.linear.weight.requires_grad_(False)
+        print(f"Loaded and froze teacher.linear from: {args.freeze_linear_from_ckpt}")
     script_dir = os.path.dirname(os.path.abspath(__file__))
     #################################################
     H_d_all, H_1_all, H_2_all = generate_channel_tensors_by_type(
-        channel_type="geometric_ricean",
+        channel_type="synthetic_rayleigh",
         N_t=N_t,
         N_r=N_r,
         N_m=N_m,
-        num_channels=channel_sampling_size,  # Multiple channels for cyclic sampling
+        num_channels=data_dict["channel_sampling_size"],  # Multiple channels for cyclic sampling
         device=device,
-        k_factor_d_db=3.0,
-        k_factor_h1_db=13.0,
-        k_factor_h2_db=7.0,
-        pathloss_exp=2.0,
-        geo_pathloss_gain_db=0.0,
+        freq_hz=wireless_dict["freq_hz"],
+        k_factor_d_db=wireless_dict["k_factor_d_db"],
+        k_factor_h1_db=wireless_dict["k_factor_h1_db"],
+        k_factor_h2_db=wireless_dict["k_factor_h2_db"],
+        pathloss_exp=wireless_dict["pathloss_exp"],
+        geo_pathloss_gain_db=wireless_dict["geo_pathloss_gain_db"], #TODO-during it test we need it to be 60! resolve this
     )
     #################################################
-    #torch.save(H_d_all, 'H_d_all.pt')
     transform = transforms.Compose([transforms.ToTensor()])
     train_dataset = datasets.MNIST(root="./data", train=True, transform=transform, download=True)
-    indices = np.random.choice(len(train_dataset), subset_size, replace=False)
+    indices = np.random.choice(len(train_dataset), data_dict["subset_size"], replace=False)
     train_subset = Subset(train_dataset, indices)
-    train_loader = DataLoader(train_subset, batch_size=batchsize, shuffle=True)
+    train_loader = DataLoader(train_subset, batch_size=data_dict["batchsize"], shuffle=True)
     #################################################
-    # Training with specified lambda_class value
-    lambda_class = args.lambda_class
-    teacher_suffix = f"testme_{mode}_lambda_class={lambda_class}_{suffix}"  # "demo" or "full"
-    save_path = os.path.join(script_dir, "models_dict", f"teacher_{teacher_suffix}.pth")
-    print(f"Lambda class: {lambda_class}")
-    print(f"Model will be saved to: {save_path}")
-
-    # Initialize wandb
-    run = wandb.init(
-        entity="mazya-ben-gurion-university-of-the-negev",
-        project="ota-ris-teacher-training",
-        name=f"teacher_{teacher_suffix}",
-        config={
-            "N_t": N_t,
-            "N_r": N_r,
-            "N_m": N_m,
-            "num_classes": num_classes,
-            "mode": mode,
-            "subset_size": subset_size,
-            "batch_size": batchsize,
-            "channel_sampling_size": channel_sampling_size,
-            "epochs": epochs,
-            "power": power,
-            "lr": lr,
-            "weight_decay": weight_decay,
-            "lambda_class": lambda_class,
-            "device": device,
-            "model_type": "MyTeacher",
-            "teacher_suffix": teacher_suffix
-        }
-    )
-
-    train_teacher(teacher, train_loader, device, epochs, lr, weight_decay,
+    if save:
+        if param_name in wireless_dict:
+            del wireless_dict[param_name]
+        teacher_suffix = f"{mode}_{param_name}={param_value}"  # "demo" or "full"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+        root_path = os.path.join(script_dir, "simulations", f"{timestamp}")
+        save_path = root_path + f"/teacher_{teacher_suffix}.pth"
+        metadata_path = root_path + f"/config.yaml"
+        # Save config.yaml only once (if it doesn't exist)D
+        metadata = {
+                'N_t': N_t,
+                'N_r': N_r,
+                'N_m': N_m,
+                'mode': mode,
+                'wireless_dict': wireless_dict,
+                'data_dict': data_dict,
+                'lr': lr,
+                'weight_decay': weight_decay,
+            }
+        if not os.path.exists(metadata_path):
+            os.makedirs(root_path, exist_ok=True)
+            with open(metadata_path, 'w') as f:
+                yaml.dump(metadata, f, default_flow_style=False)
+                print(f"Metadata saved to: {metadata_path}")
+        else:
+            print(f"Metadata already exists at: {metadata_path} (skipping)")
+        print(f"{param_name}: {param_value}")
+        print(f"Model will be saved to: {save_path}")
+    else:
+        save_path = None
+        metadata_path = None
+    if wandb:
+        run = wandb.init(
+            entity="mazya-ben-gurion-university-of-the-negev",
+            project="ota-ris-teacher-training",
+            name=f"teacher_{teacher_suffix}",
+            config=metadata  # only the metadata as defined above
+        )
+    else:
+        run = None
+    train_teacher(teacher, train_loader, device, data_dict["epochs"], lr, weight_decay,
+                use_channel_reg=use_channel_reg,
                 H_d_channel=H_d_all,
                 H_1_channel=H_1_all,
                 H_2_channel=H_2_all,
@@ -1175,6 +1945,100 @@ if __name__ == "__main__":
                 save_path=save_path,
                 wandb_run=run)
 
-    # Finish the wandb run
-    run.finish()
-    print("Wandb run finished!")
+    #################################################
+    # Phase 2: Train generator (MSE + adversarial) to mimic H_d
+    #################################################
+    # gan_latent_dim = 16
+    # gan_hidden_dim = 256
+    # gan_epochs = 100
+    # gan_lr = 1e-3
+
+    # gen = ChannelGenerator(
+    #     n_t=N_t, n_r=N_r,
+    #     latent_dim=gan_latent_dim, hidden_dim=gan_hidden_dim,
+    # ).to(device)
+    # disc = ChannelDiscriminator(
+    #     n_t=N_t, n_r=N_r,
+    #     hidden_dim=gan_hidden_dim,
+    # ).to(device)
+
+    # gan_save_path = (
+    #     os.path.join(os.path.dirname(save_path), f"gan_{os.path.basename(save_path)}")
+    #     if save_path else None
+    # )
+    # teacher = MyTeacher(n_t=N_t, n_r=N_r, n_m=N_m, num_classes=10, power=1.0).to(device)
+    # model_path = "/home/mazya/OTA_RIS/MY_code/simulations/20260401_1423/teacher_debug_target_snr_db=0.0.pth"
+    # checkpoint = torch.load(model_path, map_location=device)
+    # teacher.load_state_dict(checkpoint['teacher'] if 'teacher' in checkpoint else checkpoint)
+    # teacher.eval()
+
+    # train_gan_phase(
+    #     teacher=teacher,
+    #     generator=gen,
+    #     discriminator=disc,
+    #     train_loader=train_loader,
+    #     H_d_all=H_d_all,
+    #     device=device,
+    #     epochs=gan_epochs,
+    #     lr=gan_lr,
+    #     target_snr_db=target_snr_db,
+    #     lambda_adv=0.01,
+    #     save_path=gan_save_path,
+    # )
+
+    #################################################
+    # Phase 3: Quick validation — GAN channel vs learned linear
+    #################################################
+    # teacher.eval()
+    # gen.eval()
+    # correct_gan = 0
+    # correct_linear = 0
+    # total = 0
+    # with torch.no_grad():
+    #     for images, labels in train_loader:
+    #         images, labels = images.to(device), labels.to(device)
+    #         logits_gan = forward_with_gan_channel(teacher, gen, images)
+    #         logits_linear = teacher(images)
+    #         _, pred_gan = logits_gan.max(1)
+    #         _, pred_lin = logits_linear.max(1)
+    #         total += labels.size(0)
+    #         correct_gan += (pred_gan == labels).sum().item()
+    #         correct_linear += (pred_lin == labels).sum().item()
+    # print(f"[Phase 3 validation] GAN channel acc: {100*correct_gan/total:.2f}% | "
+    #       f"Learned linear acc: {100*correct_linear/total:.2f}%")
+
+############## 20260330_1713
+    # teacher = MyTeacher(n_t=N_t, n_r=N_r, n_m=N_m, num_classes=10, power=1.0).to(device)
+    # model_path = "/home/mazya/OTA_RIS/MY_code/simulations/20260401_1423/teacher_debug_target_snr_db=0.0.pth"
+    # checkpoint = torch.load(model_path, map_location=device)
+    # teacher.load_state_dict(checkpoint['teacher'] if 'teacher' in checkpoint else checkpoint)
+    # teacher.eval()
+    # #test_optimize_phi_gd(teacher, train_loader, H_d_all, H_1_all, H_2_all, device,iters=2000)
+    # save_theta_net_path = root_path + f"/theta_net_{teacher_suffix}.pth"
+    # sim_cfg = {
+    #     "carrier_freq_hz": wireless_dict["freq_hz"],
+    #     "sim_num_layers": 20,
+    #     "sim_layer_dist_lambda": 5.0,
+    #     "sim_elem_width_lambda": 0.5,
+    #     "sim_elem_dist_lambda": 0.5,
+    #     "sim_orientation_plane": "yz",
+    # }
+
+    # H_d_all, H_1_all, H_2_all = generate_channel_tensors_by_type(
+    #     channel_type="geometric_ricean",
+    #     N_t=N_t,
+    #     N_r=N_r,
+    #     N_m=N_m,
+    #     num_channels=100,  # Multiple channels for cyclic sampling
+    #     device=device,
+    #     freq_hz=wireless_dict["freq_hz"],
+    #     k_factor_d_db=wireless_dict["k_factor_d_db"],
+    #     k_factor_h1_db=wireless_dict["k_factor_h1_db"],
+    #     k_factor_h2_db=wireless_dict["k_factor_h2_db"],
+    #     pathloss_exp=wireless_dict["pathloss_exp"],
+    #     geo_pathloss_gain_db=wireless_dict["geo_pathloss_gain_db"], #TODO-during it test we need it to be 60! resolve this
+    # )
+    # _optimize_phi_train(teacher, train_loader,save_theta_net_path, H_1_all, H_2_all,
+    # epochs=100, lr=1e-3, device=device, noise_std=1e-18, **sim_cfg)
+    # if wandb:
+    #     run.finish() #wandb

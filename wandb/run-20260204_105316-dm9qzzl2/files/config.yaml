@@ -1,0 +1,127 @@
+_wandb:
+    value:
+        cli_version: 0.24.1
+        e:
+            1hgpxoup6mndkgmw49fkoetf5dl3m74f:
+                args:
+                    - --lambda_class
+                    - "5e-2"
+                codePath: MY_code/teachers.py
+                codePathLocal: MY_code/teachers.py
+                cpu_count: 6
+                cpu_count_logical: 12
+                cudaVersion: "12.5"
+                disk:
+                    /:
+                        total: "361207922688"
+                        used: "16847040512"
+                email: mazya@post.bgu.ac.il
+                executable: /home/mazya/.conda/envs/py310/bin/python
+                git:
+                    commit: 953b4ce8ec3020d89d0eff73c0576e29c96058fd
+                    remote: https://github.com/ShlezingerLab/OTA_RIS.git
+                gpu: NVIDIA GeForce RTX 3090
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Ampere
+                      cudaCores: 10496
+                      memoryTotal: "25769803776"
+                      name: NVIDIA GeForce RTX 3090
+                      uuid: GPU-271fe656-84f9-4ec2-3383-d2df08a2194f
+                host: ise-pheno-03.auth.ad.bgu.ac.il
+                memory:
+                    total: "134416445440"
+                os: Linux-5.14.0-503.40.1.el9_5.x86_64-x86_64-with-glibc2.34
+                program: /home/mazya/OTA_RIS/MY_code/teachers.py
+                python: CPython 3.10.19
+                root: /home/mazya/OTA_RIS
+                slurm:
+                    array_job_id: "14193013"
+                    array_task_count: "3"
+                    array_task_id: "0"
+                    array_task_max: "2"
+                    array_task_min: "0"
+                    array_task_step: "1"
+                    cluster_name: cluster
+                    conf: /var/spool/slurmd/conf-cache/slurm.conf
+                    cpus_on_node: "6"
+                    gpus: "1"
+                    gpus_on_node: "1"
+                    gtids: "0"
+                    job_account: tirzar
+                    job_cpus_per_node: "6"
+                    job_end_time: "1770232989"
+                    job_gid: "1945600513"
+                    job_gpus: "0"
+                    job_id: "14193014"
+                    job_name: minn_train
+                    job_nodelist: ise-pheno-03
+                    job_num_nodes: "1"
+                    job_partition: gpu
+                    job_qos: normal
+                    job_start_time: "1770195189"
+                    job_uid: "343830305"
+                    job_user: mazya
+                    jobid: "14193014"
+                    localid: "0"
+                    mem_per_node: "32768"
+                    nnodes: "1"
+                    nodeid: "0"
+                    nodelist: ise-pheno-03
+                    oom_kill_step: "0"
+                    prio_process: "0"
+                    procid: "0"
+                    script_context: prolog_task
+                    submit_dir: /home/mazya
+                    submit_host: cs-pheno-03.auth.ad.bgu.ac.il
+                    task_pid: "3354886"
+                    tasks_per_node: "3"
+                    topology_addr: ise-pheno-03
+                    topology_addr_pattern: node
+                startedAt: "2026-02-04T08:53:16.382248Z"
+                writerId: 1hgpxoup6mndkgmw49fkoetf5dl3m74f
+        m: []
+        python_version: 3.10.19
+        t:
+            "1":
+                - 1
+                - 41
+            "2":
+                - 1
+                - 41
+            "3":
+                - 2
+                - 13
+                - 16
+            "4": 3.10.19
+            "5": 0.24.1
+            "12": 0.24.1
+            "13": linux-x86_64
+N_m:
+    value: 9
+N_r:
+    value: 10
+N_t:
+    value: 20
+data_dict:
+    value:
+        batchsize: 256
+        channel_sampling_size: 500
+        epochs: 10
+        num_channels_sample: 300
+        subset_size: 1000
+lr:
+    value: 0.001
+mode:
+    value: debug
+weight_decay:
+    value: 1e-07
+wireless_dict:
+    value:
+        freq_hz: 2.8e+10
+        geo_pathloss_gain_db: 0
+        k_factor_d_db: 3
+        k_factor_h1_db: 13
+        k_factor_h2_db: 7
+        pathloss_exp: 2
+        power: 3
