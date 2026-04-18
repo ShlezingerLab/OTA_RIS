@@ -78,7 +78,7 @@ def generate_fake_real_samples(teacher_model, x):
         # Real complex signal: y = H @ s
         phase = torch.tensor(np.pi*1.25, device=H_d_batch.device, dtype=H_d_batch.real.dtype)
         y_real_complex = torch.bmm(H_d_batch, s.unsqueeze(-1)).squeeze(-1)
-        y_real_complex = normalize_complex_batch(y_real_complex)#*torch.exp(1j*phase) #TODO
+        #y_real_complex = normalize_complex_batch(y_real_complex)#*torch.exp(1j*phase) #TODO
 
         # 3. GAN Path: G(s, yp) [cite: 93, 231]
         s_flat = torch.view_as_real(s).reshape(B, -1)
@@ -101,7 +101,7 @@ def kl_visualization(teacher_model, save_path="kl_divergence_plot.png", num_samp
     sample_count = min(num_samples, len(train_dataset))
     indices = np.random.choice(len(train_dataset), sample_count, replace=False)
     x = torch.stack([train_dataset[idx][0] for idx in indices]).to(device)
-    y_real_complex, y_fake_complex = generate_fake_real_samples(teacher_model, x, device)
+    y_real_complex, y_fake_complex, _,_ = generate_fake_real_samples(teacher_model, x)
     plot_distribution(y_real_complex, y_fake_complex, save_path)
 
 
@@ -351,7 +351,7 @@ def train_gan_phase(
         )
 
         teacher.generator.eval()
-        y_real_complex, y_fake_complex, H_d_batch, s_flat = generate_fake_real_samples(teacher, images[:batch_size])
+        y_real_complex, y_fake_complex, H_d_batch, s_flat = generate_fake_real_samples(teacher, images[0].unsqueeze(0).expand(batch_size, -1, -1, -1))
         y_real_flat = torch.view_as_real(y_real_complex).reshape(batch_size, -1).cpu().numpy()
         y_fake_flat = torch.view_as_real(y_fake_complex).reshape(batch_size, -1).cpu().numpy()
         kl_val = estimate_kl_knn(
@@ -382,9 +382,8 @@ if __name__ == "__main__":
     d_block_epochs = 100
     g_block_epochs = 10
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    train_gan = 1
-    GAN_CHECKPOINT_PATH_PRE = "/home/mazya/OTA_RIS/MY_code/simulations"
-    DEFAULT_GAN_CHECKPOINT_PATH = GAN_CHECKPOINT_PATH_PRE+"/gan_20260416_170404/gan_checkpoint.pth"
+    train_gan = 0
+
 
     #################################################
     N_t, N_r, N_m = 20, 10, 16 #TODO N_t should be low, TODO: why increasing N_m doesnt improve me
@@ -433,6 +432,11 @@ if __name__ == "__main__":
         freeze_generator=freeze_generator, freeze_discriminator=freeze_discriminator,
         alternating_blocks=alternating_blocks, d_block_epochs=d_block_epochs,
         g_block_epochs=g_block_epochs, mini_batch_size=20)
+
+        checkpoint['generator'] = teacher.generator.state_dict()
+        checkpoint['discriminator'] = teacher.discriminator.state_dict()
+        torch.save(checkpoint, model_path)
+        print(f"Generator and discriminator weights saved to: {model_path}")
 
     if not train_gan:
         print("\n--- Running Final KL Divergence Verification ---")
