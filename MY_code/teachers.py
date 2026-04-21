@@ -8,6 +8,8 @@ from students import Encoder as StudentEncoder
 import random
 import wandb
 import yaml
+import torch.optim as optim
+
 
 # from sionna.phy.channel.tr38901 import Antenna, AntennaArray, CDL
 
@@ -682,45 +684,6 @@ class MyTeacher(nn.Module):
             sim_orientation_plane=self.sim_loss_cfg["sim_orientation_plane"],
         )
 
-    def _load_gan_generator(self, checkpoint_path: str) -> ChannelGenerator:
-        if not os.path.exists(checkpoint_path):
-            raise FileNotFoundError(f"GAN checkpoint not found: {checkpoint_path}")
-
-        checkpoint = torch.load(checkpoint_path, map_location="cpu")
-        if isinstance(checkpoint, dict) and "generator" in checkpoint:
-            generator_state = checkpoint["generator"]
-            config = checkpoint.get("config", {})
-        else:
-            generator_state = checkpoint
-            config = {}
-
-        if not isinstance(generator_state, dict):
-            raise TypeError(f"Unsupported GAN checkpoint format: {type(generator_state)}")
-
-        if "n_t" in config and int(config["n_t"]) != self.n_t:
-            raise ValueError(f"GAN checkpoint n_t={config['n_t']} does not match teacher n_t={self.n_t}")
-        if "n_r" in config and int(config["n_r"]) != self.n_r:
-            raise ValueError(f"GAN checkpoint n_r={config['n_r']} does not match teacher n_r={self.n_r}")
-
-        first_weight = generator_state.get("net.0.weight")
-        if first_weight is None:
-            raise KeyError("GAN checkpoint is missing net.0.weight")
-        hidden_dim = int(first_weight.shape[0])
-        latent_dim = int(first_weight.shape[1]) - (2 * self.n_t + 2 * self.n_r)
-        if latent_dim <= 0:
-            raise ValueError(f"Invalid latent_dim inferred from GAN checkpoint: {latent_dim}")
-
-        generator = ChannelGenerator(
-            n_t=self.n_t,
-            n_r=self.n_r,
-            latent_dim=latent_dim,
-            hidden_dim=hidden_dim,
-        )
-        generator.load_state_dict(generator_state)
-        generator.eval()
-        generator.requires_grad_(False)
-        return generator
-
     def forward(self, x: torch.Tensor, return_intermediates: bool = False) -> torch.Tensor:
         #Yaniv teacher forward
         """
@@ -730,9 +693,17 @@ class MyTeacher(nn.Module):
         Returns:
             logits: (B, num_classes)
         """
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         B = x.size(0)
-        channel_indices = torch.randint(0, self.H_d_all.size(0), (B,))
-        H_d_batch = self.H_d_all[channel_indices].to(x.device)
+        # channel_indices = torch.randint(0, self.H_d_all.size(0), (B,))
+        # H_d_batch = self.H_d_all[channel_indices].to(x.device)
+        Nr = self.n_r
+        Nt = self.n_t
+        Hr = torch.randn(B,Nr, Nt, device=device) / math.sqrt(2)
+        Hi = torch.randn(B, Nr, Nt, device=device) / math.sqrt(2)
+        H = torch.complex(Hr, Hi)
+        H = H / math.sqrt(Nt)
+        H_d_batch = H # (B, Nr, Nt)
         # Encoder: image -> complex signal
         s = self.encoder(x)  # (B, 1, Nt) or (B, Nt) complex
         if s.dim() == 3:
@@ -740,22 +711,22 @@ class MyTeacher(nn.Module):
 
         #y = torch.matmul(s.squeeze(1), self.H_d.t())  # (B, Nt) @ (Nt, Nr) = (B, Nr)
 
-        s_real = torch.view_as_real(s)  # (B, Nt, 2)
-        s_flat = s_real.reshape(s.size(0), -1)  # (B, 2*Nt)
-        y_flat_nn = self.linear(s_flat)  # (B, 2*Nr)
-        y_complex = y_flat_nn.reshape(y_flat_nn.size(0), self.n_r, 2)  # (B, Nr, 2)
-        y_complex = torch.view_as_complex(y_complex.contiguous())  # (B, Nr) complex
+        # s_real = torch.view_as_real(s)  # (B, Nt, 2)
+        # s_flat = s_real.reshape(s.size(0), -1)  # (B, 2*Nt)
+        # y_flat_nn = self.linear(s_flat)  # (B, 2*Nr)
+        # y_complex = y_flat_nn.reshape(y_flat_nn.size(0), self.n_r, 2)  # (B, Nr, 2)
+        # y_complex = torch.view_as_complex(y_complex.contiguous())  # (B, Nr) complex
 
         #y_complex = torch.bmm(H_d_batch, s.unsqueeze(-1)).squeeze(-1)
 
-        # s_flat = torch.view_as_real(s).reshape(B, -1)
-        # x_p = torch.ones(B, self.n_t, 1, device=x.device, dtype=H_d_batch.dtype)
-        # yp = torch.bmm(H_d_batch, x_p).squeeze(-1)
-        # yp_flat = torch.view_as_real(yp).reshape(B, -1)
-        # z = torch.randn(s_flat.size(0), self.generator.latent_dim, device=s_flat.device)
-        # y_flat = self.generator(s_flat, yp_flat, z)
-        # y_complex = y_flat.reshape(B, self.n_r, 2)
-        # y_complex = torch.view_as_complex(y_complex.contiguous())
+        s_flat = torch.view_as_real(s).reshape(B, -1)
+        x_p = torch.ones(B, self.n_t, 1, device=x.device, dtype=H_d_batch.dtype)
+        yp = torch.bmm(H_d_batch, x_p).squeeze(-1)
+        yp_flat = torch.view_as_real(yp).reshape(B, -1)
+        z = torch.randn(s_flat.size(0), self.generator.latent_dim, device=s_flat.device)
+        y_flat = self.generator(s_flat, yp_flat, z)
+        y_complex = y_flat.reshape(B, self.n_r, 2)
+        y_complex = torch.view_as_complex(y_complex.contiguous())
 
         target_snr_db = self.target_snr_db
         p_signal = torch.mean(torch.abs(y_complex) ** 2)

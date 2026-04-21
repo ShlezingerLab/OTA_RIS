@@ -63,7 +63,7 @@ def generate_fake_real_samples(teacher_model, x):
     with torch.no_grad():
         # 2. Real Path: Calculate H * s [cite: 264]
         s = teacher_model.encoder(x)
-        s = s[0].expand(B, s.shape[-1])
+        #s = s[0].expand(B, s.shape[-1])
         if s.dim() == 3: s = s.squeeze(1)
         Nr = teacher_model.n_r
         Nt = teacher_model.n_t
@@ -86,8 +86,8 @@ def generate_fake_real_samples(teacher_model, x):
         x_p = torch.ones(B, teacher_model.n_t, 1, device=device, dtype=H_d_batch.dtype)
         yp = torch.bmm(H_d_batch, x_p).squeeze(-1)
         yp_flat = torch.view_as_real(yp).reshape(B, -1)
-        z = torch.randn(s_flat.size(0), teacher.generator.latent_dim, device=s_flat.device)
-        y_fake_flat = teacher.generator(s_flat, yp_flat,z)
+        z = torch.randn(s_flat.size(0), teacher_model.generator.latent_dim, device=s_flat.device)
+        y_fake_flat = teacher_model.generator(s_flat, yp_flat,z)
         y_fake_complex = y_fake_flat.reshape(B, teacher_model.n_r, 2)
         y_fake_complex = torch.view_as_complex(y_fake_complex.contiguous())
         return y_real_complex, y_fake_complex, H_d_batch, s_flat
@@ -101,6 +101,7 @@ def kl_visualization(teacher_model, save_path="kl_divergence_plot.png", num_samp
     sample_count = min(num_samples, len(train_dataset))
     indices = np.random.choice(len(train_dataset), sample_count, replace=False)
     x = torch.stack([train_dataset[idx][0] for idx in indices]).to(device)
+    x=x[0].unsqueeze(0).expand(sample_count, -1, -1, -1)
     y_real_complex, y_fake_complex, _,_ = generate_fake_real_samples(teacher_model, x)
     plot_distribution(y_real_complex, y_fake_complex, save_path)
 
@@ -362,11 +363,11 @@ def train_gan_phase(
         kl_history.append((epoch + 1, kl_val))
         print(f"Epoch {epoch+1} | KL Div: {kl_val:.4f}")
         teacher.generator.train()
-        if epoch % 5 == 0:
-            save_path = 'OTA_RIS/MY_code/simulations/kl/'
-            Path(save_path).mkdir(parents=True, exist_ok=True)
-            plot_distribution(y_real_complex,y_fake_complex, save_path=save_path+str(epoch)+'.png')
-    plot_kl_history(kl_history, save_path=kl_plot_path, show_plot=show_kl_plot)
+    #     if epoch % 10 == 0:
+    #         save_path = 'OTA_RIS/MY_code/simulations/kl/'
+    #         Path(save_path).mkdir(parents=True, exist_ok=True)
+    #         plot_distribution(y_real_complex,y_fake_complex, save_path=save_path+str(epoch)+'.png')
+    # plot_kl_history(kl_history, save_path=kl_plot_path, show_plot=show_kl_plot)
 
 if __name__ == "__main__":
     param_name = "target_snr_db"  #modify it for simulations
@@ -379,8 +380,8 @@ if __name__ == "__main__":
     freeze_generator = False
     freeze_discriminator = False
     alternating_blocks = True
-    d_block_epochs = 100
-    g_block_epochs = 10
+    d_block_epochs = 10
+    g_block_epochs = 100
     device = "cuda" if torch.cuda.is_available() else "cpu"
     train_gan = 0
 
@@ -422,7 +423,7 @@ if __name__ == "__main__":
                         target_snr_db=wireless_dict["target_snr_db"]).to(device)
     model_path = "/home/mazya/OTA_RIS/MY_code/simulations/20260418_1519/teacher_debug_target_snr_db=0.0.pth"
     checkpoint = torch.load(model_path, map_location=device)
-    teacher.load_state_dict(checkpoint['teacher'] if 'teacher' in checkpoint else checkpoint)
+    teacher.load_state_dict(checkpoint['teacher'])
     teacher.eval()
     #################################################
     if train_gan:
@@ -433,10 +434,10 @@ if __name__ == "__main__":
         alternating_blocks=alternating_blocks, d_block_epochs=d_block_epochs,
         g_block_epochs=g_block_epochs, mini_batch_size=20)
 
-        checkpoint['generator'] = teacher.generator.state_dict()
-        checkpoint['discriminator'] = teacher.discriminator.state_dict()
-        torch.save(checkpoint, model_path)
-        print(f"Generator and discriminator weights saved to: {model_path}")
+        if save:
+            checkpoint['teacher'] = teacher.state_dict()
+            torch.save(checkpoint, model_path)
+            print(f"Teacher weights saved to checkpoint['teacher']: {model_path}")
 
     if not train_gan:
         print("\n--- Running Final KL Divergence Verification ---")
@@ -448,14 +449,9 @@ if __name__ == "__main__":
             num_samples=1000,
             device=device
         )
-        # Save Models and Results [cite: 282]
-        if save:
-            save_dir = Path("/home/mazya/OTA_RIS/MY_code/simulations")
-            save_dir.mkdir(parents=True, exist_ok=True)
+        save_dir = Path("/home/mazya/OTA_RIS/MY_code/simulations")
+        save_dir.mkdir(parents=True, exist_ok=True)
+        if Path(final_kl_path).exists():
+            shutil.copy(final_kl_path, save_dir / "final_constellation_verification.png")
 
-            # [keep existing torch.save logic for generator, discriminator, and checkpoint]
-            # Adding final verification plots to the save directory
-            if Path(final_kl_path).exists():
-                shutil.copy(final_kl_path, save_dir / "final_constellation_verification.png")
-
-            print(f"Final Verification Plot saved to: {save_dir / 'final_constellation_verification.png'}")
+        print(f"Final Verification Plot saved to: {save_dir / 'final_constellation_verification.png'}")
