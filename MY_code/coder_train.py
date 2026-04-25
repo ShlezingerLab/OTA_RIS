@@ -30,7 +30,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from tqdm import tqdm
 
-def train_teacher_decoder(teacher,phase, train_loader, device, epochs, lr, weight_decay, lambda_l2=0.0, use_channel_reg=False,
+def train_teacher_coder(teacher,phase, train_loader, device, epochs, lr, weight_decay, lambda_l2=0.0, use_channel_reg=False,
 H_d_channel=None, H_1_channel=None, H_2_channel=None, lambda_class=0.0 , save_path=None, wandb_run=None):
     """
     Train teacher model with optional regularization.
@@ -63,16 +63,22 @@ H_d_channel=None, H_1_channel=None, H_2_channel=None, lambda_class=0.0 , save_pa
 
 
     for epoch in range(epochs):
-        #if epoch < epochs//2:
-        teacher.decoder.requires_grad_(True)
-        optimizer = optim.Adam(teacher.decoder.parameters(), lr=lr, weight_decay=weight_decay)
-        teacher.encoder.eval()
-        # else:
-        #     teacher.encoder.requires_grad_(True)
-        #     optimizer = optim.Adam(teacher.encoder.parameters(), lr=lr, weight_decay=weight_decay)
-        #     teacher.decoder.eval()
-        teacher.train()
-        teacher.generator.eval() if phase == "decoder" else teacher.discriminator.eval()
+        if phase == "decoder":
+            teacher.decoder.requires_grad_(True)
+            optimizer = optim.Adam(teacher.decoder.parameters(), lr=lr, weight_decay=weight_decay)
+            teacher.encoder.eval()
+        elif phase == "encoder":
+            teacher.encoder.requires_grad_(True)
+            optimizer = optim.Adam(teacher.encoder.parameters(), lr=lr, weight_decay=weight_decay)
+            teacher.decoder.eval()
+        else:
+            teacher.decoder.requires_grad_(True)
+            teacher.encoder.requires_grad_(True)
+            optimizer = optim.Adam(
+            list(teacher.decoder.parameters()) + list(teacher.encoder.parameters()),
+            lr=lr,weight_decay=weight_decay)
+        # teacher.generator.eval()
+        # teacher.discriminator.eval()
         running_loss = 0.0
         running_ce_loss = 0.0
         running_l2_loss = 0.0
@@ -84,8 +90,11 @@ H_d_channel=None, H_1_channel=None, H_2_channel=None, lambda_class=0.0 , save_pa
         for images, labels in pbar:
             images = images.to(device)
             labels = labels.to(device)
-            logits = teacher(images, return_intermediates=True)
-            loss_ce = criterion(logits, labels)
+            logits, logits_wireless, _, _, _, _ = teacher(images, return_intermediates=True)
+            if phase == "decoder":
+                loss_ce = criterion(logits_wireless, labels)
+            else:
+                loss_ce = criterion(logits, labels)
             if use_channel_reg:
                 loss_channel = teacher.get_channel_matching_loss(
                     H_d_channel,
@@ -183,7 +192,7 @@ if __name__ == "__main__":
     param_value = getattr(args, param_name)
     mode = "debug"#args.mode
     lambda_class = 0.25#args.lambda_class
-    target_snr_db = param_value
+    target_snr_db = 20#param_value
     wandb = False
     save = True
     use_channel_reg = False
@@ -200,11 +209,25 @@ if __name__ == "__main__":
         channel_sampling_size=10000, epochs=200)  #args.num_channels_sample  #None = use all channels
     elif mode == "debug":
         data_dict = dict(subset_size=1000, batchsize=100,
-        channel_sampling_size=1000, epochs=20)
+        channel_sampling_size=1000, epochs=50)
     #################################################
-    teacher = MyTeacher(n_t=N_t, n_r=N_r, n_m=N_m, power=wireless_dict["power"],
-                        target_snr_db=wireless_dict["target_snr_db"]).to(device)
-    model_path = "/home/mazya/OTA_RIS/MY_code/simulations/20260418_1519/teacher_debug_target_snr_db=0.0.pth"
+    H_d_all, H_1_all, H_2_all = generate_channel_tensors_by_type(
+        channel_type="geometric_ricean",
+        N_t=N_t,
+        N_r=N_r,
+        N_m=N_m,
+        num_channels=1000,  # Multiple channels for cyclic sampling
+        device=device,
+        freq_hz=wireless_dict["freq_hz"],
+        k_factor_d_db=20.0,
+        k_factor_h1_db=wireless_dict["k_factor_h1_db"],
+        k_factor_h2_db=wireless_dict["k_factor_h2_db"],
+        pathloss_exp=wireless_dict["pathloss_exp"],
+        geo_pathloss_gain_db=wireless_dict["geo_pathloss_gain_db"], #TODO-during it test we need it to be 60! resolve this
+    )
+    #################################################
+    teacher = MyTeacher(n_t=N_t, n_r=N_r, n_m=N_m,H_d_all=H_d_all, target_snr_db=target_snr_db).to(device)
+    model_path = "/home/mazya/OTA_RIS/MY_code/simulations/20260425_1346/teacher_debug_target_snr_db=0.0.pth"
     checkpoint = torch.load(model_path, map_location=device)
     teacher.load_state_dict(checkpoint['teacher'])
     teacher.eval()
@@ -214,21 +237,6 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     teacher = teacher.to(device)
-    #################################################
-    H_d_all, H_1_all, H_2_all = generate_channel_tensors_by_type(
-        channel_type="synthetic_rayleigh",
-        N_t=N_t,
-        N_r=N_r,
-        N_m=N_m,
-        num_channels=data_dict["channel_sampling_size"],  # Multiple channels for cyclic sampling
-        device=device,
-        freq_hz=wireless_dict["freq_hz"],
-        k_factor_d_db=wireless_dict["k_factor_d_db"],
-        k_factor_h1_db=wireless_dict["k_factor_h1_db"],
-        k_factor_h2_db=wireless_dict["k_factor_h2_db"],
-        pathloss_exp=wireless_dict["pathloss_exp"],
-        geo_pathloss_gain_db=wireless_dict["geo_pathloss_gain_db"], #TODO-during it test we need it to be 60! resolve this
-    )
     #################################################
     transform = transforms.Compose([transforms.ToTensor()])
     train_dataset = datasets.MNIST(root="./data", train=True, transform=transform, download=True)
@@ -275,7 +283,7 @@ if __name__ == "__main__":
         )
     else:
         run = None
-    train_teacher_decoder(teacher, phase=phase_name, train_loader=train_loader, device=device, epochs=data_dict["epochs"], lr=lr, weight_decay=weight_decay,
+    train_teacher_coder(teacher, phase=phase_name, train_loader=train_loader, device=device, epochs=data_dict["epochs"], lr=lr, weight_decay=weight_decay,
                 use_channel_reg=use_channel_reg,
                 H_d_channel=H_d_all,
                 H_1_channel=H_1_all,

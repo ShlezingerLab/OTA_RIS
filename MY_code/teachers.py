@@ -38,52 +38,77 @@ import torch.optim as optim
 # # Generate channel impulse response
 # a, tau = cdl(batch_size=64, num_time_steps=100, sampling_frequency=1e6)
 
+def noise(y,target_snr_db):
+    p_signal = torch.mean(torch.abs(y) ** 2)
+    sigma_sqr = p_signal / (10 ** (target_snr_db / 10.0))
+    noise_std = torch.sqrt(sigma_sqr)
+    noise = (
+        torch.randn_like(y.real) + 1j * torch.randn_like(y.real)
+    ) * (noise_std / math.sqrt(2.0))
+    return noise
 
 class ChannelGenerator(nn.Module):
-    """
-    Input: transmit signal s + received pilot yp + noise z. [cite: 93, 220]
-    Condition m = concat(s, yp). [cite: 226, 229]
-    Follows Table I: 3 hidden layers of 128 neurons.
-    """
     def __init__(self, n_t, n_r, latent_dim=16):
         super().__init__()
         self.latent_dim = latent_dim
-        # Input size: 2*Nt (s) + 2*Nr (yp) + latent_dim (z) [cite: 229, 292]
+
+        # Input size: 2*Nt (s) + 2*Nr (yp) + latent_dim (z)
         self.net = nn.Sequential(
             nn.Linear(2 * n_t + 2 * n_r + latent_dim, 128),
-            nn.ReLU(),
+            nn.LeakyReLU(0.2), # Allows negative values to flow
+
             nn.Linear(128, 128),
-            nn.ReLU(),
+            nn.LeakyReLU(0.2),
+
             nn.Linear(128, 128),
-            nn.ReLU(),
+            nn.LeakyReLU(0.2),
+
+            # Final output is 2 * Nr (Real and Imaginary parts)
+            # No activation here, allowing the full range of complex values
             nn.Linear(128, 2 * n_r)
         )
 
     def forward(self, s_flat, yp_flat, z):
+        # Concatenate encoded message, pilot, and noise
         m_z = torch.cat([s_flat, yp_flat, z], dim=1)
         return self.net(m_z)
 
 class ChannelDiscriminator(nn.Module):
-    """
-    Distinguishes Real (s, yp, y_real) from Fake (s, yp, y_fake).
-    Follows Table I: 3 hidden layers of 32 neurons.
-    """
     def __init__(self, n_t, n_r):
         super().__init__()
-        # Input: 2*Nt (s) + 2*Nr (yp) + 2*Nr (y)
+        # Input: 2*Nt (s) + 4*Nr (yp + y) + 1 (batch_std_feature)
+        self.input_dim = 2 * n_t + 4 * n_r
+
         self.net = nn.Sequential(
-            nn.Linear(2 * n_t + 4 * n_r, 32),
-            nn.ReLU(),
-            nn.Linear(32, 32),
-            nn.ReLU(),
-            nn.Linear(32, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1) # Output logit for BCEWithLogitsLoss
+            # Increase neurons from 32 to 256 for more 'brainpower'
+            nn.Linear(self.input_dim + 1, 256),
+            nn.LeakyReLU(0.2), # Allows gradients to flow for negative values
+
+            nn.Linear(256, 256),
+            nn.LeakyReLU(0.2),
+
+            nn.Linear(256, 128),
+            nn.LeakyReLU(0.2),
+
+            nn.Linear(128, 1) # Output logit
         )
 
     def forward(self, s_flat, yp_flat, y_flat):
+        # 1. Standard concatenation: [Batch, Features]
         combined = torch.cat([s_flat, yp_flat, y_flat], dim=1)
-        return self.net(combined)
+
+        # 2. Calculate Minibatch Standard Deviation
+        # Compute std across the batch dimension (dim=0)
+        # 1e-8 prevents division by zero if the GAN completely collapses
+        batch_std = torch.std(combined, dim=0)
+
+        # Average deviations into a 'diversity score'
+        mean_std = batch_std.mean().view(1, 1).expand(combined.size(0), 1)
+
+        # 3. Concatenate the diversity score to every sample
+        combined_with_std = torch.cat([combined, mean_std], dim=1)
+
+        return self.net(combined_with_std)
 
 class RayleighChannelLayer(nn.Module):
     """
@@ -553,7 +578,7 @@ class HeavyRxDecoder(nn.Module):
         self.num_classes = int(num_classes)
         self.hidden_dim = int(hidden_dim)
 
-        self.fc1 = nn.Linear(2 * self.n_r, self.hidden_dim * 2)
+        self.fc1 = nn.Linear(4 * self.n_r, self.hidden_dim * 2)
         self.ln1 = nn.LayerNorm(self.hidden_dim * 2)
         self.fc2 = nn.Linear(self.hidden_dim * 2, self.hidden_dim)
         self.ln2 = nn.LayerNorm(self.hidden_dim)
@@ -561,11 +586,15 @@ class HeavyRxDecoder(nn.Module):
         self.ln3 = nn.LayerNorm(self.hidden_dim // 2)
         self.fc_out = nn.Linear(self.hidden_dim // 2, self.num_classes)
 
-    def forward(self, y: torch.Tensor) -> torch.Tensor:
+    def forward(self, y: torch.Tensor, yp: torch.Tensor) -> torch.Tensor:
+        # Concatenate the received signal and the pilot
+        # Now the decoder knows: "Given this pilot yp, this signal y means digit X"
         y_ri = torch.cat([y.real, y.imag], dim=1)
-        eps = 1e-8
-        y_ri = y_ri / (y_ri.std(dim=1, keepdim=True) + eps) #important!
-        x1 = F.leaky_relu(self.ln1(self.fc1(y_ri)), 0.2)
+        yp_ri = torch.cat([yp.real, yp.imag], dim=1)
+        # Combine them for the first layer
+        combined = torch.cat([y_ri, yp_ri], dim=1)
+
+        x1 = F.leaky_relu(self.ln1(self.fc1(combined)), 0.2)
         x2 = F.leaky_relu(self.ln2(self.fc2(x1)), 0.2)
         x3 = F.leaky_relu(self.ln3(self.fc3(x2)), 0.2)
         return self.fc_out(x3)
@@ -612,6 +641,7 @@ class MyTeacher(nn.Module):
         n_t: int,
         n_r: int,
         n_m: int,
+        H_d_all: torch.Tensor,
         num_classes: int = 10,
         power: float = 1.0,
         base_channels: int = 64,
@@ -623,6 +653,7 @@ class MyTeacher(nn.Module):
         self.n_t = int(n_t)
         self.n_r = int(n_r)
         self.n_m = int(n_m)
+        self.H_d_all = H_d_all
         self.num_classes = int(num_classes)
         self.power = power
         self.target_snr_db = float(target_snr_db)
@@ -635,22 +666,6 @@ class MyTeacher(nn.Module):
         self.decoder = HeavyRxDecoder(n_r=self.n_r, num_classes=self.num_classes, hidden_dim=decoder_hidden)
 
         self.register_buffer('current_target_p', torch.tensor(1.0))
-
-        # Physical channel H_d (Direct TX to RX) instead of learnable linear layer
-        # Generate one realization of the channel
-        from channels import generate_channel_tensors_by_type
-        H_d_all, _, _ = generate_channel_tensors_by_type(
-            channel_type="geometric_ricean",
-            N_t=self.n_t,
-            N_r=self.n_r,
-            N_m=self.n_m,
-            num_channels=10000,
-            device="cpu"  # Will be moved to correct device when model is moved
-        )
-        self.H_d_avg = torch.mean(H_d_all, dim=0)
-        self.H_d_all = H_d_all
-
-        # H_d is (Nr, Nt) complex, register as buffer (non-trainable)
         self.register_buffer('H_d', H_d_all[0])
         self.gan_checkpoint_path = gan_checkpoint_path
         if gan_checkpoint_path is not None:
@@ -685,7 +700,7 @@ class MyTeacher(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, return_intermediates: bool = False) -> torch.Tensor:
-        #Yaniv teacher forward
+        # teacher forward
         """
         Args:
             x: (B, 1, H, W) input images
@@ -693,23 +708,21 @@ class MyTeacher(nn.Module):
         Returns:
             logits: (B, num_classes)
         """
-        device = "cuda" if torch.cuda.is_available() else "cpu"
         B = x.size(0)
-        # channel_indices = torch.randint(0, self.H_d_all.size(0), (B,))
-        # H_d_batch = self.H_d_all[channel_indices].to(x.device)
-        Nr = self.n_r
-        Nt = self.n_t
-        Hr = torch.randn(B,Nr, Nt, device=device) / math.sqrt(2)
-        Hi = torch.randn(B, Nr, Nt, device=device) / math.sqrt(2)
-        H = torch.complex(Hr, Hi)
-        H = H / math.sqrt(Nt)
-        H_d_batch = H # (B, Nr, Nt)
+        channel_indices = torch.randint(0, self.H_d_all.size(0), (B,))
+        H_d_batch = self.H_d_all[channel_indices].to(x.device)
+        # Nr = self.n_r
+        # Nt = self.n_t
+        # Hr = torch.randn(B,Nr, Nt, device=device) / math.sqrt(2)
+        # Hi = torch.randn(B, Nr, Nt, device=device) / math.sqrt(2)
+        # H = torch.complex(Hr, Hi)
+        # H = H / math.sqrt(Nt)
+        # H_d_batch = H # (B, Nr, Nt)
+        #H_d_batch = H_d_batch[0].expand(B, -1, -1)
         # Encoder: image -> complex signal
         s = self.encoder(x)  # (B, 1, Nt) or (B, Nt) complex
         if s.dim() == 3:
             s = s.squeeze(1)
-
-        #y = torch.matmul(s.squeeze(1), self.H_d.t())  # (B, Nt) @ (Nt, Nr) = (B, Nr)
 
         # s_real = torch.view_as_real(s)  # (B, Nt, 2)
         # s_flat = s_real.reshape(s.size(0), -1)  # (B, 2*Nt)
@@ -717,31 +730,19 @@ class MyTeacher(nn.Module):
         # y_complex = y_flat_nn.reshape(y_flat_nn.size(0), self.n_r, 2)  # (B, Nr, 2)
         # y_complex = torch.view_as_complex(y_complex.contiguous())  # (B, Nr) complex
 
-        #y_complex = torch.bmm(H_d_batch, s.unsqueeze(-1)).squeeze(-1)
+        y_wireless = torch.bmm(H_d_batch, s.unsqueeze(-1)).squeeze(-1)
+        y_wireless = y_wireless + noise(y_wireless,self.target_snr_db)
 
-        s_flat = torch.view_as_real(s).reshape(B, -1)
         x_p = torch.ones(B, self.n_t, 1, device=x.device, dtype=H_d_batch.dtype)
         yp = torch.bmm(H_d_batch, x_p).squeeze(-1)
-        yp_flat = torch.view_as_real(yp).reshape(B, -1)
-        z = torch.randn(s_flat.size(0), self.generator.latent_dim, device=s_flat.device)
-        y_flat = self.generator(s_flat, yp_flat, z)
-        y_complex = y_flat.reshape(B, self.n_r, 2)
-        y_complex = torch.view_as_complex(y_complex.contiguous())
+        yp = yp + noise(yp,self.target_snr_db)
 
-        target_snr_db = self.target_snr_db
-        p_signal = torch.mean(torch.abs(y_complex) ** 2)
-        sigma_sqr = p_signal / (10 ** (target_snr_db / 10.0))
-        noise_std = torch.sqrt(sigma_sqr)
-        noise = (
-            torch.randn_like(y_complex.real) + 1j * torch.randn_like(y_complex.real)
-        ) * (noise_std / math.sqrt(2.0))
-        y_clean = y_complex
-        y = y_complex + noise
-        #print(f"SNR: {10 * torch.log10(p_signal / sigma_sqr)} dB")
-        #y_clean = y_flat_nn.reshape(y_flat_nn.size(0), self.n_r, 2)  # (B, Nr, 2)
-        #y_clean = torch.view_as_complex(y_clean.contiguous())  # (B, Nr) complex
-        #y = y_flat.reshape(y_flat.size(0), self.n_r, 2)  # (B, Nr, 2)
-        #y = torch.view_as_complex(y.contiguous())  # (B, Nr) complex
+        yp_flat = torch.view_as_real(yp).reshape(B, -1)
+        s_flat = torch.view_as_real(s).reshape(B, -1)
+        z = torch.randn(s_flat.size(0), self.generator.latent_dim, device=s_flat.device)
+        y_flat_gen = self.generator(s_flat, yp_flat, z)
+        y_gen = y_flat_gen.reshape(B, self.n_r, 2)
+        y_complex_gen = torch.view_as_complex(y_gen.contiguous())
         # Add phase noise
         # div = torch.rand(y.size(0), device=y.device) * 6 + 2
         # std_rad = div * (math.pi / 180.0) #TODO- phase noise std
@@ -750,17 +751,15 @@ class MyTeacher(nn.Module):
         # std_rad = torch.rand(y.size(0), device=y.device) * max_std
         # noise_phase = torch.randn_like(y.real) * std_rad.unsqueeze(1)
         # rotation = torch.exp(1j * noise_phase)  # (B, Nr) complex
-        # y = y #* rotation  # (B, Nr) complex
-        #y_power = torch.mean(torch.abs(y) ** 2, dim=-1, keepdim=True)
-        #y = y #/ torch.sqrt(y_power)  #TODO- its cancel path loss
-        # Cache intermediates if needed
-        if return_intermediates:
-            self._cached_s = s
-            self._cached_y = y
-            self._cached_y_channel = y_clean
-        # Decoder: received signal -> logits
-        logits = self.decoder(y)  # (B, num_classes)
-        return logits
+        # y = y * rotation  # (B, Nr) complex
+
+        # if return_intermediates:
+        #     self._cached_s = s
+        #     self._cached_y = y_complex
+        #     self._cached_y_channel = y_complex #TODO it was the y without noise (y_clean)
+        logits_wireless = self.decoder(y_wireless, yp)
+        logits = self.decoder(y_complex_gen, yp)  # (B, num_classes)
+        return logits, logits_wireless, y_wireless,y_complex_gen, yp ,s_flat # H_d_batch, s
 
     def extract_features(self, x: torch.Tensor, preReLU: bool = True):
         """
@@ -1270,11 +1269,7 @@ H_d_channel=None, H_1_channel=None, H_2_channel=None, lambda_class=0.0 , save_pa
     criterion = nn.CrossEntropyLoss()
 
     use_l2_reg = lambda_l2 > 0 and hasattr(teacher, 'get_l2_regularization')
-
-    H_d_channel = H_d_channel.to(device)
-    H_1_channel = H_1_channel.to(device)
-    H_2_channel = H_2_channel.to(device)
-    num_channels = H_d_channel.size(0)
+    num_channels = teacher.H_d_all.size(0)
     channel_cursor = 0
 
 
@@ -1291,7 +1286,7 @@ H_d_channel=None, H_1_channel=None, H_2_channel=None, lambda_class=0.0 , save_pa
         for images, labels in pbar:
             images = images.to(device)
             labels = labels.to(device)
-            logits = teacher(images, return_intermediates=True)
+            logits, _, _, _, _,_ = teacher(images, return_intermediates=True)
             loss_ce = criterion(logits, labels)
             if use_channel_reg:
                 loss_channel = teacher.get_channel_matching_loss(
@@ -1801,7 +1796,7 @@ if __name__ == "__main__":
     param_value = getattr(args, param_name)
     mode = "debug"#args.mode
     lambda_class = 0.25#args.lambda_class
-    target_snr_db = param_value
+    target_snr_db = 10.0#param_value
     wandb = False
     save = True
     use_channel_reg = False
@@ -1815,51 +1810,49 @@ if __name__ == "__main__":
         data_dict = dict(subset_size=60000, batchsize=256, channel_sampling_size=10000, epochs=200)  #args.num_channels_sample  #None = use all channels
     elif mode == "debug":
         data_dict = dict(subset_size=1000, batchsize=100, channel_sampling_size=10000, epochs=20)
-    #################################################
-    teacher = MyTeacher(n_t=N_t, n_r=N_r, n_m=N_m, power=wireless_dict["power"],
-                        target_snr_db=wireless_dict["target_snr_db"])
-    lr = 1e-3
-    weight_decay = 1e-7
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
-    teacher = teacher.to(device)
-    if freeze_linear_from_ckpt:
-        linear_ckpt = torch.load(args.freeze_linear_from_ckpt, map_location=device)
-        if isinstance(linear_ckpt, dict) and "teacher_linear_weight" in linear_ckpt:
-            linear_weight = linear_ckpt["teacher_linear_weight"]
-        elif isinstance(linear_ckpt, dict) and "teacher" in linear_ckpt and "linear.weight" in linear_ckpt["teacher"]:
-            linear_weight = linear_ckpt["teacher"]["linear.weight"]
-        elif isinstance(linear_ckpt, dict) and "linear.weight" in linear_ckpt:
-            linear_weight = linear_ckpt["linear.weight"]
-        else:
-            raise KeyError(
-                f"Could not find linear weights in checkpoint: {args.freeze_linear_from_ckpt}"
-            )
-        if linear_weight.shape != teacher.linear.weight.shape:
-            raise ValueError(
-                f"linear weight shape mismatch: ckpt={tuple(linear_weight.shape)} "
-                f"teacher={tuple(teacher.linear.weight.shape)}"
-            )
-        with torch.no_grad():
-            teacher.linear.weight.copy_(linear_weight.to(device=device, dtype=teacher.linear.weight.dtype))
-        teacher.linear.weight.requires_grad_(False)
-        print(f"Loaded and froze teacher.linear from: {args.freeze_linear_from_ckpt}")
-    script_dir = os.path.dirname(os.path.abspath(__file__))
     #################################################
     H_d_all, H_1_all, H_2_all = generate_channel_tensors_by_type(
-        channel_type="synthetic_rayleigh",
+        channel_type="geometric_ricean",
         N_t=N_t,
         N_r=N_r,
         N_m=N_m,
-        num_channels=data_dict["channel_sampling_size"],  # Multiple channels for cyclic sampling
+        num_channels=1000,  # Multiple channels for cyclic sampling
         device=device,
         freq_hz=wireless_dict["freq_hz"],
-        k_factor_d_db=wireless_dict["k_factor_d_db"],
+        k_factor_d_db=20.0,
         k_factor_h1_db=wireless_dict["k_factor_h1_db"],
         k_factor_h2_db=wireless_dict["k_factor_h2_db"],
         pathloss_exp=wireless_dict["pathloss_exp"],
         geo_pathloss_gain_db=wireless_dict["geo_pathloss_gain_db"], #TODO-during it test we need it to be 60! resolve this
     )
+    teacher = MyTeacher(n_t=N_t, n_r=N_r, n_m=N_m,H_d_all=H_d_all, target_snr_db=target_snr_db)
+    lr = 1e-3
+    weight_decay = 1e-7
+    print(f"Using device: {device}")
+    teacher = teacher.to(device)
+    # if freeze_linear_from_ckpt:
+    #     linear_ckpt = torch.load(args.freeze_linear_from_ckpt, map_location=device)
+    #     if isinstance(linear_ckpt, dict) and "teacher_linear_weight" in linear_ckpt:
+    #         linear_weight = linear_ckpt["teacher_linear_weight"]
+    #     elif isinstance(linear_ckpt, dict) and "teacher" in linear_ckpt and "linear.weight" in linear_ckpt["teacher"]:
+    #         linear_weight = linear_ckpt["teacher"]["linear.weight"]
+    #     elif isinstance(linear_ckpt, dict) and "linear.weight" in linear_ckpt:
+    #         linear_weight = linear_ckpt["linear.weight"]
+    #     else:
+    #         raise KeyError(
+    #             f"Could not find linear weights in checkpoint: {args.freeze_linear_from_ckpt}"
+    #         )
+    #     if linear_weight.shape != teacher.linear.weight.shape:
+    #         raise ValueError(
+    #             f"linear weight shape mismatch: ckpt={tuple(linear_weight.shape)} "
+    #             f"teacher={tuple(teacher.linear.weight.shape)}"
+    #         )
+    #     with torch.no_grad():
+    #         teacher.linear.weight.copy_(linear_weight.to(device=device, dtype=teacher.linear.weight.dtype))
+    #     teacher.linear.weight.requires_grad_(False)
+    #     print(f"Loaded and froze teacher.linear from: {args.freeze_linear_from_ckpt}")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
     #################################################
     transform = transforms.Compose([transforms.ToTensor()])
     train_dataset = datasets.MNIST(root="./data", train=True, transform=transform, download=True)
@@ -1909,9 +1902,6 @@ if __name__ == "__main__":
         run = None
     train_teacher(teacher, train_loader, device, data_dict["epochs"], lr, weight_decay,
                 use_channel_reg=use_channel_reg,
-                H_d_channel=H_d_all,
-                H_1_channel=H_1_all,
-                H_2_channel=H_2_all,
                 lambda_class=lambda_class,
                 save_path=save_path,
                 wandb_run=run)

@@ -1,0 +1,21 @@
+N_m: 16
+N_r: 10
+N_t: 20
+data_dict:
+  batchsize: 100
+  channel_sampling_size: 1000
+  epochs: 200
+  subset_size: 1000
+lr: 0.001
+mode: debug
+weight_decay: 1.0e-07
+wireless_dict:
+  freq_hz: 28000000000.0
+  geo_pathloss_gain_db: 0.0
+  k_factor_d_db: 3.0
+  k_factor_h1_db: 13.0
+  k_factor_h2_db: 7.0
+  lambda_class: 0.25
+  pathloss_exp: 2.0
+  power: 1.0
+  use_channel_reg: false

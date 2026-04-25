@@ -2,6 +2,7 @@
 # 1. ARCHITECTURE (Aligned with Hao Ye FCN)
 # ==========================================
 
+from tkinter.constants import Y
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,7 +13,7 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader, Subset
-from teachers import MyTeacher
+from teachers import MyTeacher, noise
 from channels import generate_channel_tensors_by_type
 from datetime import datetime
 from pathlib import Path
@@ -56,36 +57,37 @@ def plot_distribution(y_real_complex, y_fake_complex,save_path):
 
 def generate_fake_real_samples(teacher_model, x):
     device = x.device
-    def normalize_complex_batch(y_complex, eps=1e-8):
-        power = y_complex.abs().pow(2).mean(dim=1, keepdim=True)
-        return y_complex / torch.sqrt(power.clamp_min(eps))
     B = x.size(0)
     with torch.no_grad():
         # 2. Real Path: Calculate H * s [cite: 264]
         s = teacher_model.encoder(x)
         #s = s[0].expand(B, s.shape[-1])
         if s.dim() == 3: s = s.squeeze(1)
-        Nr = teacher_model.n_r
-        Nt = teacher_model.n_t
-        Hr = torch.randn(B,Nr, Nt, device=device) / math.sqrt(2)
-        Hi = torch.randn(B, Nr, Nt, device=device) / math.sqrt(2)
-        H = torch.complex(Hr, Hi)
-        # Normalize for stability (optional, recommended)
-        H = H / math.sqrt(Nt)
-        H_d_batch = H # (B, Nr, Nt)
-        #channel_indices = torch.randint(0, teacher_model.H_d_all.size(0), (B,))
-        #H_d_batch = teacher_model.H_d_all[channel_indices].to(device)
+        # Nr = teacher_model.n_r
+        # Nt = teacher_model.n_t
+        # Hr = torch.randn(B,Nr, Nt, device=device) / math.sqrt(2)
+        # Hi = torch.randn(B, Nr, Nt, device=device) / math.sqrt(2)
+        # H = torch.complex(Hr, Hi)
+        # # Normalize for stability (optional, recommended)
+        # H = H / math.sqrt(Nt)
+        # H_d_batch = H # (B, Nr, Nt)
+        channel_indices = torch.randint(0, teacher_model.H_d_all.size(0), (B,))
+        H_d_batch = teacher_model.H_d_all[channel_indices].to(device)
         # Real complex signal: y = H @ s
         phase = torch.tensor(np.pi*1.25, device=H_d_batch.device, dtype=H_d_batch.real.dtype)
         y_real_complex = torch.bmm(H_d_batch, s.unsqueeze(-1)).squeeze(-1)
         #y_real_complex = normalize_complex_batch(y_real_complex)#*torch.exp(1j*phase) #TODO
+
+        y_real_complex = y_real_complex + noise(y_real_complex,teacher_model.target_snr_db)
 
         # 3. GAN Path: G(s, yp) [cite: 93, 231]
         s_flat = torch.view_as_real(s).reshape(B, -1)
         # Pilot conditioning: yp = H @ x_p [cite: 226, 327]
         x_p = torch.ones(B, teacher_model.n_t, 1, device=device, dtype=H_d_batch.dtype)
         yp = torch.bmm(H_d_batch, x_p).squeeze(-1)
+        yp = yp + noise(yp,teacher_model.target_snr_db)
         yp_flat = torch.view_as_real(yp).reshape(B, -1)
+
         z = torch.randn(s_flat.size(0), teacher_model.generator.latent_dim, device=s_flat.device)
         y_fake_flat = teacher_model.generator(s_flat, yp_flat,z)
         y_fake_complex = y_fake_flat.reshape(B, teacher_model.n_r, 2)
@@ -164,7 +166,6 @@ def plot_kl_history(kl_history, save_path="kl_divergence_plot.png", show_plot=Fa
 def train_gan_phase(
     teacher,
     train_loader,
-    H_d_all,
     device,
     epochs=100,
     lr_g=1e-3, #
@@ -201,9 +202,9 @@ def train_gan_phase(
     # BCE with internal Logits for stability
     criterion = nn.BCEWithLogitsLoss()
 
-    num_channels_pool = H_d_all.size(0)
-    Nr = H_d_all.shape[1]
-    Nt = H_d_all.shape[2]
+    # num_channels_pool = H_d_all.size(0)
+    # Nr = H_d_all.shape[1]
+    # Nt = H_d_all.shape[2]
     kl_history = []
     # Retained for API compatibility; chunked training below always uses
     # per-mini-batch G-then-D updates instead of epoch-level alternation.
@@ -249,17 +250,19 @@ def train_gan_phase(
                 real_labels = torch.ones(chunk_size, 1, device=device)
                 fake_labels = torch.zeros(chunk_size, 1, device=device)
 
-                y_real_complex, _, H_d_batch, s_flat = generate_fake_real_samples(teacher, images_chunk)
-                y_real_flat = torch.view_as_real(y_real_complex).reshape(chunk_size, -1)
+                _, _, y_wireless,y_gen, y_p, s_flat = teacher(images_chunk)
+                #y_real_complex, _, H_d_batch, s_flat = generate_fake_real_samples(teacher, images_chunk)
+                y_real_flat = torch.view_as_real(y_wireless).reshape(chunk_size, -1)
                 # p_signal = torch.mean(y_real_flat ** 2)
                 # sigma_sqr = p_signal / (10 ** (target_snr_db / 10.0))
                 # noise_std = torch.sqrt(sigma_sqr)
                 #y_real_flat = y_real_flat #+ torch.randn_like(y_real_flat) * noise_std
 
-                x_p = torch.ones(chunk_size, teacher.n_t, 1, device=device, dtype=torch.complex64)
-                y_p = torch.bmm(H_d_batch, x_p).squeeze(-1) # (B, Nr)
+                # x_p = torch.ones(chunk_size, teacher.n_t, 1, device=device, dtype=torch.complex64)
+                # y_p = torch.bmm(H_d_batch, x_p).squeeze(-1) # (B, Nr)
+                # y_p = y_p + noise(y_p,teacher.target_snr_db)
                 yp_flat = torch.view_as_real(y_p).reshape(chunk_size, -1)
-                #yp_flat = yp_flat #+ torch.randn_like(yp_flat) * noise_std
+                yp_flat = yp_flat #+ torch.randn_like(yp_flat) * noise_std
 
                 loss_D = torch.zeros(1, device=device).squeeze(0)
                 loss_G = torch.zeros(1, device=device).squeeze(0)
@@ -274,10 +277,9 @@ def train_gan_phase(
                     teacher.generator.train()
                     teacher.discriminator.eval()
                     optimizer_G.zero_grad()
-                    z = torch.randn(x_p.size(0), teacher.generator.latent_dim, device=x_p.device)
+                    z = torch.randn(y_p.size(0), teacher.generator.latent_dim, device=y_p.device)
                     y_fake_g = teacher.generator(s_flat, yp_flat, z)
 
-                    # Adversarial Loss: Fool D into saying 1 [cite: 217]
                     d_fake_for_g = teacher.discriminator(s_flat, yp_flat, y_fake_g)
                     loss_G = criterion(d_fake_for_g, real_labels)
 
@@ -296,7 +298,7 @@ def train_gan_phase(
                     teacher.discriminator.train()
 
                     with torch.no_grad():
-                        z = torch.randn(x_p.size(0), teacher.generator.latent_dim, device=x_p.device)
+                        z = torch.randn(y_p.size(0), teacher.generator.latent_dim, device=y_p.device)
                         y_fake_d = teacher.generator(s_flat, yp_flat, z)
 
                     optimizer_D.zero_grad()
@@ -324,7 +326,7 @@ def train_gan_phase(
 
                 with torch.no_grad():
                     if y_fake_metric is None:
-                        z = torch.randn(x_p.size(0), teacher.generator.latent_dim, device=x_p.device)
+                        z = torch.randn(y_p.size(0), teacher.generator.latent_dim, device=y_p.device)
                         y_fake_metric = teacher.generator(s_flat, yp_flat, z)
 
                     if d_real is None or d_fake is None:
@@ -363,17 +365,17 @@ def train_gan_phase(
         kl_history.append((epoch + 1, kl_val))
         print(f"Epoch {epoch+1} | KL Div: {kl_val:.4f}")
         teacher.generator.train()
-    #     if epoch % 10 == 0:
-    #         save_path = 'OTA_RIS/MY_code/simulations/kl/'
-    #         Path(save_path).mkdir(parents=True, exist_ok=True)
-    #         plot_distribution(y_real_complex,y_fake_complex, save_path=save_path+str(epoch)+'.png')
-    # plot_kl_history(kl_history, save_path=kl_plot_path, show_plot=show_kl_plot)
+        if epoch % 10 == 0 and epoch > 0:
+            save_path = 'OTA_RIS/MY_code/simulations/kl/'
+            Path(save_path).mkdir(parents=True, exist_ok=True)
+            plot_distribution(y_real_complex,y_fake_complex, save_path=save_path+str(epoch)+'.png')
+    plot_kl_history(kl_history, save_path=kl_plot_path, show_plot=show_kl_plot)
 
 if __name__ == "__main__":
     param_name = "target_snr_db"  #modify it for simulations
     mode = "debug"#args.mode
     lambda_class = 0.5#args.lambda_class
-    target_snr_db = 20.0
+    target_snr_db = 100.0
     wandb = False
     save = True
     use_channel_reg = True
@@ -383,7 +385,7 @@ if __name__ == "__main__":
     d_block_epochs = 10
     g_block_epochs = 100
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    train_gan = 0
+    train_gan = 1
 
 
     #################################################
@@ -395,18 +397,18 @@ if __name__ == "__main__":
         data_dict = dict(subset_size=60000, batchsize=256, channel_sampling_size=10000,
         epochs=200)
     elif mode == "debug":
-        data_dict = dict(subset_size=1000, batchsize=100, channel_sampling_size=10000,
-        epochs=100)
+        data_dict = dict(subset_size=2000, batchsize=250, channel_sampling_size=10000,
+        epochs=30)
     #################################################
     H_d_all, H_1_all, H_2_all = generate_channel_tensors_by_type(
-        channel_type="synthetic_rayleigh",
+        channel_type="geometric_ricean",
         N_t=N_t,
         N_r=N_r,
         N_m=N_m,
-        num_channels=data_dict["channel_sampling_size"],  # Multiple channels for cyclic sampling
+        num_channels=1000,  # Multiple channels for cyclic sampling
         device=device,
         freq_hz=wireless_dict["freq_hz"],
-        k_factor_d_db=wireless_dict["k_factor_d_db"],
+        k_factor_d_db=20.0,
         k_factor_h1_db=wireless_dict["k_factor_h1_db"],
         k_factor_h2_db=wireless_dict["k_factor_h2_db"],
         pathloss_exp=wireless_dict["pathloss_exp"],
@@ -419,15 +421,14 @@ if __name__ == "__main__":
     train_subset = Subset(train_dataset, indices)
     train_loader = DataLoader(train_subset, batch_size=data_dict["batchsize"], shuffle=True)
     #################################################
-    teacher = MyTeacher(n_t=N_t, n_r=N_r, n_m=N_m, power=wireless_dict["power"],
-                        target_snr_db=wireless_dict["target_snr_db"]).to(device)
-    model_path = "/home/mazya/OTA_RIS/MY_code/simulations/20260418_1519/teacher_debug_target_snr_db=0.0.pth"
+    teacher = MyTeacher(n_t=N_t, n_r=N_r, n_m=N_m,H_d_all=H_d_all, target_snr_db=target_snr_db).to(device)
+    model_path = "/home/mazya/OTA_RIS/MY_code/simulations/20260425_1346/teacher_debug_target_snr_db=0.0.pth" #20260418_1519
     checkpoint = torch.load(model_path, map_location=device)
     teacher.load_state_dict(checkpoint['teacher'])
     teacher.eval()
     #################################################
     if train_gan:
-        kl_history = train_gan_phase(teacher, train_loader, H_d_all, device,
+        kl_history = train_gan_phase(teacher, train_loader, device,
         epochs=data_dict["epochs"], lr_g=1e-3, lr_d=1e-4,
         target_snr_db=wireless_dict["target_snr_db"], lambda_cos=0.5, lambda_mse=1.0,
         freeze_generator=freeze_generator, freeze_discriminator=freeze_discriminator,
@@ -441,7 +442,7 @@ if __name__ == "__main__":
 
     if not train_gan:
         print("\n--- Running Final KL Divergence Verification ---")
-        final_kl_path = "final_mimicry_verification.png"
+        final_kl_path = "/home/mazya/OTA_RIS/MY_code/simulations/final_constellation_verification.png"
         # We pass the trained generator into the teacher for the forward check
         kl_visualization(
             teacher_model=teacher,
@@ -449,9 +450,4 @@ if __name__ == "__main__":
             num_samples=1000,
             device=device
         )
-        save_dir = Path("/home/mazya/OTA_RIS/MY_code/simulations")
-        save_dir.mkdir(parents=True, exist_ok=True)
-        if Path(final_kl_path).exists():
-            shutil.copy(final_kl_path, save_dir / "final_constellation_verification.png")
-
-        print(f"Final Verification Plot saved to: {save_dir / 'final_constellation_verification.png'}")
+        print(f"Final Verification Plot saved to: {final_kl_path}")
