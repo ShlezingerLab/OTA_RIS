@@ -43,3 +43,9 @@ Thumbs.db
 # Environment variables
 .env
 .env.local
+
+# JSON and YAML files
+*.json
+*.yaml
+*.yml
+*.jsonl
