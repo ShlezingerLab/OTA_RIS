@@ -1,0 +1,107 @@
+---
+description: Model architecture, key classes, and their relationships
+alwaysApply: true
+globs: **/*.py
+---
+
+# Architecture Reference
+
+## Current Focus
+
+The active teacher architecture focus is in `teacher.py`: MNIST data -> `HeavyEncoder` -> learned `linear` channel layer -> `HeavyRxDecoder`, then physical/metasurface testing via `test_demo.test_physical()` and `_optimize_phi_gd()` from `teacher_experiments.py`.
+
+Keep this rule centered on the ordinary teacher path. GAN classes also exist in `teacher.py`, but they are a separate channel-modeling path and should only be considered for GAN-specific tasks.
+
+## Key Files
+
+| File | Purpose |
+|---|---|
+| `teacher.py` | Current teacher focus: data-facing teacher model, encoder, learned linear channel, decoder, GAN helpers |
+| `teacher_train.py` | Teacher training functions, including `train_teacher_linear()` |
+| `test_demo.py` | Physical/metasurface testing against the learned linear teacher output |
+| `teacher_experiments.py` | Phase/metasurface optimization helpers, including `_optimize_phi_gd()` |
+| `teachers.py` | Older/alternate teacher model definitions |
+| `students.py` | Student model definitions |
+| `channels.py` | Channel generation (`generate_channel_tensors_by_type`) |
+| `training.py` | All training functions |
+| `CLI_interface.py` | CLI entry point for all training phases |
+| `flow.py` | High-level training orchestration |
+
+## Current Teacher Pipeline (`teacher.py`)
+
+`MyTeacher` is the current ordinary teacher model:
+
+- `MyTeacher(n_t, n_r, n_m, H_d_all, ...)`: receives `H_d_all` externally; channels are generated outside the model.
+- `HeavyEncoder`: maps MNIST images `(B, 1, H, W)` to a power-normalized complex transmit signal `s`.
+- `self.linear`: learned real-valued channel approximation `R^(2*Nt) -> R^(2*Nr)`.
+- `HeavyRxDecoder`: maps received complex signal `y` to class logits.
+
+Standard forward flow:
+
+```python
+s = teacher.encoder(images)                         # complex, (B, 1, Nt) or (B, Nt)
+s = s.squeeze(1) if s.dim() == 3 else s             # (B, Nt)
+s_flat = torch.view_as_real(s).reshape(B, -1)       # (B, 2*Nt)
+y_flat = teacher.linear(s_flat)                     # (B, 2*Nr)
+y = torch.view_as_complex(y_flat.reshape(B, Nr, 2).contiguous())
+logits = teacher.decoder(y)
+```
+
+`teacher.forward()` currently samples `H_d_batch` from `H_d_all`, but the ordinary forward path does not use `H_d_batch` in the learned linear layer path.
+
+## Data And Channel Pools
+
+Data and channels are created outside the model:
+
+- MNIST data is loaded through torchvision datasets and dataloaders.
+- `generate_channel_tensors_by_type()` returns `H_d_all`, `H_1_all`, and `H_2_all`.
+- `H_d_all` is passed into `MyTeacher` and stored as `teacher.H_d_all`.
+- `H_1_all` and `H_2_all` are used during physical/metasurface tests.
+
+Current shape conventions in the active test code:
+
+- `H_d_all`: direct TX-to-RX channel pool, sampled as `(B, Nr, Nt)`.
+- `H_1_all`: TX-to-metasurface/RIS channel pool, sampled in `test_physical()` and used as `(B, Nm, Nt)` for `torch.bmm(H_1_batch, s.unsqueeze(-1))`.
+- `H_2_all`: metasurface/RIS-to-RX channel pool, sampled in `test_physical()` and used as `(B, Nr, Nm)`.
+
+## Complex Tensor Convention
+
+PyTorch's `nn.Linear` operates on real tensors. Always convert:
+```python
+s_real = torch.view_as_real(s)      # complex -> real
+s_flat = s_real.reshape(B, 2*Nt)    # flatten: [Re, Im interleaved]
+# ... linear layer ...
+y = torch.view_as_complex(y_flat.reshape(B, Nr, 2))  # real -> complex
+```
+
+The encoder produces complex tensors, the learned linear layer operates on real flattened `[real, imag]` representation, and the decoder receives complex `y`.
+
+## Metasurface Physical Test
+
+`test_demo.test_physical()` compares two paths:
+
+1. Learned/synthetic path: `teacher(images)` uses encoder -> linear -> decoder.
+2. Physical/metasurface path:
+   - Encode image to `s`.
+   - Build `y_learned` from `teacher.linear(s_flat)`.
+   - Optimize `phi` with `_optimize_phi_gd(teacher, s, y_learned, H_1_batch, H_2_batch, iters=100)`.
+   - Compute `y_ris = H_2 @ diag(phi) @ H_1 @ s`.
+   - Add AWGN via `noise(y_ris, target_snr_db)`.
+   - Decode with `teacher.decoder(y_ris)`.
+
+`_optimize_phi_gd()` is iterative gradient descent over `theta`, with `phi = exp(1j * theta)`. Its objective aligns `y_ris` with `y_learned` using cosine similarity in real flattened complex space.
+
+## Feature Extraction for Distillation
+
+```python
+features, logits = teacher.extract_features(images, preReLU=True)
+# Returns 8 features: 5 encoder + 1 linear layer + 2 decoder
+```
+
+The linear-layer feature is `y_flat`; it is the key intermediate representation when later aligning controller/metasurface behavior to the learned teacher channel.
+
+## Important Boundaries
+
+- Do not assume `get_channel_matching_loss()` is part of the active `teacher.py` ordinary forward path. Related helpers live in `teacher_experiments.py` and may require explicit binding/import decisions before use.
+- Do not describe the current metasurface focus as closed-form phase optimization. The active physical test uses `_optimize_phi_gd()`.
+- Do not mix the GAN path (`ChannelGenerator`, `ChannelDiscriminator`, `HeavyRxDecoder_gan`, `forward_gan`) into ordinary teacher explanations unless the task explicitly mentions GAN training or GAN channel simulation.

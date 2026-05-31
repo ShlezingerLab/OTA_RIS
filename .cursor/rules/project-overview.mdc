@@ -1,0 +1,32 @@
+---
+description: High-level overview of the OTA-RIS project
+alwaysApply: true
+---
+
+# OTA-RIS Project Overview
+
+This project implements an **Over-the-Air (OTA) communication system with a Reconfigurable Intelligent Surface (RIS)** for MNIST image classification. The neural network learns to transmit images wirelessly over a simulated physical channel, using a teacher–student knowledge distillation framework.
+
+## Core Concept
+
+- Images are encoded into complex wireless signals, transmitted through a simulated RIS channel, then decoded and classified.
+- A **teacher model** (pre-trained, high-accuracy) guides training of a lightweight **student model** through feature distillation.
+- The RIS (Reconfigurable Intelligent Surface) optimizes phase shifts to improve the wireless channel.
+
+## Key Domain Terms
+
+- **RIS**: Reconfigurable Intelligent Surface — a passive array of elements with programmable phase shifts that shape the wireless channel
+- **OTA**: Over-The-Air — information is transmitted as wireless signals, not symbolic data
+- **Distillation**: Student learns by mimicking intermediate features of the frozen teacher
+- **CSI**: Channel State Information — the measured channel matrices H_d, H_1, H_2
+- **AWGN**: Additive White Gaussian Noise
+- **SIM**: Stacked Intelligent Metasurface (multi-layer RIS variant)
+
+## Project Entry Points
+
+- `CLI_interface.py` — main CLI for running training phases
+- `training.py` — all training logic
+- `teacher.py` / `teachers.py` — teacher model definitions
+- `students.py` — student model definitions
+- `channels.py` — channel generation and simulation
+- `flow.py` — high-level training flow orchestration

@@ -1,0 +1,54 @@
+# Generated Python files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*$py.class
+
+# Local environments and caches
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+cache/
+.ipynb_checkpoints/
+
+# Experiment tracking and logs
+wandb/
+logs/
+log/
+*.log
+
+# Data and generated experiment outputs
+data/
+simulations/
+plots/
+plots_for_meeting/
+outputs/
+results/
+runs/
+artifacts/
+
+# Model checkpoints and serialized artifacts
+checkpoints/
+checkpoint/
+checkpoint_*/
+*_checkpoint/
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.pkl
+*.pickle
+models_dict/
+
+# Build and OS noise
+build/
+dist/
+*.egg-info/
+.DS_Store
+Thumbs.db

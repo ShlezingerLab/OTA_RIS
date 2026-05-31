@@ -198,6 +198,39 @@ class HeavyRxDecoder(nn.Module):
         self.num_classes = int(num_classes)
         self.hidden_dim = int(hidden_dim)
 
+        self.fc1 = nn.Linear(2 * self.n_r, self.hidden_dim * 2)
+        self.ln1 = nn.LayerNorm(self.hidden_dim * 2)
+        self.fc2 = nn.Linear(self.hidden_dim * 2, self.hidden_dim)
+        self.ln2 = nn.LayerNorm(self.hidden_dim)
+        self.fc3 = nn.Linear(self.hidden_dim, self.hidden_dim // 2)
+        self.ln3 = nn.LayerNorm(self.hidden_dim // 2)
+        self.fc_out = nn.Linear(self.hidden_dim // 2, self.num_classes)
+
+    def forward(self, y: torch.Tensor) -> torch.Tensor:
+        y_ri = torch.cat([y.real, y.imag], dim=1)
+        x1 = F.leaky_relu(self.ln1(self.fc1(y_ri)), 0.2)
+        x2 = F.leaky_relu(self.ln2(self.fc2(x1)), 0.2)
+        x3 = F.leaky_relu(self.ln3(self.fc3(x2)), 0.2)
+        return self.fc_out(x3)
+
+    def extract_features(self, y: torch.Tensor):
+        y_ri = torch.cat([y.real, y.imag], dim=1)
+        x1 = F.leaky_relu(self.ln1(self.fc1(y_ri)), 0.2)
+        x2 = F.leaky_relu(self.ln2(self.fc2(x1)), 0.2)
+        x3 = F.leaky_relu(self.ln3(self.fc3(x2)), 0.2)
+        logits = self.fc_out(x3)
+        return [x2, x3], logits
+
+class HeavyRxDecoder_gan(nn.Module):
+    """
+    Heavy decoder: received complex signal -> logits.
+    """
+    def __init__(self, n_r: int, num_classes: int = 10, hidden_dim: int = 256):
+        super().__init__()
+        self.n_r = int(n_r)
+        self.num_classes = int(num_classes)
+        self.hidden_dim = int(hidden_dim)
+
         self.fc1 = nn.Linear(4 * self.n_r, self.hidden_dim * 2)
         self.ln1 = nn.LayerNorm(self.hidden_dim * 2)
         self.fc2 = nn.Linear(self.hidden_dim * 2, self.hidden_dim)
@@ -262,7 +295,7 @@ class MyTeacher(nn.Module):
         self.generator = ChannelGenerator(n_t=self.n_t, n_r=self.n_r)
         self.discriminator = ChannelDiscriminator(n_t=self.n_t, n_r=self.n_r)
         self.decoder = HeavyRxDecoder(n_r=self.n_r, num_classes=self.num_classes, hidden_dim=decoder_hidden)
-
+        self.decoder_gan = HeavyRxDecoder_gan(n_r=self.n_r, num_classes=self.num_classes, hidden_dim=decoder_hidden)
         self.register_buffer('current_target_p', torch.tensor(1.0))
         self.register_buffer('H_d', H_d_all[0])
         self.gan_checkpoint_path = gan_checkpoint_path
@@ -321,12 +354,38 @@ class MyTeacher(nn.Module):
         s = self.encoder(x)  # (B, 1, Nt) or (B, Nt) complex
         if s.dim() == 3:
             s = s.squeeze(1)
+        s_real = torch.view_as_real(s)  # (B, Nt, 2)
+        s_flat = s_real.reshape(s.size(0), -1)  # (B, 2*Nt)
+        y_flat_nn = self.linear(s_flat)  # (B, 2*Nr)
+        y_complex = y_flat_nn.reshape(y_flat_nn.size(0), self.n_r, 2)  # (B, Nr, 2)
+        y_complex = torch.view_as_complex(y_complex.contiguous())  # (B, Nr) complex
+        logits = self.decoder(y_complex)
+        return logits
 
-        # s_real = torch.view_as_real(s)  # (B, Nt, 2)
-        # s_flat = s_real.reshape(s.size(0), -1)  # (B, 2*Nt)
-        # y_flat_nn = self.linear(s_flat)  # (B, 2*Nr)
-        # y_complex = y_flat_nn.reshape(y_flat_nn.size(0), self.n_r, 2)  # (B, Nr, 2)
-        # y_complex = torch.view_as_complex(y_complex.contiguous())  # (B, Nr) complex
+    def forward_gan(self, x: torch.Tensor, return_intermediates: bool = False) -> torch.Tensor:
+        # teacher forward
+        """
+        Args:
+            x: (B, 1, H, W) input images
+            return_intermediates: if True, also cache s and y for regularization
+        Returns:
+            logits: (B, num_classes)
+        """
+        B = x.size(0)
+        channel_indices = torch.randint(0, self.H_d_all.size(0), (B,))
+        H_d_batch = self.H_d_all[channel_indices].to(x.device)
+        # Nr = self.n_r
+        # Nt = self.n_t
+        # Hr = torch.randn(B,Nr, Nt, device=device) / math.sqrt(2)
+        # Hi = torch.randn(B, Nr, Nt, device=device) / math.sqrt(2)
+        # H = torch.complex(Hr, Hi)
+        # H = H / math.sqrt(Nt)
+        # H_d_batch = H # (B, Nr, Nt)
+        #H_d_batch = H_d_batch[0].expand(B, -1, -1)
+        # Encoder: image -> complex signal
+        s = self.encoder(x)  # (B, 1, Nt) or (B, Nt) complex
+        if s.dim() == 3:
+            s = s.squeeze(1)
 
         y_wireless = torch.bmm(H_d_batch, s.unsqueeze(-1)).squeeze(-1)
         y_wireless = y_wireless + noise(y_wireless,self.target_snr_db)
@@ -355,8 +414,8 @@ class MyTeacher(nn.Module):
         #     self._cached_s = s
         #     self._cached_y = y_complex
         #     self._cached_y_channel = y_complex #TODO it was the y without noise (y_clean)
-        logits_wireless = self.decoder(y_wireless, yp)
-        logits = self.decoder(y_complex_gen, yp)  # (B, num_classes)
+        logits_wireless = self.decoder_gan(y_wireless, yp)
+        logits = self.decoder_gan(y_complex_gen, yp)  # (B, num_classes)
         return logits, logits_wireless, y_wireless,y_complex_gen, yp ,s_flat # H_d_batch, s
 
     def extract_features(self, x: torch.Tensor, preReLU: bool = True):
@@ -531,7 +590,7 @@ if __name__ == "__main__":
     if mode == "full":
         data_dict = dict(subset_size=60000, batchsize=256, channel_sampling_size=10000, epochs=200)  #args.num_channels_sample  #None = use all channels
     elif mode == "debug":
-        data_dict = dict(subset_size=2000, batchsize=500, channel_sampling_size=10000, epochs=100)
+        data_dict = dict(subset_size=1000, batchsize=100, channel_sampling_size=10000, epochs=20)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     #################################################
     H_d_all, H_1_all, H_2_all = generate_channel_tensors_by_type(
@@ -607,10 +666,12 @@ if __name__ == "__main__":
     root_path = os.path.join(script_dir, "simulations", f"{timestamp}")
     save_path = root_path + f"/teacher_{teacher_suffix}.pth"
     #################################################
-    phases_list = ["encoder", "gan", "visualize gan", "decoder",'test']
-    initial = False
-    if initial:
-        train_teacher_coder(teacher, phase="encoder", train_loader=train_loader, device=device, epochs=1, lr=lr, weight_decay=weight_decay,
+    timestamp = "20260527_1543"
+    model_path = f"/home/mazya/OTA_RIS/simulations/{timestamp}/teacher_debug_target_snr_db=0.0.pth" #20260418_1519
+    phase = "test"
+    #################################################
+    if phase == "train":
+        train_teacher_linear(teacher, train_loader=train_loader, device=device, epochs=10, lr=lr, weight_decay=weight_decay,
                         use_channel_reg=use_channel_reg,
                         H_d_channel=H_d_all,
                         H_1_channel=H_1_all,
@@ -620,86 +681,47 @@ if __name__ == "__main__":
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             torch.save({'teacher': teacher.state_dict()}, save_path)
             print(f"Model saved to: {save_path}")
-        exit(0)
-    timestamp = "20260510_1154"
-    model_path = f"/home/mazya/OTA_RIS/simulations/{timestamp}/teacher_debug_target_snr_db=0.0.pth" #20260418_1519
-    #################################################
-    for j in range(1):
-        for i in range(1):#(len(phases_list)):
-            phase = "visualize gan"#phases_list[i] #PHASE SELECTION
-            checkpoint = torch.load(model_path, map_location=device)
-            teacher.load_state_dict(checkpoint['teacher'])
-            teacher.eval()
-            if phase == "encoder":
-                # train_teacher_initial(teacher, train_loader, device, data_dict["epochs"], lr, weight_decay,
-                #             use_channel_reg=use_channel_reg,
-                #             lambda_class=lambda_class,
-                #             save_path=save_path,
-                #             wandb_run=run)
-                train_teacher_coder(teacher, phase="encoder", train_loader=train_loader, device=device, epochs=data_dict["epochs"], lr=lr, weight_decay=weight_decay,
-                        use_channel_reg=use_channel_reg,
-                        H_d_channel=H_d_all,
-                        H_1_channel=H_1_all,
-                        H_2_channel=H_2_all,
-                        lambda_class=lambda_class)
-                if save:
-                    torch.save({'teacher': teacher.state_dict()}, model_path)
-                    print(f"Model saved to: {model_path}")
 
-            elif phase == "gan":
-                freeze_generator = False
-                freeze_discriminator = False
-                alternating_blocks = True
-                d_block_epochs = 10
-                g_block_epochs = 100
-                mini_batch_size = 20
-                kl_history = train_gan_phase(teacher, train_loader, device,
-                epochs=data_dict["epochs"], lr_g=1e-3, lr_d=1e-4,
-                target_snr_db=wireless_dict["target_snr_db"], lambda_cos=0.5, lambda_mse=1.0,
-                freeze_generator=freeze_generator, freeze_discriminator=freeze_discriminator,
-                alternating_blocks=alternating_blocks, d_block_epochs=d_block_epochs,
-                g_block_epochs=g_block_epochs, mini_batch_size=mini_batch_size)
-                if save:
-                    checkpoint['teacher'] = teacher.state_dict()
-                    torch.save(checkpoint, model_path)
-                    print(f"Teacher weights saved to checkpoint['teacher']: {model_path}")
-            elif phase == "visualize gan":
-                final_kl_path = "/home/mazya/OTA_RIS/plots/gan/constellation_verification.png"
-                # We pass the trained generator into the teacher for the forward check
-                visualization(
-                    teacher_model=teacher,
-                    save_path=final_kl_path,
-                    num_samples=1000,
-                    device=device
-                )
-                print(f"Final Verification Plot saved to: {final_kl_path}")
-            elif phase == "decoder":
-                train_teacher_coder(teacher, phase="decoder", train_loader=train_loader, device=device, epochs=20, lr=lr, weight_decay=weight_decay,
-                        use_channel_reg=use_channel_reg,
-                        H_d_channel=H_d_all,
-                        H_1_channel=H_1_all,
-                        H_2_channel=H_2_all,
-                        lambda_class=lambda_class)
-                if save:
-                    torch.save({'teacher': teacher.state_dict()}, model_path)
-                    print(f"Model saved to: {model_path}")
-
-            elif phase == "test":
-                H_d_all, H_1_all, H_2_all = generate_channel_tensors_by_type(
-                channel_type="geometric_ricean",
-                N_t=N_t,
-                N_r=N_r,
-                N_m=N_m,
-                num_channels=1000,  # Multiple channels for cyclic sampling
-                device=device,
-                freq_hz=wireless_dict["freq_hz"],
-                k_factor_d_db=20.0,
-                k_factor_h1_db=wireless_dict["k_factor_h1_db"],
-                k_factor_h2_db=wireless_dict["k_factor_h2_db"],
-                pathloss_exp=wireless_dict["pathloss_exp"],
-                geo_pathloss_gain_db=wireless_dict["geo_pathloss_gain_db"], #TODO-during it test we need it to be 60! resolve this
-            )
-                plot_path = "/home/mazya/OTA_RIS/plots/gan/test_kl.png"
-                accuracy, accuracy_learned = test_physical_channel(teacher,device=device, SNR=30.0, H_d_all=H_d_all, plot_path=plot_path)
-                print(f"Accuracy physical: {accuracy}")
-                print(f"Accuracy Learned: {accuracy_learned}")
+    elif phase == "test":
+        checkpoint = torch.load(model_path, map_location=device)
+        teacher.load_state_dict(checkpoint['teacher'])
+        teacher.eval()
+        H_d_all, H_1_all, H_2_all = generate_channel_tensors_by_type(
+        channel_type="geometric_ricean",
+        N_t=N_t,
+        N_r=N_r,
+        N_m=N_m,
+        num_channels=1000,  # Multiple channels for cyclic sampling
+        device=device,
+        freq_hz=wireless_dict["freq_hz"],
+        k_factor_d_db=7.0,
+        k_factor_h1_db=wireless_dict["k_factor_h1_db"],
+        k_factor_h2_db=wireless_dict["k_factor_h2_db"],
+        pathloss_exp=wireless_dict["pathloss_exp"],
+        geo_pathloss_gain_db=wireless_dict["geo_pathloss_gain_db"], #TODO-during it test we need it to be 60! resolve this
+    )
+        # accuracy, accuracy_learned = test_physical(teacher, device=device, SNR=10.0,  H_1_all=H_1_all, H_2_all=H_2_all)
+        # print(f"Accuracy physical: {accuracy}")
+        # print(f"Accuracy Learned: {accuracy_learned}")
+        INPUT_classes = [0.0, 5.0, 10.0, 15.0, 20.0]
+        # param_name = "target_snr_db"
+        # timestamp, mode = "20260330_1019", "debug"
+        #=========================================================
+        accuracies = []
+        accuracies_learned = []
+        for input in INPUT_classes:
+            accuracy, accuracy_learned = test_physical(teacher, device=device, SNR=input,  H_1_all=H_1_all, H_2_all=H_2_all)
+            accuracies.append(accuracy)
+            accuracies_learned.append(accuracy_learned)
+        plt.figure(figsize=(10, 6))
+        plt.plot(INPUT_classes, accuracies_learned, marker='o', linewidth=2, markersize=8, label='Synthetic Test')
+        plt.plot(INPUT_classes, accuracies, marker='o', linewidth=2, markersize=8, label='Physical Test')
+        plt.legend(fontsize=12)
+        plt.xlabel(f'{param_name}', fontsize=12)
+        plt.ylabel('Accuracy', fontsize=12)
+        plt.grid(True, alpha=0.3)
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        plot_path = os.path.join(script_dir, "plots", "test_demo.png")
+        os.makedirs(os.path.dirname(plot_path), exist_ok=True)
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        print(f"\nPlot saved to: {plot_path}")

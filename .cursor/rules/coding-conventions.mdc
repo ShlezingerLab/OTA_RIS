@@ -1,0 +1,57 @@
+---
+description: Coding conventions and patterns used in this project
+alwaysApply: true
+globs: **/*.py
+---
+
+# Coding Conventions
+
+## Simplicity First
+
+- Keep the code as simple as possible. Prefer direct, readable implementations over clever abstractions.
+- When investigating new directions, prefer creating separate classes, scripts, or experiment files instead of deeply integrating the idea into the main code path immediately.
+- Many exploratory ideas will not be used in the bottom line, so keep experiments easy to remove or ignore.
+- Add abstractions only after a pattern proves useful and repeated. In general, the simpler solution is better.
+
+## PyTorch Patterns
+
+- Use `torch.view_as_real` / `torch.view_as_complex` for complex↔real conversion, not manual splitting
+- Register fixed tensors (e.g. channel realizations) as buffers: `self.register_buffer('H_d', ...)`
+- Use `bmm` for batched matrix multiplication on GPU
+- Power normalization: `s = s / s.norm(dim=-1, keepdim=True) * sqrt(power)`
+
+## Naming Conventions
+
+| Symbol | Meaning |
+|---|---|
+| `n_t` / `Nt` | Number of transmit antennas |
+| `n_r` / `Nr` | Number of receive antennas |
+| `n_m` / `Nm` | Number of RIS elements |
+| `s` | Transmit signal (complex) |
+| `y` | Received signal (complex) |
+| `H_d`, `H_1`, `H_2` | Channel matrices |
+| `phi` / `theta` | RIS phase shifts |
+| `B` | Batch size |
+
+## Model Checkpointing
+
+- Save checkpoints with meaningful names including phase and epoch
+- Use `wandb` for all experiment logging — always log both task loss and auxiliary losses separately
+
+## Training Functions
+
+- All training logic lives in `training.py`
+- Training functions follow the pattern: `train_<component>(model, dataloader, optimizer, ...)`
+- Always support `num_channels_sample` parameter for channel sampling efficiency
+
+## Error Checking
+
+- Check for NaN in channel matching loss (division by zero in normalization)
+- Verify `|phi_i| = 1` (unit modulus constraint) after phase optimization
+- Verify power constraint: `||s||² ≈ power` after encoder
+
+## HPC / Cluster
+
+- This project runs on BGU SLURM cluster
+- See `.cursor/docs/references/BGU_HPC_Cluster_User_Guide_Summary.md` for job submission details
+- Use `wandb` offline mode when running on cluster nodes without internet

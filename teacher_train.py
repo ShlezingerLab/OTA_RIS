@@ -12,7 +12,7 @@ import torch.optim as optim
 from tqdm import tqdm
 from gan import *
 
-def train_teacher_initial(teacher, train_loader, device, epochs, lr, weight_decay, lambda_l2=0.0, use_channel_reg=False,
+def train_teacher_linear(teacher, train_loader, device, epochs, lr, weight_decay, lambda_l2=0.0, use_channel_reg=False,
 H_d_channel=None, H_1_channel=None, H_2_channel=None, lambda_class=0.0 , save_path=None, wandb_run=None):
     """
     Train teacher model with optional regularization.
@@ -53,7 +53,125 @@ H_d_channel=None, H_1_channel=None, H_2_channel=None, lambda_class=0.0 , save_pa
         for images, labels in pbar:
             images = images.to(device)
             labels = labels.to(device)
-            logits, _, _, _, _,_ = teacher(images, return_intermediates=True)
+            logits = teacher(images, return_intermediates=True)
+            loss_ce = criterion(logits, labels)
+            if use_channel_reg:
+                loss_channel = teacher.get_channel_matching_loss(
+                    H_d_channel,
+                    H_1_channel,
+                    H_2_channel,
+                    num_channels_sample=num_channels,
+                )
+                loss = lambda_class*loss_ce + loss_channel
+            else:
+                loss = loss_ce
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+            running_ce_loss += loss_ce.item()
+            running_channel_loss += loss_channel.item() if use_channel_reg else 0.0
+            _, predicted = torch.max(logits.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+            if use_channel_reg:
+                channel_cursor = (channel_cursor + labels.size(0)) % num_channels
+
+            postfix = {
+                'loss': f"{loss.item():.4f}",
+                'acc': f"{100 * correct / total:.2f}%"
+            }
+            postfix['ch'] = f"{loss_channel.item():.4f}" if use_channel_reg else "0.0000"
+            pbar.set_postfix(postfix)
+
+            # Log batch metrics to wandb
+            if wandb_run is not None:
+                wandb_run.log({
+                    "batch/loss": loss.item(),
+                    "batch/ce_loss": loss_ce.item(),
+                    "batch/channel_loss": loss_channel.item(),
+                    "batch/accuracy": 100 * correct / total
+                })
+
+        epoch_loss = running_loss / len(train_loader)
+        epoch_ce_loss = running_ce_loss / len(train_loader)
+        epoch_l2_loss = running_l2_loss / len(train_loader)
+        epoch_channel_loss = running_channel_loss / len(train_loader)
+        epoch_accuracy = 100 * correct / total
+
+        loss_str = f"Loss: {epoch_loss:.4f} (CE: {epoch_ce_loss:.4f}"
+        if use_l2_reg:
+            loss_str += f", L2: {epoch_l2_loss:.4f}"
+        loss_str += f", Channel: {epoch_channel_loss:.4f}" if use_channel_reg else ""
+        loss_str += ")"
+        print(f"Epoch {epoch+1}/{epochs} | {loss_str} | Acc: {epoch_accuracy:.2f}%")
+
+        # Log epoch metrics to wandb
+        if wandb_run is not None:
+            epoch_metrics = {
+                "epoch": epoch + 1,
+                "epoch/loss": epoch_loss,
+                "epoch/ce_loss": epoch_ce_loss,
+                "epoch/accuracy": epoch_accuracy
+            }
+            if use_l2_reg:
+                epoch_metrics["epoch/l2_loss"] = epoch_l2_loss
+            epoch_metrics["epoch/channel_loss"] = epoch_channel_loss
+            wandb_run.log(epoch_metrics)
+
+    print("\nTraining finished!")
+
+    # Save the model if save_path is provided
+    if save_path:
+        import os
+        save_dir = os.path.dirname(save_path)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+        torch.save({'teacher': teacher.state_dict()}, save_path)
+        print(f"Model saved to: {save_path}")
+
+def train_teacher_initial_gan(teacher, train_loader, device, epochs, lr, weight_decay, lambda_l2=0.0, use_channel_reg=False,
+H_d_channel=None, H_1_channel=None, H_2_channel=None, lambda_class=0.0 , save_path=None, wandb_run=None):
+    """
+    Train teacher model with optional regularization.
+
+    Args:
+        teacher: Model to train
+        train_loader: DataLoader for training data
+        device: Device to train on
+        epochs: Number of training epochs
+        lr: Learning rate
+        weight_decay: Weight decay for optimizer
+        lambda_l2: Weight for L2 regularization on linear layer weights
+        H_d_channel: Direct channel matrix tensor (num_channels, Nr, Nt) complex for cyclic sampling
+        H_1_channel: TX to RIS channel matrix tensor (num_channels, Nt, Nm) complex for cyclic sampling
+        H_2_channel: RIS to RX channel matrix tensor (num_channels, Nm, Nr) complex for cyclic sampling
+        lambda_channel: Weight for RIS channel matching loss ||(H₁ΦH₂ + H_d)s - y||²
+        save_path: Path to save the trained model (optional)
+        wandb_run: wandb run object for logging (optional)
+    """
+    optimizer = optim.Adam(teacher.parameters(), lr=lr, weight_decay=weight_decay)
+    criterion = nn.CrossEntropyLoss()
+
+    use_l2_reg = lambda_l2 > 0 and hasattr(teacher, 'get_l2_regularization')
+    num_channels = teacher.H_d_all.size(0)
+    channel_cursor = 0
+
+
+    for epoch in range(epochs):
+        teacher.train()
+        running_loss = 0.0
+        running_ce_loss = 0.0
+        running_l2_loss = 0.0
+        running_channel_loss = 0.0
+        correct = 0
+        total = 0
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
+
+        for images, labels in pbar:
+            images = images.to(device)
+            labels = labels.to(device)
+            logits, _, _, _, _,_ = teacher.forward_gan(images, return_intermediates=True)
             loss_ce = criterion(logits, labels)
             if use_channel_reg:
                 loss_channel = teacher.get_channel_matching_loss(
@@ -149,7 +267,7 @@ def train_gan_phase(
     kl_monitor_interval=1000,
     kl_num_samples=500,
     kl_k=5,
-    plot_path="/home/mazya/OTA_RIS/plots/gan",
+    plot_path=None,
 ):
     """
     Phase 2: Train GAN to mimic H_d with pilot-aided conditioning. [cite: 92, 285]
@@ -216,7 +334,7 @@ def train_gan_phase(
                 real_labels = torch.ones(chunk_size, 1, device=device)
                 fake_labels = torch.zeros(chunk_size, 1, device=device)
 
-                _, _, y_wireless,y_gen, y_p, s_flat = teacher(images_chunk)
+                _, _, y_wireless,y_gen, y_p, s_flat = teacher.forward_gan(images_chunk)
                 #y_real_complex, _, H_d_batch, s_flat = generate_fake_real_samples(teacher, images_chunk)
                 y_real_flat = torch.view_as_real(y_wireless).reshape(chunk_size, -1)
                 # p_signal = torch.mean(y_real_flat ** 2)
@@ -332,9 +450,15 @@ def train_gan_phase(
         print(f"Epoch {epoch+1} | KL Div: {kl_val:.4f}")
         teacher.generator.train()
         if epoch % 10 == 0 and epoch > 0:
-            Path(plot_path + '/per_epoch').mkdir(parents=True, exist_ok=True)
-            plot_distribution(y_real_complex,y_fake_complex, save_path=plot_path+'/per_epoch/'+str(epoch)+'.png')
-    plot_kl_history(kl_history, save_path=plot_path+'/kl_graph.png')
+            if plot_path:
+                Path(plot_path + '/per_epoch').mkdir(parents=True, exist_ok=True)
+                plot_distribution(y_real_complex,y_fake_complex, save_path=plot_path+'/per_epoch/'+str(epoch)+'.png')
+            else:
+                pass
+    if plot_path:
+        plot_kl_history(kl_history, save_path=plot_path+'/kl_graph.png')
+    else:
+        pass
 
 def train_teacher_coder(teacher,phase, train_loader, device, epochs, lr, weight_decay, lambda_l2=0.0, use_channel_reg=False,
 H_d_channel=None, H_1_channel=None, H_2_channel=None, lambda_class=0.0 , wandb_run=None):
@@ -370,22 +494,22 @@ H_d_channel=None, H_1_channel=None, H_2_channel=None, lambda_class=0.0 , wandb_r
 
     for epoch in range(epochs):
         if phase == "decoder":
-            teacher.decoder.requires_grad_(True)
-            optimizer = optim.Adam(teacher.decoder.parameters(), lr=lr, weight_decay=weight_decay)
+            teacher.decoder_gan.requires_grad_(True)
+            optimizer = optim.Adam(teacher.decoder_gan.parameters(), lr=lr, weight_decay=weight_decay)
             teacher.encoder.eval()
-            teacher.decoder.train()
+            teacher.decoder_gan.train()
         elif phase == "encoder":
             teacher.encoder.requires_grad_(True)
             optimizer = optim.Adam(teacher.encoder.parameters(), lr=lr, weight_decay=weight_decay)
-            teacher.decoder.eval()
+            teacher.decoder_gan.eval()
             teacher.encoder.train()
         else: #Both
-            teacher.decoder.requires_grad_(True)
+            teacher.decoder_gan.requires_grad_(True)
             teacher.encoder.requires_grad_(True)
-            teacher.decoder.train()
+            teacher.decoder_gan.train()
             teacher.encoder.train()
             optimizer = optim.Adam(
-            list(teacher.decoder.parameters()) + list(teacher.encoder.parameters()),
+            list(teacher.decoder_gan.parameters()) + list(teacher.encoder.parameters()),
             lr=lr,weight_decay=weight_decay)
         teacher.generator.eval()
         teacher.discriminator.eval()
@@ -400,9 +524,9 @@ H_d_channel=None, H_1_channel=None, H_2_channel=None, lambda_class=0.0 , wandb_r
         for images, labels in pbar:
             images = images.to(device)
             labels = labels.to(device)
-            logits, logits_wireless, _, _, _, _ = teacher(images, return_intermediates=True)
+            logits, logits_wireless, _, _, _, _ = teacher.forward_gan(images, return_intermediates=True)
             if phase == "decoder":
-                loss_ce = criterion(logits, labels)#criterion(logits_wireless, labels) TODO
+                loss_ce = criterion(logits, labels) # TODO
             else:
                 loss_ce = criterion(logits, labels)
             if use_channel_reg:

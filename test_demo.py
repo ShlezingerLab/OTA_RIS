@@ -9,13 +9,13 @@ import torch.nn as nn
 # Import your model class and channel generator
 from channels import generate_channel_tensors_by_type
 import matplotlib.pyplot as plt
-from gan import *
+from gan.gan import *
 
 def normalize_complex_batch(y_complex, eps=1e-8):
         power = y_complex.abs().pow(2).mean(dim=1, keepdim=True)
         return y_complex / torch.sqrt(power.clamp_min(eps))
 
-def test_physical_channel(teacher, device, SNR, H_d_all, plot_path):
+def test_physical_channel_gan(teacher, device, SNR, H_d_all, plot_path):
     transform = transforms.Compose([transforms.ToTensor()])
     test_dataset = datasets.MNIST(root="./data", train=False, transform=transform, download=True)
     test_loader = DataLoader(test_dataset, batch_size=500, shuffle=False)
@@ -103,18 +103,76 @@ def test_physical_channel(teacher, device, SNR, H_d_all, plot_path):
             #     self._cached_y = y_complex
             #     self._cached_y_channel = y_complex #TODO it was the y without noise (y_clean)
 
-            logits_wireless = teacher.decoder(y_wireless, yp)
-            logits= teacher.decoder(y_complex_gen, yp)  # (B, num_classes)
+            logits_wireless = teacher.decoder_gan(y_wireless, yp)
+            logits= teacher.decoder_gan(y_complex_gen, yp)  # (B, num_classes)
 
             _, predicted_learned = torch.max(logits.data, 1)
             _, predicted = torch.max(logits_wireless.data, 1)
             total += labels.size(0)
             correct_learned += (predicted_learned == labels).sum().item()
             correct += (predicted == labels).sum().item()
-            plot_distribution(normalize_complex_batch(y_wireless), normalize_complex_batch(y_complex_gen), plot_path)
+            if plot_path:
+                plot_distribution(normalize_complex_batch(y_wireless), normalize_complex_batch(y_complex_gen), plot_path+'/test_kl.png')
+            else:
+                pass
 
     return correct / total, correct_learned / total
     #print(f"Physical Test Accuracy: {100 * correct / total:.2f}%")
+
+
+def test_physical(teacher, device, SNR , H_1_all, H_2_all):
+    from teacher_experiments import _optimize_phi_gd
+    transform = transforms.Compose([transforms.ToTensor()])
+    test_dataset = datasets.MNIST(root="./data", train=False, transform=transform, download=True)
+    test_loader = DataLoader(test_dataset, batch_size=500, shuffle=False)
+
+    correct = 0
+    correct_learned = 0
+    total = 0
+
+    with torch.no_grad():
+        target_snr_db = SNR
+        for images, labels in test_loader:
+            images, labels = images.to(device), labels.to(device)
+            B = images.size(0)
+        with torch.no_grad():
+            channel_indices = torch.randint(0, H_1_all.size(0), (B,))
+            H_1_batch = H_1_all[channel_indices].to(device)  # (B, Nm, Nt)
+            H_2_batch = H_2_all[channel_indices].to(device)  # (B, Nr, Nm)
+
+            # Encoder: image -> complex signal s
+            s = teacher.encoder(images)  # (B, 1, Nt) or (B, Nt) complex
+            if s.dim() == 3:
+                s = s.squeeze(1)  # (B, Nt)
+
+            # Get y_learned from linear layer — used as the target for phi optimization
+            s_flat = torch.view_as_real(s).reshape(B, -1)       # (B, 2*Nt)
+            y_flat = teacher.linear(s_flat)                      # (B, 2*Nr)
+            y_learned = torch.view_as_complex(
+                y_flat.reshape(B, teacher.n_r, 2).contiguous()  # (B, Nr)
+            )
+
+            # Optimize phi via GD: min ||H2 @ diag(phi) @ H1 @ s - y_learned||
+            # phi = _optimize_phi_gd(teacher, s, y_learned, H_1_batch, H_2_batch, iters=100)
+            theta = 2 * torch.pi * torch.rand((B, teacher.n_m), device=device)
+            phi = torch.exp(1j * theta)
+
+            # RIS forward pass: y_ris = H_2 @ diag(phi) @ H_1 @ s + noise
+            H_1_s = torch.bmm(H_1_batch, s.unsqueeze(-1)).squeeze(-1)            # (B, Nm)
+            y_ris = torch.bmm(H_2_batch, (H_1_s * phi).unsqueeze(-1)).squeeze(-1)  # (B, Nr)
+            y_ris = y_ris + noise(y_ris, target_snr_db)
+
+            logits = teacher.decoder(y_ris)
+            logits_learned = teacher(images)
+
+            _, predicted_learned = torch.max(logits_learned.data, 1)
+            _, predicted = torch.max(logits.data, 1)
+            total += labels.size(0)
+            correct_learned += (predicted_learned == labels).sum().item()
+            correct += (predicted == labels).sum().item()
+
+    return correct / total, correct_learned / total
+
 
 if __name__ == "__main__":
     SNR = 10.0 #TODO- NICE!
