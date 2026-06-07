@@ -130,6 +130,57 @@ H_d_channel=None, H_1_channel=None, H_2_channel=None, lambda_class=0.0 , save_pa
         torch.save({'teacher': teacher.state_dict()}, save_path)
         print(f"Model saved to: {save_path}")
 
+def train_thin_teacher(teacher, train_loader, device, epochs, lr, weight_decay=0.0,
+                       use_intermediate=True, save_path=None):
+    """
+    Minimal CrossEntropy training for ThinTeacher.
+
+    Trains the encoder + decoder, and the intermediate linear layer only when
+    use_intermediate=True (when False, self.linear is bypassed and gets no gradient).
+    No channel regularization / H_d / H_1 / H_2.
+
+    Args:
+        teacher: ThinTeacher model to train
+        train_loader: DataLoader for training data
+        device: Device to train on
+        epochs: Number of training epochs
+        lr: Learning rate
+        weight_decay: Weight decay for optimizer
+        use_intermediate: If True, route through the intermediate linear layer; if
+            False, bypass it (ablation to show the intermediate layer is necessary)
+        save_path: Path to save the trained model (optional)
+    """
+    teacher = teacher.to(device)
+    optimizer = optim.Adam(teacher.parameters(), lr=lr, weight_decay=weight_decay)
+    criterion = nn.CrossEntropyLoss()
+    for epoch in range(epochs):
+        teacher.train()
+        running_loss, correct, total = 0.0, 0, 0
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
+        for images, labels in pbar:
+            images, labels = images.to(device), labels.to(device)
+            logits = teacher(images, use_intermediate=use_intermediate)
+            loss = criterion(logits, labels)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+            _, predicted = torch.max(logits.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+            pbar.set_postfix({'loss': f"{loss.item():.4f}", 'acc': f"{100*correct/total:.2f}%"})
+        print(f"Epoch {epoch+1}/{epochs} | Loss: {running_loss/len(train_loader):.4f} | Acc: {100*correct/total:.2f}%")
+
+    print("\nTraining finished!")
+
+    if save_path is not None:
+        save_dir = os.path.dirname(save_path)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+        torch.save({'teacher': teacher.state_dict()}, save_path)
+        print(f"Model saved to: {save_path}")
+    return teacher
+
 def train_teacher_initial_gan(teacher, train_loader, device, epochs, lr, weight_decay, lambda_l2=0.0, use_channel_reg=False,
 H_d_channel=None, H_1_channel=None, H_2_channel=None, lambda_class=0.0 , save_path=None, wandb_run=None):
     """

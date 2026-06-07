@@ -153,9 +153,9 @@ def test_physical(teacher, device, SNR , H_1_all, H_2_all):
             )
 
             # Optimize phi via GD: min ||H2 @ diag(phi) @ H1 @ s - y_learned||
-            # phi = _optimize_phi_gd(teacher, s, y_learned, H_1_batch, H_2_batch, iters=100)
-            theta = 2 * torch.pi * torch.rand((B, teacher.n_m), device=device)
-            phi = torch.exp(1j * theta)
+            phi = _optimize_phi_gd(teacher, s, y_learned, H_1_batch, H_2_batch, iters=10)
+            # theta = 2 * torch.pi * torch.rand((B, teacher.n_m), device=device)
+            # phi = torch.exp(1j * theta)
 
             # RIS forward pass: y_ris = H_2 @ diag(phi) @ H_1 @ s + noise
             H_1_s = torch.bmm(H_1_batch, s.unsqueeze(-1)).squeeze(-1)            # (B, Nm)

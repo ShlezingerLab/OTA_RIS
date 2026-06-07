@@ -55,3 +55,9 @@ globs: **/*.py
 - This project runs on BGU SLURM cluster
 - See `.cursor/docs/references/BGU_HPC_Cluster_User_Guide_Summary.md` for job submission details
 - Use `wandb` offline mode when running on cluster nodes without internet
+
+## Add Alongside, Don't Replace
+
+- When introducing a new method, approach, or configuration, prefer to add it alongside the existing one rather than replacing it.
+- Keep previously working options available — typically behind a flag or parameter — so we can switch back and directly compare old vs. new.
+- Example: in `teacher.py` the data pipeline supports BOTH MNIST and CIFAR-10 via a `dataset` flag, instead of replacing MNIST with CIFAR-10.

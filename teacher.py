@@ -463,6 +463,97 @@ class MyTeacher(nn.Module):
         sim_out = self.sim_net(H_1_s)
         return torch.bmm(H_2, sim_out.unsqueeze(-1)).squeeze(-1)
 
+class ThinEncoder(nn.Module):
+    """
+    Minimal encoder: image -> nonnegative feature vector a (B, 2*N_t).
+
+    A single linear layer followed by ReLU. Ending in ReLU is what makes the
+    downstream intermediate linear layer non-removable: when the intermediate is
+    bypassed, the decoder's leading ReLU sees the already-nonnegative `a` and acts
+    as a no-op, collapsing the two ReLU stages into one (see ThinTeacher).
+    """
+    def __init__(self, n_t: int, in_dim: int = 3 * 32 * 32):
+        super().__init__()
+        self.Nt = int(n_t)
+        self.fc = nn.Linear(in_dim, 2 * self.Nt)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.relu(self.fc(x.flatten(1)))  # (B, 2*N_t), >= 0
+
+class ThinDecoder(nn.Module):
+    """
+    Minimal decoder: real feature vector y (B, 2*N_r) -> class logits.
+
+    Starts with ReLU and then a single linear classification layer. There is no
+    trainable linear layer before the ReLU, so it cannot absorb the intermediate
+    linear layer (which is what would otherwise make the intermediate redundant).
+    """
+    def __init__(self, n_r: int, num_classes: int = 10):
+        super().__init__()
+        self.n_r = int(n_r)
+        self.num_classes = int(num_classes)
+        self.fc_out = nn.Linear(2 * self.n_r, self.num_classes)
+
+    def forward(self, y: torch.Tensor) -> torch.Tensor:
+        return self.fc_out(F.relu(y))  # ReLU first, then linear readout
+
+class ThinTeacher(nn.Module):
+    """
+    Minimal ablation teacher to test whether the intermediate linear layer is necessary.
+
+    Architecture (all real-valued):
+      1) ThinEncoder: image -> a = ReLU(Linear(x))  (B, 2*N_t), nonnegative
+      2) Intermediate linear layer (the layer under test): a -> h  (B, 2*N_r)
+      3) ThinDecoder: logits = Linear(ReLU(h))
+
+    The encoder ends in ReLU and the decoder starts with ReLU. With the intermediate
+    layer the network has two genuine nonlinear stages. When the intermediate is
+    bypassed, the decoder's ReLU receives the already-nonnegative `a` (a no-op), so
+    the two ReLUs collapse into a single hidden layer. With a thin width, the
+    collapsed (bypass) model underfits while the with-intermediate model succeeds:
+    that gap is the evidence the intermediate linear layer is necessary.
+
+    Requires N_t == N_r == N_m so the intermediate layer can be cleanly bypassed
+    (a fed straight to the decoder) when ablating via forward(use_intermediate=False).
+    """
+    def __init__(
+        self,
+        n_t: int,
+        n_r: int,
+        n_m: int,
+        H_d_all: torch.Tensor = None,
+        num_classes: int = 10,
+        in_dim: int = 3 * 32 * 32,
+        target_snr_db: float = 0.0,
+    ):
+        super().__init__()
+        assert n_t == n_r == n_m, "ThinTeacher requires N_t == N_r == N_m"
+        self.n_t = int(n_t)
+        self.n_r = int(n_r)
+        self.n_m = int(n_m)
+        self.num_classes = int(num_classes)
+        self.in_dim = int(in_dim)
+        self.target_snr_db = float(target_snr_db)
+
+        self.encoder = ThinEncoder(self.n_t, in_dim=self.in_dim)
+        # Intermediate layer under test (kept named "linear" to match MyTeacher).
+        self.linear = nn.Linear(2 * self.n_t, 2 * self.n_r, bias=False)
+        self.decoder = ThinDecoder(self.n_r, num_classes=self.num_classes)
+
+    def forward(self, x: torch.Tensor, use_intermediate: bool = True) -> torch.Tensor:
+        """
+        Args:
+            x: (B, C, H, W) input images
+            use_intermediate: if False, bypass self.linear and feed `a` directly to the
+                decoder (valid since 2*N_t == 2*N_r). The accuracy drop in this mode is
+                the evidence that the intermediate layer is necessary.
+        Returns:
+            logits: (B, num_classes)
+        """
+        a = self.encoder(x)  # (B, 2*N_t), >= 0
+        h = self.linear(a) if use_intermediate else a  # (B, 2*N_r); bypass when ablating
+        return self.decoder(h)
+
 def _split_to_close_to_square_factors(n: int) -> tuple[int, int]:
     n = int(n)
     if n <= 0:
@@ -581,16 +672,18 @@ if __name__ == "__main__":
     #################################################
     mode = "debug"#args.mode
     target_snr_db = 10.0#param_value
-    save = True
+    save = False
+    dataset = "cifar10"  # "mnist" or "cifar10"
+    #use_mid = True
     #################################################
-    N_t, N_r, N_m = 20, 10, 16 #TODO N_t should be low, TODO: why increasing N_m doesnt improve me
+    N_t, N_r, N_m = 5,5,5#20, 10, 16 #TODO N_t should be low, TODO: why increasing N_m doesnt improve me
     wireless_dict = dict(power=1.0, lambda_class=lambda_class, use_channel_reg=use_channel_reg, freq_hz=28e9, k_factor_d_db=3.0, k_factor_h1_db=13.0,
     k_factor_h2_db=7.0,pathloss_exp=2.0, geo_pathloss_gain_db=0.0, target_snr_db=target_snr_db)
 
     if mode == "full":
-        data_dict = dict(subset_size=60000, batchsize=256, channel_sampling_size=10000, epochs=200)  #args.num_channels_sample  #None = use all channels
+        data_dict = dict(subset_size=50000, batchsize=256, channel_sampling_size=10000, epochs=200)  #args.num_channels_sample  #None = use all channels
     elif mode == "debug":
-        data_dict = dict(subset_size=1000, batchsize=100, channel_sampling_size=10000, epochs=20)
+        data_dict = dict(subset_size=10000, batchsize=256, channel_sampling_size=10000, epochs=10)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     #################################################
     H_d_all, H_1_all, H_2_all = generate_channel_tensors_by_type(
@@ -607,18 +700,46 @@ if __name__ == "__main__":
         pathloss_exp=wireless_dict["pathloss_exp"],
         geo_pathloss_gain_db=wireless_dict["geo_pathloss_gain_db"], #TODO-during it test we need it to be 60! resolve this
     )
+    # Dataset config for the ThinTeacher ablation (supports both MNIST and CIFAR-10)
+    if dataset == "mnist":
+        in_dim = 28 * 28
+        num_classes = 10
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.1307,), (0.3081,)),
+        ])
+    elif dataset == "cifar10":
+        in_dim = 3 * 32 * 32
+        num_classes = 10
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261)),
+        ])
+    else:
+        raise ValueError(f"Unknown dataset: {dataset!r} (expected 'mnist' or 'cifar10')")
     teacher = MyTeacher(n_t=N_t, n_r=N_r, n_m=N_m,H_d_all=H_d_all, target_snr_db=wireless_dict["target_snr_db"])
+    thin_teacher = ThinTeacher(n_t=N_t, n_r=N_r, n_m=N_m, H_d_all=H_d_all, num_classes=num_classes,
+                               in_dim=in_dim, target_snr_db=wireless_dict["target_snr_db"])
     lr = 1e-3
     weight_decay = 1e-7
     print(f"Using device: {device}")
     teacher = teacher.to(device)
     script_dir = os.path.dirname(os.path.abspath(__file__))
     #################################################
-    transform = transforms.Compose([transforms.ToTensor()])
-    train_dataset = datasets.MNIST(root="./data", train=True, transform=transform, download=True)
-    indices = np.random.choice(len(train_dataset), data_dict["subset_size"], replace=False)
+    # `transform` is selected above based on `dataset`.
+    if dataset == "mnist":
+        train_dataset = datasets.MNIST(root="./data", train=True, transform=transform, download=True)
+        test_dataset = datasets.MNIST(root="./data", train=False, transform=transform, download=True)
+    elif dataset == "cifar10":
+        train_dataset = datasets.CIFAR10(root="./data", train=True, transform=transform, download=True)
+        test_dataset = datasets.CIFAR10(root="./data", train=False, transform=transform, download=True)
+    else:
+        raise ValueError(f"Unknown dataset: {dataset!r} (expected 'mnist' or 'cifar10')")
+    subset_size = min(data_dict["subset_size"], len(train_dataset))
+    indices = np.random.choice(len(train_dataset), subset_size, replace=False)
     train_subset = Subset(train_dataset, indices)
     train_loader = DataLoader(train_subset, batch_size=data_dict["batchsize"], shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=data_dict["batchsize"], shuffle=False)
     #################################################
     # if yml:
     #     # if param_name in wireless_dict:
@@ -668,7 +789,7 @@ if __name__ == "__main__":
     #################################################
     timestamp = "20260527_1543"
     model_path = f"/home/mazya/OTA_RIS/simulations/{timestamp}/teacher_debug_target_snr_db=0.0.pth" #20260418_1519
-    phase = "test"
+    phase = "train_thin"
     #################################################
     if phase == "train":
         train_teacher_linear(teacher, train_loader=train_loader, device=device, epochs=10, lr=lr, weight_decay=weight_decay,
@@ -681,6 +802,34 @@ if __name__ == "__main__":
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             torch.save({'teacher': teacher.state_dict()}, save_path)
             print(f"Model saved to: {save_path}")
+
+    elif phase == "train_thin":
+        @torch.no_grad()
+        def _eval_thin(model, loader, device, use_intermediate):
+            model.eval()
+            correct, total = 0, 0
+            for images, labels in loader:
+                images, labels = images.to(device), labels.to(device)
+                logits = model(images, use_intermediate=use_intermediate)
+                _, predicted = torch.max(logits, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+            return 100.0 * correct / max(total, 1)
+
+        # Train a fresh model per mode (training is mode-specific) and compare.
+        test_acc = {}
+        for use_mid in (True, False):
+            model = ThinTeacher(n_t=N_t, n_r=N_r, n_m=N_m, num_classes=num_classes,
+                                in_dim=in_dim, target_snr_db=wireless_dict["target_snr_db"]).to(device)
+            print(f"\n=== Training ThinTeacher (use_intermediate={use_mid}) ===")
+            train_thin_teacher(model, train_loader=train_loader, device=device, epochs=data_dict["epochs"], lr=lr,
+                                weight_decay=weight_decay, use_intermediate=use_mid, save_path=None)
+            test_acc[use_mid] = _eval_thin(model, test_loader, device, use_intermediate=use_mid)
+
+        print("\n================ ThinTeacher ablation (CIFAR-10 test) ================")
+        print(f"with intermediate (use_intermediate=True) : {test_acc[True]:.2f}%")
+        print(f"bypass            (use_intermediate=False): {test_acc[False]:.2f}%")
+        print(f"gap (with - bypass)                       : {test_acc[True] - test_acc[False]:.2f}%")
 
     elif phase == "test":
         checkpoint = torch.load(model_path, map_location=device)

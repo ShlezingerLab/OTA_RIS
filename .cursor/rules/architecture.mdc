@@ -16,11 +16,10 @@ Keep this rule centered on the ordinary teacher path. GAN classes also exist in 
 
 | File | Purpose |
 |---|---|
-| `teacher.py` | Current teacher focus: data-facing teacher model, encoder, learned linear channel, decoder, GAN helpers |
+| `teacher.py` | Current teacher focus: `MyTeacher`, encoder, learned linear channel, decoder, GAN helpers; also `ThinTeacher` ablation model |
 | `teacher_train.py` | Teacher training functions, including `train_teacher_linear()` |
-| `test_demo.py` | Physical/metasurface testing against the learned linear teacher output |
-| `teacher_experiments.py` | Phase/metasurface optimization helpers, including `_optimize_phi_gd()` |
-| `teachers.py` | Older/alternate teacher model definitions |
+| `test_demo.py` | Physical/metasurface testing (`test_physical()`) plus the GAN-channel test (`test_physical_channel_gan()`); re-exports `noise()` from `gan.gan` |
+| `teacher_experiments.py` | Phase/metasurface optimization helpers (`_optimize_phi_gd()`, `get_channel_matching_loss()`, etc.) and alternate teachers (`HeavyIntermediateTeacher`, `MNISTClassifier`, `E2EProxyTeacher`) |
 | `students.py` | Student model definitions |
 | `channels.py` | Channel generation (`generate_channel_tensors_by_type`) |
 | `training.py` | All training functions |
@@ -84,7 +83,7 @@ The encoder produces complex tensors, the learned linear layer operates on real 
 2. Physical/metasurface path:
    - Encode image to `s`.
    - Build `y_learned` from `teacher.linear(s_flat)`.
-   - Optimize `phi` with `_optimize_phi_gd(teacher, s, y_learned, H_1_batch, H_2_batch, iters=100)`.
+   - Optimize `phi` with `_optimize_phi_gd(teacher, s, y_learned, H_1_batch, H_2_batch, iters=10)`.
    - Compute `y_ris = H_2 @ diag(phi) @ H_1 @ s`.
    - Add AWGN via `noise(y_ris, target_snr_db)`.
    - Decode with `teacher.decoder(y_ris)`.
@@ -100,8 +99,37 @@ features, logits = teacher.extract_features(images, preReLU=True)
 
 The linear-layer feature is `y_flat`; it is the key intermediate representation when later aligning controller/metasurface behavior to the learned teacher channel.
 
+## Thin Teacher (Ablation)
+
+`teacher.py` also defines a minimal ablation stack (`ThinEncoder`, `ThinDecoder`, `ThinTeacher`) used to test whether the intermediate linear layer is necessary. It is separate from the ordinary `MyTeacher` path and is purely real-valued (no complex `s`/`y`, no power normalization, no channel pools).
+
+The design makes a strictly linear intermediate layer non-removable via ReLU boundaries:
+
+- `ThinEncoder`: a single `Linear(in_dim, 2*N_t)` followed by `ReLU`, mapping a flattened image to a nonnegative `a` of shape `(B, 2*N_t)`. It ends in ReLU. `in_dim` defaults to `3*32*32` (CIFAR-10).
+- `ThinDecoder`: starts with `ReLU` then a single `Linear(2*N_r, num_classes)`. There is no trainable linear layer before the ReLU, so it cannot absorb `self.linear`.
+- `ThinTeacher`: `ThinEncoder -> [optional self.linear] -> ThinDecoder`. `self.linear = nn.Linear(2*N_t, 2*N_r, bias=False)` is the strictly-linear layer under test (named `linear` to match `MyTeacher`). It asserts `N_t == N_r == N_m`.
+
+Forward with ablation toggle:
+
+```python
+# a = ReLU(Linear(x))                              # (B, 2*N_t), >= 0
+# use_intermediate=True : h = self.linear(a)       # (B, 2*N_r)
+# use_intermediate=False: h = a                    # bypass self.linear
+# logits = decoder(h) = Linear(ReLU(h))
+logits = thin_teacher(images, use_intermediate=...)
+```
+
+The bypass is valid because `2*N_t == 2*N_r`. Why the intermediate is necessary: with it, the network has two genuine nonlinear stages, `Linear(ReLU(W * ReLU(Linear(x))))`. Without it, the decoder's ReLU receives the already-nonnegative `a`, so `ReLU(a) = a` and the two ReLUs collapse into a single hidden layer (`Linear(ReLU(Linear(x)))`). With a thin width (`2*N_t`) and a dataset that needs nonlinearity (CIFAR-10), the collapsed bypass underfits while the with-intermediate path succeeds. That gap is the evidence the intermediate linear layer is necessary.
+
+Training (`teacher_train.py`):
+
+- `train_thin_teacher(teacher, train_loader, device, epochs, lr, weight_decay=0.0, use_intermediate=True, save_path=None)` is a minimal CrossEntropy loop. It has no `H_d`/`H_1`/`H_2` channel regularization and no GAN. It trains the encoder and decoder, and trains `self.linear` only when `use_intermediate=True` (when `False`, `self.linear` is bypassed and receives no gradient).
+
+Entry point: under `phase == "train_thin"`, the `teacher.py` `__main__` block trains CIFAR-10 (with a held-out test loader), instantiating a fresh `ThinTeacher` for each mode (`use_intermediate=True` and `False`) and printing the test accuracies and their gap.
+
 ## Important Boundaries
 
-- Do not assume `get_channel_matching_loss()` is part of the active `teacher.py` ordinary forward path. Related helpers live in `teacher_experiments.py` and may require explicit binding/import decisions before use.
+- Do not assume `get_channel_matching_loss()` is part of the active `teacher.py` ordinary forward path. The phi/channel-matching helpers in `teacher_experiments.py` (`_optimize_phi_gd`, `get_channel_matching_loss`, `_optimize_phi_analytical`, `_optimize_phi_manifold_gd`) are module-level functions whose first parameter is named `self` but are **not** bound to `MyTeacher`. They are called by passing a teacher instance explicitly, e.g. `_optimize_phi_gd(teacher, s, y_learned, H_1_batch, H_2_batch, iters=10)` in `test_demo.test_physical()`. `train_teacher_linear()`'s `use_channel_reg` path calls `teacher.get_channel_matching_loss(...)` as a bound method, which will fail unless it is explicitly attached to the teacher first.
 - Do not describe the current metasurface focus as closed-form phase optimization. The active physical test uses `_optimize_phi_gd()`.
 - Do not mix the GAN path (`ChannelGenerator`, `ChannelDiscriminator`, `HeavyRxDecoder_gan`, `forward_gan`) into ordinary teacher explanations unless the task explicitly mentions GAN training or GAN channel simulation.
+- Do not mix the `ThinTeacher` ablation stack into ordinary `MyTeacher` explanations. It is a separate, minimal path with no channel pools (`H_d`/`H_1`/`H_2`) and no GAN; it exists only to test whether the intermediate linear layer is necessary.
