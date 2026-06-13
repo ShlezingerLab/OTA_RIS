@@ -74,7 +74,7 @@ class CheckerboardNet(nn.Module):
       before the ReLU so it cannot absorb `linear`.
     """
 
-    def __init__(self, hidden: int = 24, num_classes: int = 2):
+    def __init__(self, hidden: int = 24, num_classes: int = 2, snr_db: float = 10.0):
         super().__init__()
         self.hidden = int(hidden)
         self.num_classes = int(num_classes)
@@ -83,11 +83,12 @@ class CheckerboardNet(nn.Module):
         # Strictly-linear, bias-free intermediate (the layer under test).
         self.linear = nn.Linear(self.hidden, self.hidden, bias=False)
         self.dec = nn.Linear(self.hidden, self.num_classes)
+        self.snr_db = float(snr_db)
 
     def forward(self, x: torch.Tensor, use_intermediate: bool = True) -> torch.Tensor:
         a = torch.relu(self.enc(x))                  # (B, hidden), >= 0
         h = self.linear(a) if use_intermediate else a  # bypass valid: same dim
-        return self.dec(torch.relu(h))               # ReLU(a) == a when bypassing
+        return self.dec(torch.relu(h) + noise(h, self.snr_db))
 
 
 def train(model, x, y, device, epochs, lr, batch_size, weight_decay, use_intermediate):
@@ -146,6 +147,7 @@ def save_model(model, path, grid_n, hidden, epochs, use_intermediate):
         "hidden": hidden,
         "epochs": epochs,
         "use_intermediate": use_intermediate,
+        "snr_db": model.snr_db,
     }
     torch.save(checkpoint, path)
     print(f"  saved model to: {path}")
@@ -154,21 +156,27 @@ def save_model(model, path, grid_n, hidden, epochs, use_intermediate):
 def load_model(path, device):
     """Load a saved CheckerboardNet checkpoint for evaluation/plotting."""
     checkpoint = torch.load(path, map_location=device)
-    model = CheckerboardNet(hidden=checkpoint["hidden"], num_classes=2).to(device)
+    model = CheckerboardNet(
+        hidden=checkpoint["hidden"],
+        num_classes=2,
+        snr_db=checkpoint.get("snr_db", 10.0),
+    ).to(device)
     model.load_state_dict(checkpoint["state_dict"])
     model.eval()
     print(f"  loaded model from: {path}")
     return model
 
 
-def _wireless_noise(y, target_snr_db):
-    """AWGN matched to signal power (vendored verbatim from gan/gan.py `noise`)."""
+def noise(y, target_snr_db):
+    """AWGN matched to signal power (vendored from gan/gan.py; real + complex)."""
     p_signal = torch.mean(torch.abs(y) ** 2)
     sigma_sqr = p_signal / (10 ** (target_snr_db / 10.0))
     noise_std = torch.sqrt(sigma_sqr)
-    return (
-        torch.randn_like(y.real) + 1j * torch.randn_like(y.real)
-    ) * (noise_std / math.sqrt(2.0))
+    if y.is_complex():
+        return (
+            torch.randn_like(y.real) + 1j * torch.randn_like(y.real)
+        ) * (noise_std / math.sqrt(2.0))
+    return torch.randn_like(y) * noise_std
 
 
 def _optimize_phi_gd(s, y, H_1, H_2, n_m, iters=10, step_size=0.1):
@@ -207,7 +215,7 @@ def _optimize_phi_gd(s, y, H_1, H_2, n_m, iters=10, step_size=0.1):
     return torch.exp(1j * theta).detach()
 
 
-def make_ris_channel_pools(hidden, n_m, device, num_channels=1000):
+def make_ris_channel_pools(hidden, n_m, device, channel_type, kappa, num_channels=1000):
     """Generate (H_1_all, H_2_all) RIS channel pools for the wireless panel.
 
     Uses the exact channel generator from test_demo.py
@@ -222,7 +230,7 @@ def make_ris_channel_pools(hidden, n_m, device, num_channels=1000):
 
     n_t = n_r = hidden // 2
     _, H_1_all, H_2_all = generate_channel_tensors_by_type(
-        channel_type="geometric_ricean",
+        channel_type=channel_type,
         N_t=n_t,
         N_r=n_r,
         N_m=n_m,
@@ -230,8 +238,8 @@ def make_ris_channel_pools(hidden, n_m, device, num_channels=1000):
         device=device,
         freq_hz=28e9,
         k_factor_d_db=5.0,
-        k_factor_h1_db=13.0,
-        k_factor_h2_db=7.0,
+        k_factor_h1_db=kappa,
+        k_factor_h2_db=kappa,
         pathloss_exp=2.0,
         geo_pathloss_gain_db=0.0,
     )
@@ -265,15 +273,15 @@ def wireless_forward(model, x, H_1_all, H_2_all, n_m, snr_db, device, phi_iters)
 
     H_1_s = torch.bmm(H_1_b, s.unsqueeze(-1)).squeeze(-1)          # (B, Nm)
     y_ris = torch.bmm(H_2_b, (H_1_s * phi).unsqueeze(-1)).squeeze(-1)  # (B, Nr)
-    y_ris = y_ris #+ _wireless_noise(y_ris, snr_db)
+    y_ris = y_ris + noise(y_ris, snr_db)
 
     y_ris_real = torch.view_as_real(y_ris).reshape(B, hidden)
     target_norm = torch.linalg.norm(y_flat, dim=1, keepdim=True)
     ris_norm = torch.linalg.norm(y_ris_real, dim=1, keepdim=True)
     rx_gain = target_norm / (ris_norm + 1e-8)
-    y_ris_real_scaled = y_ris_real * rx_gain
+    y_ris_real = y_ris_real * rx_gain #TODO we have to use it with cosine loss
 
-    return model.dec(torch.relu(y_ris_real_scaled))                       # (B, num_classes)
+    return model.dec(torch.relu(y_ris_real))                       # (B, num_classes)
 
 
 @torch.no_grad()
@@ -338,10 +346,67 @@ def plot_decision_comparison(models, accuracies, device, grid_n, path, res: int 
     #print(f"  saved decision-boundary plot to: {path}")
 
 
+@torch.no_grad()
+def plot_wireless_kappa_comparison(model, x_te, y_te, device, grid_n, hidden, n_m,
+                                   snr_db, phi_iters, kappa_values, path,
+                                   include_rayleigh=True, res: int = 300):
+    """Save wireless RIS decision boundaries: Rayleigh + Ricean kappa sweep."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    lin = np.linspace(0.0, 1.0, res, dtype=np.float32)
+    gx, gy = np.meshgrid(lin, lin)
+    grid = np.stack([gx.ravel(), gy.ravel()], axis=1)
+    grid_t = torch.from_numpy(grid).to(device)
+
+    panels = []
+    if include_rayleigh:
+        panels.append(("geometric_rayleigh", None, "Rayleigh"))
+    for kappa in kappa_values:
+        panels.append(("geometric_ricean", kappa, f"Ricean κ={kappa:g}"))
+
+    n_panels = len(panels)
+    fig, axes = plt.subplots(1, n_panels, figsize=(5 * n_panels, 5))
+    if n_panels == 1:
+        axes = [axes]
+
+    for ax, (ch_type, kappa, label) in zip(axes, panels):
+        kappa_arg = 0.0 if kappa is None else kappa
+        H_1_all, H_2_all = make_ris_channel_pools(
+            hidden, n_m, device, ch_type, kappa_arg,
+        )
+        acc = evaluate_wireless(
+            model, x_te, y_te, H_1_all, H_2_all, n_m, snr_db, device, phi_iters,
+        )
+        wlogits = wireless_forward(
+            model, grid_t, H_1_all, H_2_all, n_m, snr_db, device, phi_iters,
+        )
+        wireless_pred = wlogits.argmax(1).cpu().numpy().reshape(res, res)
+        ax.imshow(wireless_pred, origin="lower", extent=(0, 1, 0, 1), cmap="coolwarm", alpha=0.9)
+        ax.set_title(f"Wireless RIS {label} (acc {acc:.2f}%)")
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    fig.suptitle(f"SNR={snr_db:g} dB", y=1.02)
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fig.savefig(path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  saved wireless fading comparison to: {path}")
+
+
+def _tag_float(x):
+    """Format a float for use in filenames (10.0 -> '10', 10.5 -> '10p5')."""
+    s = f"{x:g}"
+    return s.replace(".", "p")
+
+
 def run_once(grid_n, hidden, n_train, n_test, batch_size, epochs, lr, weight_decay,
              seed, device, make_plots, plot_dir, save_models=True, model_dir=None,
-             wireless=False, snr_db=10.0, n_m=100, phi_iters=100,
-             load_only=False, model_with_path=None, model_bypass_path=None):
+             wireless=False, channel_type="geometric_rayleigh", kappa=10, snr_db=10.0, n_m=100, phi_iters=100,
+             load_only=False, model_with_path=None, model_bypass_path=None,
+             kappa_sweep=(20, 30, 40, 50), include_rayleigh=True):
     """Train (or load) both routing modes and return (acc_with, acc_bypass).
 
     When `load_only=True`, skip training and load saved checkpoints from
@@ -375,7 +440,7 @@ def run_once(grid_n, hidden, n_train, n_test, batch_size, epochs, lr, weight_dec
             eval_model = load_model(path, device)
         else:
             torch.manual_seed(seed)
-            model = CheckerboardNet(hidden=hidden, num_classes=2)
+            model = CheckerboardNet(hidden=hidden, num_classes=2, snr_db=snr_db)
             print(f"\n=== Training {tag} | grid_n={grid_n}, hidden={hidden} ===")
             train(model, x_tr, y_tr, device, epochs=epochs, lr=lr, batch_size=batch_size,
                   weight_decay=weight_decay, use_intermediate=use_mid)
@@ -395,7 +460,7 @@ def run_once(grid_n, hidden, n_train, n_test, batch_size, epochs, lr, weight_dec
     if wireless:
         # print(f"\n=== Wireless RIS path | grid_n={grid_n}, hidden={hidden}, "
         #       f"Nm={n_m}, SNR={snr_db}dB, phi_iters={phi_iters} ===")
-        H_1_all, H_2_all = make_ris_channel_pools(hidden, n_m, device)
+        H_1_all, H_2_all = make_ris_channel_pools(hidden, n_m, device, channel_type, kappa)
         acc["wireless"] = evaluate_wireless(
             eval_models[True], x_te, y_te, H_1_all, H_2_all, n_m, snr_db, device, phi_iters)
         wireless_cfg = {
@@ -409,6 +474,22 @@ def run_once(grid_n, hidden, n_train, n_test, batch_size, epochs, lr, weight_dec
             path=os.path.join(plot_dir, f"checkerboard_g{grid_n}_h{hidden}_epochs{epochs}_comparison.png"),
             wireless_cfg=wireless_cfg,
         )
+        if wireless_cfg is not None and (include_rayleigh or kappa_sweep):
+            name_parts = []
+            if include_rayleigh:
+                name_parts.append("rayleigh")
+            if kappa_sweep:
+                name_parts.append("kappa" + "_".join(_tag_float(k) for k in kappa_sweep))
+            wireless_path = os.path.join(
+                plot_dir,
+                f"checkerboard_g{grid_n}_h{hidden}_epochs{epochs}_"
+                f"snr{_tag_float(snr_db)}_{'_'.join(name_parts)}_wireless.png",
+            )
+            plot_wireless_kappa_comparison(
+                eval_models[True], x_te, y_te, device, grid_n, hidden, n_m,
+                snr_db, phi_iters, kappa_sweep, wireless_path,
+                include_rayleigh=include_rayleigh,
+            )
     if not wireless:
         acc["wireless"] = None
     return acc[True], acc[False], acc["wireless"]
@@ -436,7 +517,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Checkerboard W_lin necessity demo")
     parser.add_argument("--mode", type=str, default="demo", choices=["demo", "full"],
                         help="Run mode: demo is quick; full uses the validated long settings")
-    parser.add_argument("--make_plots", type=str, default=None, choices=["true", "false"],
+    parser.add_argument("--make_plots", type=str, default="true", choices=["true", "false"],
                         help="Override plot saving: true or false")
     parser.add_argument("--save", type=str, default="true", choices=["true", "false"],
                         help="Save trained models before loading them for evaluation: true or false")
@@ -451,16 +532,25 @@ if __name__ == "__main__":
                         help="Explicit path to bypass checkpoint (overrides model_dir default)")
     parser.add_argument("--wireless", type=str, default="true", choices=["true", "false"],
                         help="Add a wireless RIS panel (encoder -> H_2 diag(phi) H_1 -> decoder)")
-    parser.add_argument("--snr", type=float, default=10.0, help="Wireless path SNR in dB")
+    parser.add_argument("--snr", type=float, default=60.0, help="Wireless path SNR in dB")
     parser.add_argument("--n_m", type=int, default=100, help="Number of RIS elements (Nm)")
     parser.add_argument("--phi_iters", type=int, default=100, help="Iterations for _optimize_phi_gd")
     parser.add_argument("--sweep", action="store_true", help="Sweep grid_n at fixed hidden")
     parser.add_argument("--no-plots", action="store_true", help="Disable decision-boundary plots")
+    parser.add_argument("--channel_type", type=str, default="geometric_rayleigh", choices=["geometric_rayleigh", "geometric_ricean"],
+                        help="Channel type: geometric_rayleigh or geometric_ricean")
+    parser.add_argument("--kappa", type=float, default=10, help="K-factor for geometric_ricean channel")
+    parser.add_argument("--kappa_sweep", type=str, default="20,30,40,50",
+                        help="Comma-separated Ricean kappa values for the fading comparison plot")
+    parser.add_argument("--include_rayleigh", type=str, default="true", choices=["true", "false"],
+                        help="Include a Rayleigh panel in the fading comparison plot")
     args = parser.parse_args()
-    mode = "full"#args.mode == "demo"
+    mode = args.mode
     save_models = args.save == "true"
     load_only = args.load == "true"
-    wireless = False#args.wireless == "true"
+    wireless = args.wireless == "true"
+    kappa_sweep = tuple(float(x.strip()) for x in args.kappa_sweep.split(",") if x.strip())
+    include_rayleigh = args.include_rayleigh == "true"
 
     if mode == "full":
         n_train = 20000
@@ -481,9 +571,7 @@ if __name__ == "__main__":
         save_models = False
 
     SWEEP = SWEEP or args.sweep
-    if args.make_plots is not None:
-        make_plots = args.make_plots == "true"
-    make_plots = not args.no_plots
+    make_plots = args.make_plots == "true" and not args.no_plots
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
@@ -515,14 +603,18 @@ if __name__ == "__main__":
         for g, acc_with, acc_bypass in results:
             print(f"{g:>8} | {acc_with:>11.2f}% | {acc_bypass:>9.2f}% | {acc_with - acc_bypass:>7.2f}%")
     else:
+        channel_type = args.channel_type
+        kappa = args.kappa
         acc_with, acc_bypass, channel_accuracy = run_once(
             grid_n=grid_n, hidden=hidden, n_train=n_train, n_test=n_test,
             batch_size=batch_size, epochs=epochs, lr=lr, weight_decay=weight_decay,
             seed=seed, device=device, make_plots=make_plots, plot_dir=plot_dir,
             save_models=save_models, model_dir=model_dir,
-            wireless=wireless, snr_db=args.snr, n_m=args.n_m, phi_iters=args.phi_iters,
+            wireless=wireless, channel_type=channel_type, kappa=kappa, snr_db=args.snr, n_m=args.n_m, phi_iters=args.phi_iters,
             load_only=load_only, model_with_path=args.model_with,
             model_bypass_path=args.model_bypass,
+            kappa_sweep=kappa_sweep,
+            include_rayleigh=include_rayleigh,
         )
         if wireless:
             print(f"wireless : {channel_accuracy:.2f}%")
