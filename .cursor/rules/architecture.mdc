@@ -10,6 +10,8 @@ globs: **/*.py
 
 The active teacher architecture focus is in `teacher.py`: MNIST data -> `HeavyEncoder` -> learned `linear` channel layer -> `HeavyRxDecoder`, then physical/metasurface testing via `test_demo.test_physical()` and `_optimize_phi_gd()` from `teacher_experiments.py`.
 
+Wireless/RIS validation is actively exercised in `checkboard/wlin_necessity_checkerboard.py` (isolated checkerboard demo with an optional wireless panel). Treat findings there (channel rank, SNR, cosine φ + AGC) as the current best recipe for the physical path; see `.cursor/docs/architecture/wireless-ris-phi.md` and `rank.md`.
+
 Keep this rule centered on the ordinary teacher path. GAN classes also exist in `teacher.py`, but they are a separate channel-modeling path and should only be considered for GAN-specific tasks.
 
 ## Key Files
@@ -17,11 +19,14 @@ Keep this rule centered on the ordinary teacher path. GAN classes also exist in 
 | File | Purpose |
 |---|---|
 | `teacher.py` | Current teacher focus: `MyTeacher`, encoder, learned linear channel, decoder, GAN helpers; also `ThinTeacher` ablation model |
-| `teacher_train.py` | Teacher training functions, including `train_teacher_linear()` |
+| `teacher_train.py` | Teacher training functions, including `train_teacher_linear()` and `train_thin_teacher()` |
 | `test_demo.py` | Physical/metasurface testing (`test_physical()`) plus the GAN-channel test (`test_physical_channel_gan()`); re-exports `noise()` from `gan.gan` |
-| `teacher_experiments.py` | Phase/metasurface optimization helpers (`_optimize_phi_gd()`, `get_channel_matching_loss()`, etc.) and alternate teachers (`HeavyIntermediateTeacher`, `MNISTClassifier`, `E2EProxyTeacher`) |
+| `teacher_experiments.py` | Phase/metasurface optimization helpers (`_optimize_phi_gd()`, `get_channel_matching_loss()`, etc.) and alternate teachers |
 | `students.py` | Student model definitions |
-| `channels.py` | Channel generation (`generate_channel_tensors_by_type`) |
+| `channels.py` | Channel generation (`generate_channel_tensors_by_type`; supports `geometric_rayleigh`, `geometric_ricean`, etc.) |
+| `checkboard/wlin_necessity_checkerboard.py` | Isolated W_lin necessity demo + optional wireless RIS panel (vendored φ opt, AGC, channel pools) |
+| `checkboard/wlin_checker_maxgap_sweep.py` | Sweeps `(grid_n, hidden)` for max with-vs-bypass gap |
+| `rank.md` | Rank-deficiency analysis: strong LoS collapse vs Rayleigh / low-K fix |
 | `training.py` | All training functions |
 | `CLI_interface.py` | CLI entry point for all training phases |
 | `flow.py` | High-level training orchestration |
@@ -60,8 +65,10 @@ Data and channels are created outside the model:
 Current shape conventions in the active test code:
 
 - `H_d_all`: direct TX-to-RX channel pool, sampled as `(B, Nr, Nt)`.
-- `H_1_all`: TX-to-metasurface/RIS channel pool, sampled in `test_physical()` and used as `(B, Nm, Nt)` for `torch.bmm(H_1_batch, s.unsqueeze(-1))`.
-- `H_2_all`: metasurface/RIS-to-RX channel pool, sampled in `test_physical()` and used as `(B, Nr, Nm)`.
+- `H_1_all`: TX-to-metasurface/RIS channel pool, sampled as `(B, Nm, Nt)` for `torch.bmm(H_1_batch, s.unsqueeze(-1))`.
+- `H_2_all`: metasurface/RIS-to-RX channel pool, sampled as `(B, Nr, Nm)`.
+
+For the RIS surrogate `y_ris = H₂ diag(φ) H₁ s` to mimic `W_lin`, the cascaded channel needs sufficient rank (typically `Rank(H_eq) ≥ Nr`). **Strong LoS (high Ricean K on H₁/H₂) causes rank-1 collapse**; prefer **`geometric_rayleigh`** or heavily suppressed LoS. Details in `rank.md`.
 
 ## Complex Tensor Convention
 
@@ -88,7 +95,13 @@ The encoder produces complex tensors, the learned linear layer operates on real 
    - Add AWGN via `noise(y_ris, target_snr_db)`.
    - Decode with `teacher.decoder(y_ris)`.
 
-`_optimize_phi_gd()` is iterative gradient descent over `theta`, with `phi = exp(1j * theta)`. Its objective aligns `y_ris` with `y_learned` using cosine similarity in real flattened complex space.
+**Phi optimization recipe (current best practice):**
+
+- **Loss:** cosine similarity in flattened real complex space:
+  `loss = mean(1 - cosine_sim(y_target, y_ris))`. Used in `teacher_experiments._optimize_phi_gd` and the checkerboard vendored copy.
+- **AGC:** scale `y_ris` so `‖y_ris‖ = ‖y_target‖` using the known learned intermediate norm before decode. Implemented in `checkboard/wlin_necessity_checkerboard.py::wireless_forward`; **not yet in `test_demo.test_physical()`**.
+- **SNR:** checkerboard wireless defaults to **60 dB** (`--snr 60`); lower SNR can swamp φ matching. Main `test_physical()` still uses the caller's `SNR` argument.
+- **Channels:** use full-rank scattering (Rayleigh / low K), not strong LoS on H₁/H₂.
 
 ## Feature Extraction for Distillation
 
@@ -127,9 +140,28 @@ Training (`teacher_train.py`):
 
 Entry point: under `phase == "train_thin"`, the `teacher.py` `__main__` block trains CIFAR-10 (with a held-out test loader), instantiating a fresh `ThinTeacher` for each mode (`use_intermediate=True` and `False`) and printing the test accuracies and their gap.
 
+## Checkerboard Demo (Isolated)
+
+`checkboard/` is a standalone depth-separation experiment on 2D checkerboard data. It mirrors the ThinTeacher ReLU-boundary mechanism but produces a much larger with-vs-bypass gap (~35% at default `grid_n=6`, `hidden=24`).
+
+- `CheckerboardNet`: `enc: Linear(2, hidden) -> ReLU` -> optional `linear: Linear(hidden, hidden, bias=False)` -> `dec: ReLU -> Linear(hidden, 2)`.
+- Trains separate with-`W_lin` and bypass models; optional **wireless panel** routes the with-`W_lin` model through `H₂ diag(φ) H₁` instead of `W_lin`.
+- Wireless mapping: real `a = ReLU(enc(x))` reshaped to complex `s`; target `y_learned = complex(W_lin(a))`; φ from vendored `_optimize_phi_gd`; AWGN; AGC to `‖y_target‖`; decode via `dec(ReLU(y_ris_real))`.
+- Entry: `checkboard/wlin_necessity_checkerboard.py` (`--wireless`, `--snr`, `--channel_type`, `--phi_iters`). Does not import or train `MyTeacher`.
+
+Conceptual mapping to main code:
+
+| Checkerboard | OTA_RIS |
+|---|---|
+| `CheckerboardNet.linear` | `MyTeacher.linear` |
+| Wireless RIS path | `test_demo.test_physical()` |
+| `_optimize_phi_gd` (vendored) | `teacher_experiments._optimize_phi_gd` |
+
 ## Important Boundaries
 
 - Do not assume `get_channel_matching_loss()` is part of the active `teacher.py` ordinary forward path. The phi/channel-matching helpers in `teacher_experiments.py` (`_optimize_phi_gd`, `get_channel_matching_loss`, `_optimize_phi_analytical`, `_optimize_phi_manifold_gd`) are module-level functions whose first parameter is named `self` but are **not** bound to `MyTeacher`. They are called by passing a teacher instance explicitly, e.g. `_optimize_phi_gd(teacher, s, y_learned, H_1_batch, H_2_batch, iters=10)` in `test_demo.test_physical()`. `train_teacher_linear()`'s `use_channel_reg` path calls `teacher.get_channel_matching_loss(...)` as a bound method, which will fail unless it is explicitly attached to the teacher first.
-- Do not describe the current metasurface focus as closed-form phase optimization. The active physical test uses `_optimize_phi_gd()`.
+- Do not describe the current metasurface focus as closed-form phase optimization. The active physical test uses `_optimize_phi_gd()` with cosine-similarity loss.
+- Do not assume strong LoS Ricean channels are appropriate for RIS surrogate tests. High K on H₁/H₂ can collapse rank and break φ optimization (see `rank.md`).
+- Do not assume AGC is applied in `test_demo.test_physical()` just because checkerboard wireless uses it. Only the checkerboard path scales `y_ris` to `‖y_target‖` today.
 - Do not mix the GAN path (`ChannelGenerator`, `ChannelDiscriminator`, `HeavyRxDecoder_gan`, `forward_gan`) into ordinary teacher explanations unless the task explicitly mentions GAN training or GAN channel simulation.
-- Do not mix the `ThinTeacher` ablation stack into ordinary `MyTeacher` explanations. It is a separate, minimal path with no channel pools (`H_d`/`H_1`/`H_2`) and no GAN; it exists only to test whether the intermediate linear layer is necessary.
+- Do not mix the `ThinTeacher` ablation stack or `checkboard/` demo into ordinary `MyTeacher` training flows. They are isolated experiments for intermediate-layer necessity and wireless surrogate validation.

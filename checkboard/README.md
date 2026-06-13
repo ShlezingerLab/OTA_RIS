@@ -72,17 +72,26 @@ signal passes through a real RIS channel (same logic as `test_demo.test_physical
 a          = ReLU(enc(x))                          # (B, hidden)  — plays role of transmit signal s
 s          = view_as_complex(a)                    # (B, Nt=hidden/2)
 y_learned  = view_as_complex(W_lin(a))             # (B, Nr=hidden/2)  — phi-matching target
-φ          = _optimize_phi_gd(s, y_learned, H₁, H₂, iters)
+φ          = _optimize_phi_gd(s, y_learned, H₁, H₂, iters)   # cosine-sim loss
 H₁s        = H₁ @ s                                # (B, Nm)
 y_ris      = H₂ @ (H₁s * φ) + noise(y_ris, SNR)   # (B, Nr)
+y_ris      = AGC(y_ris, target=‖W_lin(a)‖)         # scale to learned intermediate norm
 logits     = dec(ReLU(view_as_real(y_ris)))        # back to (B, hidden) real
 ```
 
 Requirements for wireless:
 
 - `hidden` must be **even** (so `Nt = Nr = hidden/2`).
-- Channels from `channels.generate_channel_tensors_by_type` (geometric Ricean,
-  same format as `test_demo.py`, sionna-free).
+- Channels from `channels.generate_channel_tensors_by_type` via
+  `make_ris_channel_pools` (sionna-free). Default: **`geometric_rayleigh`**.
+- **`H₁` and `H₂` must be full-rank** (effective `Rank(H₂ diag(φ) H₁) ≥ Nr`) so
+  the RIS can mimic `W_lin`. Strong LoS (high Ricean κ) collapses the cascaded
+  channel to rank-1 and produces a uniform decision boundary. Prefer Rayleigh or
+  very low κ. See `../rank.md` for the derivation.
+- **φ optimization:** cosine similarity between flattened `y_learned` and
+  `y_ris` during GD; **AGC** at decode scales `y_ris` to `‖y_target‖` from
+  `W_lin(a)` (both are needed: cosine for direction, AGC for magnitude).
+- **SNR:** default **`60` dB** so AWGN does not dominate before φ matching.
 - `_optimize_phi_gd` and `noise` are vendored into the script (no sionna import).
 
 ---
@@ -98,7 +107,8 @@ checkboard/
 │   ├── checkerboard_g6_h24_epochs2500_with.pt
 │   └── checkerboard_g6_h24_epochs2500_bypass.pt
 └── plots/                           # comparison figures (.png)
-    └── checkerboard_g6_h24_epochs2500_comparison.png
+    ├── checkerboard_g6_h24_epochs2500_comparison.png
+    └── checkerboard_g6_h24_epochs2500_snr60_rayleigh_kappa*_wireless.png
 ```
 
 Checkpoint naming:
@@ -127,6 +137,7 @@ same data, then evaluates all paths:
      c. TEST wireless accuracy
 4. If --make_plots true:
      Save 3- or 4-panel comparison PNG
+     If --wireless true: also save Rayleigh/kappa fading comparison PNG
 ```
 
 With `--load true`, steps 2a and 2b are skipped; checkpoints are loaded directly
@@ -178,9 +189,9 @@ python -u wlin_necessity_checkerboard.py --mode full --load false --make_plots t
 # Load existing checkpoints and test only (no training)
 python -u wlin_necessity_checkerboard.py --load true --epochs 2500 --make_plots true
 
-# Load + wireless panel
+# Load + wireless panel (current defaults: Rayleigh, SNR 60 dB, Nm=100)
 python -u wlin_necessity_checkerboard.py --load true --epochs 2500 \
-  --wireless true --snr 10 --n_m 16 --phi_iters 2000 --make_plots true
+  --wireless true --snr 60 --make_plots true
 
 # Explicit checkpoint paths
 python -u wlin_necessity_checkerboard.py --load true \
@@ -224,28 +235,39 @@ Does not enable the wireless panel by default.
 | `--epochs` | mode default | Override epoch count (must match checkpoint filename when loading) |
 | `--make_plots` | mode default | `true` / `false` — save comparison PNG |
 | `--wireless` | `true` | Add 4th panel: wireless RIS path |
-| `--snr` | `10.0` | Wireless path SNR in dB |
-| `--n_m` | `16` | Number of RIS elements |
-| `--phi_iters` | `2000` | Gradient-descent iterations for `_optimize_phi_gd` |
+| `--snr` | `60.0` | Wireless path SNR in dB |
+| `--n_m` | `100` | Number of RIS elements (Nm) |
+| `--phi_iters` | `100` | Gradient-descent iterations for `_optimize_phi_gd` |
+| `--channel_type` | `geometric_rayleigh` | `geometric_rayleigh` or `geometric_ricean` |
+| `--kappa` | `10` | Ricean K-factor (dB) when `--channel_type geometric_ricean` |
+| `--kappa_sweep` | `20,30,40,50` | Comma-separated κ values for fading comparison plot |
+| `--include_rayleigh` | `true` | Include Rayleigh panel in fading comparison plot |
 | `--model_with` | auto | Explicit path to with-`W_lin` checkpoint |
 | `--model_bypass` | auto | Explicit path to bypass checkpoint |
 | `--sweep` | off | Sweep `grid_n` at fixed `hidden` |
 
 ---
 
-## Comparison plot
+## Comparison plots
 
-When `--make_plots true`, saves a single PNG with up to 4 panels:
+When `--make_plots true`, saves:
+
+**Main 3- or 4-panel PNG** (with/bypass/wireless on one channel):
 
 ```text
 [Benchmark]  |  [With W_lin]  |  [Without W_lin / bypass]  |  [Wireless RIS]
- true board      acc ~95%           acc ~60%                    acc TBD
+ true board      acc ~95%           acc ~60%                    wireless acc
 ```
-
-Saved to:
 
 ```text
 plots/checkerboard_g{grid_n}_h{hidden}_epochs{epochs}_comparison.png
+```
+
+**Fading comparison PNG** (when `--wireless true`): wireless decision boundaries
+for Rayleigh plus each `--kappa_sweep` Ricean panel at fixed SNR:
+
+```text
+plots/checkerboard_g{grid_n}_h{hidden}_epochs{epochs}_snr{snr}_rayleigh_kappa*_wireless.png
 ```
 
 ---
@@ -271,47 +293,56 @@ additionally imports `channels.py` (sionna-free). `_optimize_phi_gd` and
 
 ---
 
-## Next step: verify wireless / phi optimization
+## Wireless RIS: root cause and current recipe
 
-**Open problem:** the wireless RIS path accuracy is currently poor — phi
-optimization does not seem to work as expected on the checkerboard mapping.
+**Root cause (fixed in script):** strong LoS Ricean channels made
+`H₂ diag(φ) H₁` effectively rank-1, so `y_ris` collapsed to a fixed direction
+regardless of input — a flat "pure blue" wireless panel. Full write-up:
+`../rank.md`.
 
-Things to investigate:
+**Current recipe in `wireless_forward`:**
 
-1. **Real ↔ complex reshape**: `a` (length `hidden` real) is reshaped to
-   complex `s` via `view_as_complex(a.reshape(B, hidden/2, 2))`. Verify this
-   mapping preserves the information `W_lin` was trained on.
+1. Generate **`geometric_rayleigh`** (or low-κ Ricean) `H₁`, `H₂` pools.
+2. Optimize `φ` with **cosine similarity** loss vs `y_learned = W_lin(a)`.
+3. Forward through RIS + AWGN at **`--snr 60`** dB (default).
+4. Apply **AGC**: scale received real vector to `‖W_lin(a)‖` before decoder ReLU.
 
-2. **Phi convergence**: log cosine similarity / loss inside `_optimize_phi_gd`
-   for checkerboard inputs vs MNIST inputs in `test_demo`. Default was 10 iters
-   in `test_physical`; script default is now `--phi_iters 2000`.
+**Still open:**
 
-3. **Channel dimensions**: checkerboard uses `Nt = Nr = hidden/2 = 12` (much
-   smaller than `MyTeacher`'s `Nt=20, Nr=10, Nm=16`). Check whether `Nm=16`
-   RIS elements can span the smaller complex space.
+- Confirm end-to-end wireless accuracy vs with-`W_lin` (~95%) under the new defaults.
+- Wire AGC consistently with the cosine objective (TODO in code).
+- Port rank/SNR/cosine+AGC recipe to `test_demo.test_physical()`.
 
-4. **Target mismatch**: `y_learned = W_lin(a)` is a *real-valued* linear map
-   reinterpreted as complex. In `test_demo`, `y_learned` comes from a complex
-   linear layer on complex `s`. The checkerboard target may not be achievable
-   by any `H₂·diag(φ)·H₁·s`.
-
-5. **Noise level**: `--snr 10` dB may dominate when `y_ris` is already a poor
-   match to `y_learned`. Try `--snr` sweep (0, 10, 20, inf).
-
-6. **Plot inspection**: compare the wireless panel decision boundary to the
-   with-`W_lin` panel. If it looks like noise/random, phi optimization failed
-   entirely; if it looks smoothed/wrong, the channel is partially working.
-
-Suggested debug command:
+Suggested command:
 
 ```bash
 python -u wlin_necessity_checkerboard.py --load true --epochs 2500 \
-  --wireless true --phi_iters 2000 --snr 10 --make_plots true
+  --wireless true --snr 60 --channel_type geometric_rayleigh --make_plots true
 ```
 
-Then inspect `plots/checkerboard_g6_h24_epochs2500_comparison.png` and compare
-the wireless accuracy printed as `channel_accuracy=...%` against with-`W_lin`
+Compare printed `wireless : ...%` and both PNGs under `plots/` against with-`W_lin`
 (~95%) and bypass (~60%).
+
+---
+
+## Recent changes
+
+From recent work on the wireless panel (committed in `13c25da checkboard plot update`):
+
+- Identified **rank deficiency** under strong LoS; default channel is now Rayleigh.
+- **`--snr` default raised to 60 dB** (was 10 dB in older README runs).
+- **`--n_m` default 100**, `--phi_iters` default 100.
+- Added **`--channel_type`**, **`--kappa`**, **`--kappa_sweep`**, **`--include_rayleigh`**.
+- **Cosine φ loss** + **AGC** at decoder input in `wireless_forward`.
+- New **fading comparison plot** (Rayleigh vs Ricean κ sweep).
+- Added `../rank.md` (repo root) documenting the LoS collapse math.
+
+## Next steps
+
+1. Re-run wireless eval with defaults above; record wireless accuracy vs ~95%.
+2. Finish AGC + cosine integration (see TODO in `wireless_forward`).
+3. Update `test_demo.py` / `teacher_experiments.py` with the same channel-rank,
+   SNR, and φ/AGC recipe.
 
 ---
 
