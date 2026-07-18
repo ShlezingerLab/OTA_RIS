@@ -50,3 +50,8 @@ Thumbs.db
 *.yml
 *.jsonl
 data/
+
+# Experiment outputs / artifacts
+wandb/
+plots_for_meeting/
+checkboard/plots_old/
