@@ -155,7 +155,7 @@ def save_model(model, path, grid_n, hidden, epochs, use_intermediate):
 
 def load_model(path, device):
     """Load a saved CheckerboardNet checkpoint for evaluation/plotting."""
-    checkpoint = torch.load(path, map_location=device)
+    checkpoint = torch.load(path, map_location=device, weights_only=True)
     model = CheckerboardNet(
         hidden=checkpoint["hidden"],
         num_classes=2,
@@ -163,7 +163,7 @@ def load_model(path, device):
     ).to(device)
     model.load_state_dict(checkpoint["state_dict"])
     model.eval()
-    print(f"  loaded model from: {path}")
+    #print(f"  loaded model from: {path}")
     return model
 
 
@@ -312,13 +312,83 @@ def wireless_settings_title(channel_type, snr_db, kappa, n_m, phi_iters, omit=No
     return " | ".join(parts)
 
 
-@torch.no_grad()
-def plot_decision_comparison(models, accuracies, device, grid_n, path, res: int = 300,
-                             wireless_cfg=None):
-    """Save ground truth, with-W_lin, and bypass decision regions in one PNG."""
-    import matplotlib
-    matplotlib.use("Agg")
+def _matplotlib_interactive():
+    """True when running under IPython / Interactive Window (inline show works)."""
+    return "ipykernel" in sys.modules
+
+
+def _matplotlib_has_display():
+    """True when a terminal run has a GUI display available for matplotlib."""
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def _ensure_qt_runtime_dir():
+    """Give Qt a writable runtime dir when /run/user/... is not usable."""
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime_dir:
+        try:
+            os.makedirs(runtime_dir, mode=0o700, exist_ok=True)
+            if os.access(runtime_dir, os.W_OK | os.X_OK):
+                return
+        except OSError:
+            pass
+
+    uid = os.getuid() if hasattr(os, "getuid") else "user"
+    fallback_dir = os.path.join("/tmp", f"runtime-{uid}")
+    os.makedirs(fallback_dir, mode=0o700, exist_ok=True)
+    os.chmod(fallback_dir, 0o700)
+    os.environ["XDG_RUNTIME_DIR"] = fallback_dir
+
+
+def _matplotlib_pyplot():
+    """Import pyplot using matplotlib's configured/default backend."""
+    _ensure_qt_runtime_dir()
     import matplotlib.pyplot as plt
+    return plt
+
+
+def _matplotlib_can_show(plt):
+    """True when plt.show() can render inline or open a GUI window."""
+    if _matplotlib_interactive():
+        return True
+    backend = plt.get_backend().lower()
+    backend_name = backend.rsplit(".", 1)[-1]
+    non_gui_backends = {"agg", "pdf", "pgf", "ps", "svg", "template"}
+    return backend_name not in non_gui_backends
+
+
+def _show_or_close_plot(plt, fig, path):
+    """Show a figure when possible; otherwise close it with a useful hint."""
+    if _matplotlib_can_show(plt):
+        try:
+            plt.show()
+            return
+        except Exception as exc:
+            print(f"  matplotlib could not open an interactive window ({exc}); "
+                  "falling back to file output")
+            if path is None:
+                fallback_path = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)), "plots", "latest_plot.png"
+                )
+                os.makedirs(os.path.dirname(fallback_path), exist_ok=True)
+                fig.savefig(fallback_path, dpi=120, bbox_inches="tight")
+                print(f"  saved fallback plot to: {fallback_path}")
+    else:
+        if path is None:
+            print("  no interactive matplotlib display detected; rerun with --save_plots true "
+                  "to write PNGs under checkboard/plots/")
+    plt.close(fig)
+
+
+@torch.no_grad()
+def plot_decision_comparison(models, accuracies, device, grid_n, path=None, res: int = 300,
+                             wireless_cfg=None):
+    """Show or optionally save ground-truth / with-W_lin / bypass regions.
+
+    When `path` is None, nothing is written to disk — figure is only displayed
+    when matplotlib has an inline or GUI display. When `path` is set, also saves a PNG.
+    """
+    plt = _matplotlib_pyplot()
 
     lin = np.linspace(0.0, 1.0, res, dtype=np.float32)
     gx, gy = np.meshgrid(lin, lin)
@@ -363,22 +433,21 @@ def plot_decision_comparison(models, accuracies, device, grid_n, path, res: int 
         ax.set_xticks([])
         ax.set_yticks([])
     fig.tight_layout()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    fig.savefig(path, dpi=120, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  saved decision-boundary plot to: {path}")
+    if path is not None:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fig.savefig(path, dpi=120, bbox_inches="tight")
+        print(f"  saved decision-boundary plot to: {path}")
+    _show_or_close_plot(plt, fig, path)
 
 
 @torch.no_grad()
 def plot_wireless_sweep_comparison(model, x_te, y_te, device, grid_n, hidden,
-                                   sweep_name, sweep_values, path,
+                                   sweep_name, sweep_values, path=None,
                                    channel_type="geometric_rayleigh", kappa=10.0,
                                    snr_db=60.0, n_m=100, phi_iters=100,
                                    res: int = 300):
-    """Save wireless RIS decision boundaries while varying one wireless parameter."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    """Show or optionally save wireless RIS sweep panels."""
+    plt = _matplotlib_pyplot()
 
     lin = np.linspace(0.0, 1.0, res, dtype=np.float32)
     gx, gy = np.meshgrid(lin, lin)
@@ -438,10 +507,11 @@ def plot_wireless_sweep_comparison(model, x_te, y_te, device, grid_n, hidden,
         y=1.02,
     )
     fig.tight_layout()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    fig.savefig(path, dpi=120, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  saved wireless {sweep_name} sweep to: {path}")
+    if path is not None:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fig.savefig(path, dpi=120, bbox_inches="tight")
+        print(f"  saved wireless {sweep_name} sweep to: {path}")
+    _show_or_close_plot(plt, fig, path)
 
 
 def _tag_float(x):
@@ -470,7 +540,7 @@ def run_once(grid_n, hidden, n_train, n_test, batch_size, epochs, lr, weight_dec
              wireless=False, channel_type="geometric_rayleigh", kappa=10, snr_db=10.0, n_m=100, phi_iters=100,
              load_only=False, model_with_path=None, model_bypass_path=None,
              phi_iters_sweep=None, snr_sweep=None, kappa_sweep=None, n_m_sweep=None,
-             decision_plot=True):
+             decision_plot=True, save_plot_files=False):
     """Train (or load) both routing modes and return (acc_with, acc_bypass).
 
     When `load_only=True`, skip training and load saved checkpoints from
@@ -481,6 +551,9 @@ def run_once(grid_n, hidden, n_train, n_test, batch_size, epochs, lr, weight_dec
     with-W_lin model and replaces W_lin with `H_2 diag(phi) H_1` (phi from
     `_optimize_phi_gd`). The wireless test accuracy is printed and, if plotting,
     added as a 4th panel.
+
+    Plots are shown when running in Interactive Window. PNG files are written
+    only when `save_plot_files=True`.
     """
     x_te, y_te = make_checkerboard(n_test, grid_n=grid_n, seed=seed + 1)
     if not load_only:
@@ -500,7 +573,7 @@ def run_once(grid_n, hidden, n_train, n_test, batch_size, epochs, lr, weight_dec
                 path = model_path_for(model_dir, grid_n, hidden, epochs, use_mid)
             if not os.path.isfile(path):
                 raise FileNotFoundError(f"Checkpoint not found for {tag}: {path}")
-            print(f"\n=== Loading {tag} | grid_n={grid_n}, hidden={hidden} ===")
+            #print(f"\n=== Loading {tag} | grid_n={grid_n}, hidden={hidden} ===")
             eval_model = load_model(path, device)
         else:
             torch.manual_seed(seed)
@@ -538,10 +611,14 @@ def run_once(grid_n, hidden, n_train, n_test, batch_size, epochs, lr, weight_dec
         for sweep_values in (phi_iters_sweep, snr_sweep, kappa_sweep, n_m_sweep)
     )
     if make_plots:
+        # Display-only by default (path=None). PNG only when save_plot_files=True.
         if decision_plot and not wireless_sweep_requested:
+            plot_path = (
+                os.path.join(plot_dir, f"epochs_{epochs}.png") if save_plot_files else None
+            )
             plot_decision_comparison(
                 eval_models, acc, device, grid_n=grid_n,
-                path=os.path.join(plot_dir, f"epochs_{epochs}.png"),
+                path=plot_path,
                 wireless_cfg=wireless_cfg,
             )
         if wireless_cfg is not None:
@@ -555,11 +632,13 @@ def run_once(grid_n, hidden, n_train, n_test, batch_size, epochs, lr, weight_dec
             for sweep_name, sweep_values, filename_label in sweep_specs:
                 if sweep_values is None:
                     continue
-                wireless_path = os.path.join(
-                    plot_dir,
-                    f"checkerboard_g{grid_n}_h{hidden}_epochs{epochs}_"
-                    f"{filename_label}_{_tag_values(sweep_values)}_wireless.png",
-                )
+                wireless_path = None
+                if save_plot_files:
+                    wireless_path = os.path.join(
+                        plot_dir,
+                        f"checkerboard_g{grid_n}_h{hidden}_epochs{epochs}_"
+                        f"{filename_label}_{_tag_values(sweep_values)}_wireless.png",
+                    )
                 plot_wireless_sweep_comparison(
                     eval_models[True], x_te, y_te, device, grid_n, hidden,
                     sweep_name, sweep_values, wireless_path,
@@ -594,7 +673,9 @@ if __name__ == "__main__":
     parser.add_argument("--mode", type=str, default="demo", choices=["demo", "full"],
                         help="Run mode: demo is quick; full uses the validated long settings")
     parser.add_argument("--make_plots", type=str, default="true", choices=["true", "false"],
-                        help="Override plot saving: true or false")
+                        help="Show decision-boundary plots (Interactive Window): true or false")
+    parser.add_argument("--save_plots", type=str, default="false", choices=["true", "false"],
+                        help="Also write plot PNGs under plots/: true or false (default false)")
     parser.add_argument("--save", type=str, default="true", choices=["true", "false"],
                         help="Save trained models before loading them for evaluation: true or false")
     parser.add_argument("--load", type=str, default="true", choices=["true", "false"],
@@ -624,7 +705,11 @@ if __name__ == "__main__":
                         help="Comma-separated K-factor values for a Ricean wireless sweep plot; omit or pass none to skip")
     parser.add_argument("--n_m_sweep", type=str, default=None,
                         help="Comma-separated RIS element counts (Nm) for a wireless sweep plot; omit or pass none to skip")
-    args = parser.parse_args()
+    # Interactive Window / Jupyter injects kernel argv; ignore unknowns there.
+    if _matplotlib_interactive():
+        args, _ = parser.parse_known_args()
+    else:
+        args = parser.parse_args()
     mode = args.mode
     save_models = args.save == "true"
     load_only = args.load == "true"
@@ -654,11 +739,13 @@ if __name__ == "__main__":
 
     SWEEP = SWEEP or args.sweep
     make_plots = args.make_plots == "true" and not args.no_plots
+    save_plot_files = args.save_plots == "true"
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     print(f"Mode: {mode}")
     print(f"Make plots: {make_plots}")
+    print(f"Save plot files: {save_plot_files}")
     print(f"Save models: {save_models}")
     print(f"Load only: {load_only}")
     print(f"Wireless RIS panel: {wireless}")
@@ -685,7 +772,7 @@ if __name__ == "__main__":
                 model_bypass_path=args.model_bypass,
                 phi_iters_sweep=phi_iters_sweep, snr_sweep=snr_sweep,
                 kappa_sweep=kappa_sweep, n_m_sweep=n_m_sweep,
-                decision_plot=False,
+                decision_plot=False, save_plot_files=save_plot_files,
             )
             results.append((g, acc_with, acc_bypass))
         for g, acc_with, acc_bypass in results:
@@ -703,6 +790,7 @@ if __name__ == "__main__":
             model_bypass_path=args.model_bypass,
             phi_iters_sweep=phi_iters_sweep, snr_sweep=snr_sweep,
             kappa_sweep=kappa_sweep, n_m_sweep=n_m_sweep,
+            save_plot_files=save_plot_files,
         )
         if wireless:
             print(f"wireless : {channel_accuracy:.2f}%")
