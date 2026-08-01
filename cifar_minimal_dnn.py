@@ -1,5 +1,5 @@
 """
-CIFAR-10 teacher-style classifier with an optional wireless RIS inference path.
+CIFAR-10 teacher-style classifier with optional wireless RIS / SimNet paths.
 
 Standalone, self-contained CIFAR-10 demo inspired by
 `wlin_necessity_checkerboard.py` and the teacher pattern in
@@ -15,6 +15,12 @@ with softmax + argmax).
 When `--wireless true`, the trained `linear` is replaced at inference by a
 physical RIS channel `H_2 diag(phi) H_1` whose phases `phi` are matched to the
 learned target `y = linear(s)` via `_optimize_phi_gd` (vendored, sionna-free).
+
+When `--simnet true`, a parallel end-to-end net (`CifarSimCNN`) replaces `linear`
+with the physical cascade `H_2 · SimNet(H_1 · s)` (same encoder/decoder as the
+teacher; phases live in `SimNet`, trained with CE + AWGN). Kappa sweeps can plot
+teacher bound, wireless RIS, and SimNet E2E together.
+
 The RIS channel pools reuse `channels.generate_channel_tensors_by_type`.
 
 CIFAR-10 is read directly from the raw pickle batches under
@@ -155,6 +161,140 @@ class CifarCNN(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.intermediate(self.encode(x))
         y = y + noise(y, self.snr_db)               # AWGN before decoder
+        return self.decode(y)
+
+
+def _split_to_close_to_square_factors(n: int) -> tuple[int, int]:
+    """Factor n into (rows, cols) as close to square as possible (for RisLayer grid)."""
+    n = int(n)
+    if n <= 0:
+        raise ValueError("n must be positive")
+    root = int(math.isqrt(n))
+    for rows in range(root, 0, -1):
+        if n % rows == 0:
+            return int(rows), int(n // rows)
+    return 1, n
+
+
+def _build_sim_net(
+    n_m: int,
+    device,
+    carrier_freq_hz: float = 28e9,
+    sim_num_layers: int = 3,
+    sim_layer_dist_lambda: float = 5.0,
+    sim_elem_width_lambda: float = 0.5,
+    sim_elem_dist_lambda: float | None = None,
+    sim_orientation_plane: str = "yz",
+    sim_first_layer_central_coords: tuple[float, float, float] = (0.0, 0.0, 0.0),
+):
+    """Build a multi-layer diffractive SimNet with N_m elements per layer."""
+    from CODE_EXAMPLE.simnet import SimNet, RisLayer
+
+    c_light = 299_792_458.0
+    wavelength = c_light / float(carrier_freq_hz)
+    elem_dist_lambda = (
+        float(sim_elem_width_lambda)
+        if sim_elem_dist_lambda is None
+        else float(sim_elem_dist_lambda)
+    )
+    n_rows, n_cols = _split_to_close_to_square_factors(n_m)
+    layers = [RisLayer(n_rows, n_cols) for _ in range(int(sim_num_layers))]
+    return SimNet(
+        layers=layers,
+        layer_dist=float(sim_layer_dist_lambda) * wavelength,
+        wavelength=wavelength,
+        elem_area=(float(sim_elem_width_lambda) * wavelength) ** 2,
+        elem_dist=elem_dist_lambda * wavelength,
+        layers_orientation_plane=sim_orientation_plane,
+        first_layer_central_coords=sim_first_layer_central_coords,
+        complex_dtype=torch.complex64,
+    ).to(device)
+
+
+class CifarSimCNN(nn.Module):
+    """CIFAR-10 net with SimNet intermediate: encoder -> H2 SimNet(H1 s) -> decoder.
+
+    Same encoder/decoder as `CifarCNN`; the bias-free `linear` is replaced by the
+    physical cascade used in `train_minn` (metanet/sim) and `MyTeacher._compute_sim_target`.
+    SimNet Metasurface phases are trained end-to-end with the encoder and decoder.
+    """
+
+    def __init__(self, n_t: int = 32, n_r: int = 16, n_m: int = 64,
+                 num_classes: int = 10, snr_db: float = 10.0, power: float = 1.0,
+                 carrier_freq_hz: float = 28e9, sim_num_layers: int = 3,
+                 sim_layer_dist_lambda: float = 5.0,
+                 sim_elem_width_lambda: float = 0.5,
+                 sim_elem_dist_lambda: float | None = None,
+                 sim_orientation_plane: str = "yz"):
+        super().__init__()
+        self.n_t = int(n_t)
+        self.n_r = int(n_r)
+        self.n_m = int(n_m)
+        self.num_classes = int(num_classes)
+        self.snr_db = float(snr_db)
+        self.power = float(power)
+        self.carrier_freq_hz = float(carrier_freq_hz)
+        self.sim_num_layers = int(sim_num_layers)
+        self.sim_layer_dist_lambda = float(sim_layer_dist_lambda)
+        self.sim_elem_width_lambda = float(sim_elem_width_lambda)
+        self.sim_elem_dist_lambda = (
+            None if sim_elem_dist_lambda is None else float(sim_elem_dist_lambda)
+        )
+        self.sim_orientation_plane = str(sim_orientation_plane)
+
+        c1, c2, c3 = 32, 64, 128
+        self.features = nn.Sequential(              # 3x32x32 -> 128x4x4
+            nn.Conv2d(3, c1, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),                        # 32 -> 16
+            nn.Conv2d(c1, c2, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),                        # 16 -> 8
+            nn.Conv2d(c2, c3, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),                        # 8 -> 4
+        )
+        self.enc_fc = nn.Linear(c3 * 4 * 4, 2 * self.n_t)
+        self.sim_net = _build_sim_net(
+            n_m=self.n_m,
+            device="cpu",
+            carrier_freq_hz=self.carrier_freq_hz,
+            sim_num_layers=self.sim_num_layers,
+            sim_layer_dist_lambda=self.sim_layer_dist_lambda,
+            sim_elem_width_lambda=self.sim_elem_width_lambda,
+            sim_elem_dist_lambda=self.sim_elem_dist_lambda,
+            sim_orientation_plane=self.sim_orientation_plane,
+        )
+        self.dec = nn.Sequential(
+            nn.Linear(2 * self.n_r, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, self.num_classes),
+        )
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Image -> unit-power complex transmit vector s (B, N_t)."""
+        z = self.enc_fc(self.features(x).reshape(x.size(0), -1))
+        s = torch.view_as_complex(z.reshape(z.size(0), self.n_t, 2).contiguous())
+        norm = torch.sqrt(torch.mean(s.abs() ** 2, dim=1, keepdim=True) + 1e-8)
+        return (math.sqrt(self.power) * s) / norm
+
+    def intermediate(self, s: torch.Tensor, H_1: torch.Tensor,
+                     H_2: torch.Tensor) -> torch.Tensor:
+        """Physical cascade y = H_2 · SimNet(H_1 · s), shape (B, N_r)."""
+        H_1_s = torch.bmm(H_1, s.unsqueeze(-1)).squeeze(-1)           # (B, N_m)
+        sim_out = self.sim_net(H_1_s)                                 # (B, N_m)
+        return torch.bmm(H_2, sim_out.unsqueeze(-1)).squeeze(-1)      # (B, N_r)
+
+    def decode(self, y: torch.Tensor) -> torch.Tensor:
+        """Complex received vector y (B, N_r) -> logits."""
+        return self.dec(torch.cat([y.real, y.imag], dim=1))
+
+    def forward(self, x: torch.Tensor, H_1: torch.Tensor,
+                H_2: torch.Tensor) -> torch.Tensor:
+        y = self.intermediate(self.encode(x), H_1, H_2)
+        y = y + noise(y, self.snr_db)
         return self.decode(y)
 
 
@@ -346,6 +486,13 @@ def model_path_for(model_dir, n_t, n_r, epochs):
     return os.path.join(model_dir, f"cifar_wl_nt{n_t}_nr{n_r}_epochs{epochs}.pt")
 
 
+def sim_model_path_for(model_dir, n_t, n_r, n_m, epochs):
+    """Stable checkpoint path for one CifarSimCNN (n_t, n_r, n_m, epochs) config."""
+    return os.path.join(
+        model_dir, f"cifar_sim_nt{n_t}_nr{n_r}_nm{n_m}_epochs{epochs}.pt"
+    )
+
+
 def save_model(model, path, epochs):
     """Save model weights plus the metadata needed to reload."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -363,6 +510,30 @@ def save_model(model, path, epochs):
     print(f"  saved model to: {path}")
 
 
+def save_sim_model(model, path, epochs):
+    """Save CifarSimCNN weights plus SimNet geometry metadata for reload."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    checkpoint = {
+        "kind": "sim",
+        "state_dict": model.state_dict(),
+        "n_t": model.n_t,
+        "n_r": model.n_r,
+        "n_m": model.n_m,
+        "num_classes": model.num_classes,
+        "epochs": epochs,
+        "snr_db": model.snr_db,
+        "power": model.power,
+        "carrier_freq_hz": model.carrier_freq_hz,
+        "sim_num_layers": model.sim_num_layers,
+        "sim_layer_dist_lambda": model.sim_layer_dist_lambda,
+        "sim_elem_width_lambda": model.sim_elem_width_lambda,
+        "sim_elem_dist_lambda": model.sim_elem_dist_lambda,
+        "sim_orientation_plane": model.sim_orientation_plane,
+    }
+    torch.save(checkpoint, path)
+    print(f"  saved SimNet model to: {path}")
+
+
 def load_model(path, device):
     """Load a saved CifarCNN checkpoint for evaluation/plotting."""
     checkpoint = torch.load(path, map_location=device, weights_only=True)
@@ -377,6 +548,85 @@ def load_model(path, device):
     model.load_state_dict(checkpoint["state_dict"])
     model.eval()
     return model
+
+
+def load_sim_model(path, device):
+    """Load a saved CifarSimCNN checkpoint (rebuilds SimNet from metadata)."""
+    checkpoint = torch.load(path, map_location=device, weights_only=True)
+    model = CifarSimCNN(
+        n_t=checkpoint["n_t"],
+        n_r=checkpoint["n_r"],
+        n_m=checkpoint.get("n_m", 64),
+        num_classes=checkpoint.get("num_classes", 10),
+        snr_db=checkpoint.get("snr_db", 10.0),
+        power=checkpoint.get("power", 1.0),
+        carrier_freq_hz=checkpoint.get("carrier_freq_hz", 28e9),
+        sim_num_layers=checkpoint.get("sim_num_layers", 3),
+        sim_layer_dist_lambda=checkpoint.get("sim_layer_dist_lambda", 5.0),
+        sim_elem_width_lambda=checkpoint.get("sim_elem_width_lambda", 0.5),
+        sim_elem_dist_lambda=checkpoint.get("sim_elem_dist_lambda", None),
+        sim_orientation_plane=checkpoint.get("sim_orientation_plane", "yz"),
+    ).to(device)
+    model.load_state_dict(checkpoint["state_dict"])
+    model.eval()
+    return model
+
+
+def train_sim(model, x, y, H_1_all, H_2_all, device, epochs, lr, batch_size,
+              weight_decay):
+    """End-to-end Adam + CrossEntropy training for CifarSimCNN (samples H1/H2)."""
+    model = model.to(device)
+    x, y = x.to(device), y.to(device)
+    H_1_all = H_1_all.to(device)
+    H_2_all = H_2_all.to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    criterion = nn.CrossEntropyLoss()
+    n = x.size(0)
+    num_channels = H_1_all.size(0)
+
+    for epoch in range(epochs):
+        model.train()
+        perm = torch.randperm(n, device=device)
+        running_loss, correct, total = 0.0, 0, 0
+        for start in range(0, n, batch_size):
+            idx = perm[start:start + batch_size]
+            xb, yb = x[idx], y[idx]
+            ch_idx = torch.randint(0, num_channels, (xb.size(0),), device=device)
+            H_1_b = H_1_all[ch_idx]
+            H_2_b = H_2_all[ch_idx]
+            logits = model(xb, H_1_b, H_2_b)
+            loss = criterion(logits, yb)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item() * xb.size(0)
+            correct += (logits.argmax(1) == yb).sum().item()
+            total += xb.size(0)
+        if (epoch + 1) % max(1, epochs // 10) == 0 or epoch == 0:
+            print(
+                f"  [sim] epoch {epoch + 1:4d}/{epochs} | "
+                f"loss {running_loss / total:.4f} | train acc {100.0 * correct / total:.2f}%"
+            )
+    return 100.0 * correct / max(total, 1)
+
+
+@torch.no_grad()
+def evaluate_sim(model, x, y, H_1_all, H_2_all, device, batch_size=500):
+    """Test accuracy (%) of CifarSimCNN (channels re-sampled per batch)."""
+    model.eval()
+    x, y = x.to(device), y.to(device)
+    H_1_all = H_1_all.to(device)
+    H_2_all = H_2_all.to(device)
+    num_channels = H_1_all.size(0)
+    correct, total = 0, 0
+    for start in range(0, x.size(0), batch_size):
+        xb = x[start:start + batch_size]
+        yb = y[start:start + batch_size]
+        ch_idx = torch.randint(0, num_channels, (xb.size(0),), device=device)
+        logits = model(xb, H_1_all[ch_idx], H_2_all[ch_idx])
+        correct += (logits.argmax(1) == yb).sum().item()
+        total += yb.size(0)
+    return 100.0 * correct / max(total, 1)
 
 
 def _matplotlib_interactive():
@@ -499,9 +749,12 @@ def plot_sample_predictions(model, x_te, y_te, device, label_names, path=None,
 
 
 @torch.no_grad()
-def evaluate_kappa_sweep(model, x_te, y_te, sim_acc, kappas, device, snr_db,
-                         phi_iters, num_channels):
-    """Evaluate Ricean wireless accuracy for each kappa value."""
+def evaluate_kappa_sweep(model, x_te, y_te, teacher_acc, kappas, device, snr_db,
+                         phi_iters, num_channels, sim_model=None):
+    """Evaluate Ricean wireless (and optional SimNet E2E) accuracy per kappa.
+
+    Returns list of (kappa, teacher_acc, wireless_acc, simnet_acc_or_nan).
+    """
     results = []
     for kappa in kappas:
         print(f"\n=== Kappa sweep | kappa={kappa:g} | channel=geometric_ricean ===")
@@ -513,12 +766,21 @@ def evaluate_kappa_sweep(model, x_te, y_te, sim_acc, kappas, device, snr_db,
         )
         wireless_acc = evaluate_wireless(
             model, x_te, y_te, H_1_all, H_2_all, snr_db, device, phi_iters)
-        results.append((float(kappa), float(sim_acc), float(wireless_acc)))
+        if sim_model is not None:
+            simnet_acc = evaluate_sim(
+                sim_model, x_te, y_te, H_1_all, H_2_all, device)
+            print(f"  wireless acc={wireless_acc:.2f}% | SimNet E2E acc={simnet_acc:.2f}%")
+        else:
+            simnet_acc = float("nan")
+            print(f"  wireless acc={wireless_acc:.2f}%")
+        results.append(
+            (float(kappa), float(teacher_acc), float(wireless_acc), float(simnet_acc))
+        )
     return results
 
 
-def plot_kappa_sweep(kappas, sim_acc, wireless_accs, path=None):
-    """Show or optionally save wireless accuracy vs log(1 / Ricean kappa)."""
+def plot_kappa_sweep(kappas, teacher_acc, wireless_accs, path=None, simnet_accs=None):
+    """Show or optionally save accuracy vs log(1 / Ricean kappa)."""
     plt = _matplotlib_pyplot()
     inv_kappa = 1.0 / np.asarray(kappas, dtype=np.float64)
     x_values = np.log10(inv_kappa)  # log10(1 / kappa)
@@ -527,11 +789,18 @@ def plot_kappa_sweep(kappas, sim_acc, wireless_accs, path=None):
     wireless_accs = np.asarray(wireless_accs, dtype=np.float64)[order]
 
     fig, ax = plt.subplots(figsize=(7, 4))
-    ax.axhline(sim_acc, linestyle="--", label=f"teacher upper bound ({sim_acc:.1f}%)")
+    ax.axhline(
+        teacher_acc, linestyle="--",
+        label=f"teacher upper bound ({teacher_acc:.1f}%)",
+    )
     ax.plot(x_values, wireless_accs, marker="o", label="wireless RIS")
+    if simnet_accs is not None:
+        simnet_accs = np.asarray(simnet_accs, dtype=np.float64)[order]
+        if np.isfinite(simnet_accs).any():
+            ax.plot(x_values, simnet_accs, marker="s", label="SimNet E2E")
     ax.set_xlabel(r"$\log_{10}(1 / \kappa)$")
     ax.set_ylabel("Accuracy (%)")
-    ax.set_title(r"CIFAR wireless accuracy vs $\log_{10}(1 / \kappa)$")
+    ax.set_title(r"CIFAR accuracy vs $\log_{10}(1 / \kappa)$")
     ax.grid(True, alpha=0.3)
     ax.legend()
     fig.tight_layout()
@@ -547,19 +816,24 @@ def run_once(n_t, n_r, n_m, n_epochs, batch_size, lr, weight_decay, seed, device
              load_only=False, model_path=None, save_plot_files=False,
              snr_db=10.0, wireless=False, channel_type="geometric_rayleigh",
              kappa=None, phi_iters=100, num_channels=1000, kappa_sweep=None,
+             simnet=False, sim_num_layers=3, sim_layer_dist_lambda=5.0,
+             sim_elem_width_lambda=0.5, carrier_freq_hz=28e9,
              data_dir=_DEFAULT_CIFAR_DIR):
-    """Train (or load) the CIFAR net and return (test_acc, wireless_acc) in %.
+    """Train (or load) the CIFAR net and return (test_acc, wireless_acc, simnet_acc).
 
     When `load_only=True`, skip training and load a saved checkpoint from
     `model_dir` (or the explicit `--model` path), then test and plot as usual.
     When `wireless=True`, also evaluate the RIS-channel inference path.
-    `wireless_acc` is None when `wireless=False`.
+    When `simnet=True` (or kappa_sweep is set), also train/eval `CifarSimCNN`.
+    Accuracies that are not requested are returned as None.
     For geometric_rayleigh, kappa is forced to None (Rayleigh has no K-factor).
     """
     if channel_type == "geometric_rayleigh":
         kappa = None
+    use_simnet = bool(simnet) or (kappa_sweep is not None)
     x_te, y_te = load_cifar(data_dir, train=False)
     label_names = load_label_names(data_dir)
+    x_tr = y_tr = None
 
     if load_only:
         path = model_path
@@ -593,21 +867,91 @@ def run_once(n_t, n_r, n_m, n_epochs, batch_size, lr, weight_decay, seed, device
 
     acc = evaluate(model, x_te, y_te, device)
 
+    sim_model = None
+    simnet_acc = None
+    if use_simnet:
+        sim_path = (
+            None if model_dir is None
+            else sim_model_path_for(model_dir, n_t, n_r, n_m, n_epochs)
+        )
+        if load_only:
+            if sim_path is None or not os.path.isfile(sim_path):
+                raise FileNotFoundError(
+                    f"SimNet checkpoint not found: {sim_path}. "
+                    "Train with --simnet true --save true first."
+                )
+            print(f"\n=== Loading SimNet CIFAR net | n_t={n_t}, n_r={n_r}, "
+                  f"n_m={n_m}, epochs={n_epochs} ===")
+            sim_model = load_sim_model(sim_path, device)
+            sim_model.snr_db = float(snr_db)
+        else:
+            if x_tr is None:
+                x_tr, y_tr = load_cifar(data_dir, train=True)
+            print(f"\n=== Training SimNet CIFAR net | n_t={n_t}, n_r={n_r}, "
+                  f"n_m={n_m}, layers={sim_num_layers}, epochs={n_epochs}, "
+                  f"SNR={snr_db:g} dB, channel={channel_settings_label(channel_type, kappa)} ===")
+            H_1_train, H_2_train = make_ris_channel_pools(
+                n_t, n_r, n_m, device, channel_type, kappa,
+                num_channels=num_channels,
+            )
+            torch.manual_seed(seed + 1)
+            sim_model = CifarSimCNN(
+                n_t=n_t, n_r=n_r, n_m=n_m, num_classes=10, snr_db=snr_db,
+                carrier_freq_hz=carrier_freq_hz,
+                sim_num_layers=sim_num_layers,
+                sim_layer_dist_lambda=sim_layer_dist_lambda,
+                sim_elem_width_lambda=sim_elem_width_lambda,
+            )
+            train_sim(
+                sim_model, x_tr, y_tr, H_1_train, H_2_train, device,
+                epochs=n_epochs, lr=lr, batch_size=batch_size,
+                weight_decay=weight_decay,
+            )
+            if save_models:
+                if model_dir is None:
+                    raise ValueError("model_dir must be provided when save_models=True")
+                save_sim_model(sim_model, sim_path, n_epochs)
+                sim_model = load_sim_model(sim_path, device)
+                sim_model.snr_db = float(snr_db)
+            else:
+                sim_model = sim_model.to(device)
+
+        print(f"\n=== SimNet E2E eval | channel={channel_settings_label(channel_type, kappa)} ===")
+        H_1_eval, H_2_eval = make_ris_channel_pools(
+            n_t, n_r, n_m, device, channel_type, kappa,
+            num_channels=num_channels,
+        )
+        simnet_acc = evaluate_sim(sim_model, x_te, y_te, H_1_eval, H_2_eval, device)
+
     wireless_acc = None
     if kappa_sweep is not None:
-        print("\n=== Kappa sweep (wireless RIS vs 1/kappa) ===")
+        print("\n=== Kappa sweep (wireless RIS / SimNet E2E vs 1/kappa) ===")
         sweep_results = evaluate_kappa_sweep(
-            model, x_te, y_te, acc, kappa_sweep, device, snr_db, phi_iters, num_channels)
+            model, x_te, y_te, acc, kappa_sweep, device, snr_db, phi_iters,
+            num_channels, sim_model=sim_model,
+        )
         print(f"simulation upper bound : {acc:.2f}%")
-        print("\n   kappa | 1/kappa | wireless acc | gap to upper")
-        for kappa_value, sim_acc, sweep_wireless_acc in sweep_results:
-            print(
-                f"{kappa_value:8g} | {1.0 / kappa_value:7.4f} | "
-                f"{sweep_wireless_acc:12.2f}% | {sim_acc - sweep_wireless_acc:12.2f}%"
-            )
+        has_sim = sim_model is not None
+        if has_sim:
+            print("\n   kappa | 1/kappa | wireless acc | SimNet E2E | gap(wl) | gap(sim)")
+            for kappa_value, teacher_acc, sweep_wireless_acc, sweep_sim_acc in sweep_results:
+                print(
+                    f"{kappa_value:8g} | {1.0 / kappa_value:7.4f} | "
+                    f"{sweep_wireless_acc:12.2f}% | {sweep_sim_acc:10.2f}% | "
+                    f"{teacher_acc - sweep_wireless_acc:7.2f}% | "
+                    f"{teacher_acc - sweep_sim_acc:8.2f}%"
+                )
+        else:
+            print("\n   kappa | 1/kappa | wireless acc | gap to upper")
+            for kappa_value, teacher_acc, sweep_wireless_acc, _ in sweep_results:
+                print(
+                    f"{kappa_value:8g} | {1.0 / kappa_value:7.4f} | "
+                    f"{sweep_wireless_acc:12.2f}% | {teacher_acc - sweep_wireless_acc:12.2f}%"
+                )
         if make_plots:
             kappas = [row[0] for row in sweep_results]
             wireless_accs = [row[2] for row in sweep_results]
+            simnet_accs = [row[3] for row in sweep_results] if has_sim else None
             sweep_plot_path = (
                 os.path.join(
                     plot_dir,
@@ -615,7 +959,10 @@ def run_once(n_t, n_r, n_m, n_epochs, batch_size, lr, weight_decay, seed, device
                 )
                 if save_plot_files else None
             )
-            plot_kappa_sweep(kappas, acc, wireless_accs, path=sweep_plot_path)
+            plot_kappa_sweep(
+                kappas, acc, wireless_accs, path=sweep_plot_path,
+                simnet_accs=simnet_accs,
+            )
 
     if wireless:
         print(f"\n=== Wireless RIS path | n_t={model.n_t}, n_r={model.n_r}, "
@@ -635,7 +982,7 @@ def run_once(n_t, n_r, n_m, n_epochs, batch_size, lr, weight_decay, seed, device
         )
         plot_sample_predictions(model, x_te, y_te, device, label_names,
                                 path=plot_path, seed=seed)
-    return acc, wireless_acc
+    return acc, wireless_acc, simnet_acc
 
 
 if __name__ == "__main__":
@@ -675,6 +1022,16 @@ if __name__ == "__main__":
                         help="AWGN SNR in dB on decoder input / RIS channel")
     parser.add_argument("--wireless", type=str, default="false", choices=["true", "false"],
                         help="Also evaluate the wireless RIS inference path")
+    parser.add_argument("--simnet", type=str, default="false", choices=["true", "false"],
+                        help="Also train/evaluate end-to-end SimNet (H1->SimNet->H2) path")
+    parser.add_argument("--sim_num_layers", type=int, default=3,
+                        help="Number of SimNet / RisLayer metasurface layers")
+    parser.add_argument("--sim_layer_dist_lambda", type=float, default=5.0,
+                        help="SimNet inter-layer distance in wavelengths")
+    parser.add_argument("--sim_elem_width_lambda", type=float, default=0.5,
+                        help="SimNet element width in wavelengths")
+    parser.add_argument("--carrier_freq_hz", type=float, default=28e9,
+                        help="Carrier frequency (Hz) for SimNet geometry")
     parser.add_argument("--phi_iters", type=int, default=100,
                         help="Iterations for _optimize_phi_gd")
     parser.add_argument("--channel_type", type=str, default="geometric_ricean",
@@ -699,6 +1056,7 @@ if __name__ == "__main__":
     save_models = args.save == "true"
     load_only = args.load == "true"
     wireless = args.wireless == "true"
+    simnet = args.simnet == "true"
     kappa_sweep = parse_sweep_values(args.kappa_sweep, float)
     channel_type = args.channel_type
     # Rayleigh has no K-factor; Ricean defaults to kappa=10 when not set.
@@ -747,6 +1105,7 @@ if __name__ == "__main__":
     print(f"Save models: {save_models}")
     print(f"Load only: {load_only}")
     print(f"Wireless RIS path: {wireless}")
+    print(f"SimNet E2E path: {simnet or (kappa_sweep is not None)}")
     print(f"Channel: {channel_settings_label(channel_type, kappa)}")
     print(f"N_t: {n_t} | N_r: {n_r} | N_m: {n_m} | Epochs: {epochs} | "
           f"Batch: {batch_size} | LR: {lr} | SNR: {snr_db:g} dB")
@@ -755,7 +1114,7 @@ if __name__ == "__main__":
     plot_dir = os.path.join(script_dir, "plots")
     model_dir = os.path.join(script_dir, "models")
 
-    acc, wireless_acc = run_once(
+    acc, wireless_acc, simnet_acc = run_once(
         n_t=n_t, n_r=n_r, n_m=n_m, n_epochs=epochs, batch_size=batch_size, lr=lr,
         weight_decay=weight_decay, seed=seed, device=device,
         make_plots=make_plots, plot_dir=plot_dir,
@@ -764,8 +1123,14 @@ if __name__ == "__main__":
         save_plot_files=save_plot_files, snr_db=snr_db,
         wireless=wireless, channel_type=channel_type, kappa=kappa,
         phi_iters=args.phi_iters, num_channels=args.num_channels,
-        kappa_sweep=kappa_sweep,
+        kappa_sweep=kappa_sweep, simnet=simnet,
+        sim_num_layers=args.sim_num_layers,
+        sim_layer_dist_lambda=args.sim_layer_dist_lambda,
+        sim_elem_width_lambda=args.sim_elem_width_lambda,
+        carrier_freq_hz=args.carrier_freq_hz,
     )
     if wireless_acc is not None:
         print(f"wireless acc : {wireless_acc:.2f}%")
+    if simnet_acc is not None:
+        print(f"simnet acc : {simnet_acc:.2f}%")
     print(f"test acc : {acc:.2f}%")
