@@ -1,0 +1,39 @@
+Using device: cuda
+Mode: demo
+Make plots: True
+Save plot files: True
+Save models: False
+Load only: True
+Teacher: thin
+Encoder depth: n/a (thin)
+Dataset: mnist
+Intermediate: linear (W)
+Wireless RIS path: False
+Compare teachers: True (E2E on)
+SimNet E2E only: False
+SimNet E2E path: True
+Channel: ricean | kappa=10
+Channel pools: train=10000 | test=1000
+N_t: 16 | N_r: 8 | N_m(wl/SimNet): 64 | N_m(AirFC): 64 | Epochs: 500 | Batch: 256 | LR: 0.001 | weight_decay: 0.0 | SNR: 60 dB | phi_iters: 100 | airfc_phi_iters: 100
+  loaded CNN teacher   : /home/mazya/OTA_RIS/cifar/models/mnist_thin_d0_cnn_nt16_nr8__epochs500.pt
+  loaded Linear teacher: /home/mazya/OTA_RIS/cifar/models/mnist_thin_d0_linear_nt16_nr8__epochs500.pt
+  loaded E2E SimNet    : /home/mazya/OTA_RIS/cifar/models/mnist_thin_d0_sim_nt16_nr8__epochs500.pt
+
+=== Compare teachers | dataset=mnist | teacher=thin | n_t=16, n_r=8, n_m=64, airfc_n_m=64, SNR=60 dB, phi_iters=100, channel=ricean | kappa=10 ===
+
+=== Compare kappa sweep (6 points) ===
+  kappa=5 | wl(CNN)=98.35% | wl(Lin)=92.98% | AirFC=80.50%
+  kappa=10 | wl(CNN)=98.37% | wl(Lin)=92.96% | AirFC=57.56%
+  kappa=20 | wl(CNN)=91.52% | wl(Lin)=73.69% | AirFC=25.97%
+  kappa=33 | wl(CNN)=37.44% | wl(Lin)=29.92% | AirFC=12.83%
+  kappa=50 | wl(CNN)=37.27% | wl(Lin)=29.08% | AirFC=26.12%
+  kappa=70 | wl(CNN)=37.24% | wl(Lin)=29.10% | AirFC=26.01%
+
+      kappa | CNN clean | Lin clean | wl(CNN) | wl(Lin) | AirFC | SimNet
+          5 |    98.36% |    92.98% |  98.35% |  92.98% | 80.50% |  11.35%
+         10 |    98.36% |    92.98% |  98.37% |  92.96% | 57.56% |  11.35%
+         20 |    98.36% |    92.98% |  91.52% |  73.69% | 25.97% |  11.35%
+         33 |    98.36% |    92.98% |  37.44% |  29.92% | 12.83% |  11.35%
+         50 |    98.36% |    92.98% |  37.27% |  29.08% | 26.12% |  11.35%
+         70 |    98.36% |    92.98% |  37.24% |  29.10% | 26.01% |  11.35%
+  saved compare kappa-sweep plot to: /home/mazya/OTA_RIS/cifar/plots/mnist_compare_nt16_nr8_epochs500_kappa_sweep.png
