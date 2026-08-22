@@ -1,0 +1,12 @@
+------------------------------------
+Wed 05 Aug 2026 13:25:08 IDT
+SLURM_JOBID:		19865477
+SLURM_JOB_NODELIST:	ise-pheno-12
+SLURM_SCRATCH_DIR:	
+Allocated Resouces:	cpu - 4 / mem - 24576 MB / gpu - 1
+SLURM_GPU_INDEX:	
+Running as mazya from tirzar account with normal QOS
+------------------------------------
+Wed 05 Aug 2026 13:24:58 IDT
+ STARTING JOB WITH THE COMMAND:  sleep 600 
+[2026-08-05T16:02:43.200] error: *** JOB 19865477 ON ise-pheno-12 CANCELLED AT 2026-08-05T16:02:43 DUE to SIGNAL Terminated ***

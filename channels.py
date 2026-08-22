@@ -5,8 +5,8 @@ import numpy as np
 import os
 import sys
 
-# Allow running scripts from inside MY_code/ by adding project root to sys.path.
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+# This file lives at the OTA_RIS repo root; keep that on sys.path for CODE_EXAMPLE.
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
@@ -161,6 +161,7 @@ def _mimo_geometric_channel(
     extra_attenuation_db: float | None,
     pathloss_gain_db: float,
     rng: np.random.Generator,
+    apply_pathloss: bool = True,
 ) -> np.ndarray:
     tx_type = str(tx_antenna_type).upper()
     rx_type = str(rx_antenna_type).upper()
@@ -179,12 +180,13 @@ def _mimo_geometric_channel(
 
     dist = float(np.linalg.norm(np.asarray(tx_position, dtype=float) - np.asarray(rx_position, dtype=float)))
     pl = _pathloss_power_linear(dist, wavelength, pathloss_exponent, extra_attenuation_db, pathloss_gain_db)
+    scale = math.sqrt(pl) if apply_pathloss else 1.0
 
     fading = str(fading).lower()
     nlos = _complex_standard_normal((int(n_tx_antennas), int(n_rx_antennas)), rng)
 
     if fading == "rayleigh":
-        h = math.sqrt(pl) * nlos
+        h = scale * nlos
         return h.T
 
     kappa = _k_linear_from_db(ricean_factor_db)
@@ -194,7 +196,7 @@ def _mimo_geometric_channel(
     los = math.sqrt(kappa / (kappa + 1.0)) * a
 
     nlos_scaled = math.sqrt(1.0 / (kappa + 1.0)) * nlos
-    h = (los + nlos_scaled)*math.sqrt(pl) #TODO
+    h = (los + nlos_scaled) * scale #TODO
     return h.T
 
 # --- Tensor Generation Dispatcher (from channel_tensors.py) ---
@@ -261,6 +263,7 @@ def generate_channel_tensors_geometric(
     extra_tx_rx_attenuation_db: float | None = None,
     geo_pathloss_gain_db: float = 0.0,
     seed: int | None = None,
+    apply_pathloss: bool = True,
 ):
     if num_channels <= 0:
         raise ValueError("num_channels must be positive.")
@@ -283,21 +286,23 @@ def generate_channel_tensors_geometric(
             pathloss_exponent=float(pathloss_exp), tx_antenna_type="ULA", rx_antenna_type="ULA",
             fading=fading, ricean_factor_db=float(k_factor_d_db),
             extra_attenuation_db=extra_tx_rx_attenuation_db, pathloss_gain_db=float(geo_pathloss_gain_db),
-            rng=rng
+            rng=rng, apply_pathloss=bool(apply_pathloss),
         ).astype(np.complex64, copy=False)
         H_1[i] = _mimo_geometric_channel(
             tx_position=tx_pos, rx_position=ris_pos, n_tx_antennas=int(N_t), n_rx_antennas=int(N_m),
             tx_elem_spacing=elem_spacing, rx_elem_spacing=elem_spacing, wavelength=lam,
             pathloss_exponent=float(pathloss_exp), tx_antenna_type="ULA", rx_antenna_type="URA",
             fading=fading, ricean_factor_db=float(k_factor_h1_db), extra_attenuation_db=None,
-            pathloss_gain_db=float(geo_pathloss_gain_db), rng=rng
+            pathloss_gain_db=float(geo_pathloss_gain_db), rng=rng,
+            apply_pathloss=bool(apply_pathloss),
         ).astype(np.complex64, copy=False)
         H_2[i] = _mimo_geometric_channel(
             tx_position=ris_pos, rx_position=rx_pos, n_tx_antennas=int(N_m), n_rx_antennas=int(N_r),
             tx_elem_spacing=elem_spacing, rx_elem_spacing=elem_spacing, wavelength=lam,
             pathloss_exponent=float(pathloss_exp), tx_antenna_type="URA", rx_antenna_type="ULA",
             fading=fading, ricean_factor_db=float(k_factor_h2_db), extra_attenuation_db=None,
-            pathloss_gain_db=float(geo_pathloss_gain_db), rng=rng
+            pathloss_gain_db=float(geo_pathloss_gain_db), rng=rng,
+            apply_pathloss=bool(apply_pathloss),
         ).astype(np.complex64, copy=False)
 
     H_d_all = torch.from_numpy(H_d).to(torch.complex64).to(device)
@@ -324,6 +329,7 @@ def generate_channel_tensors_by_type(
     extra_tx_rx_attenuation_db: float | None = None,
     geo_pathloss_gain_db: float = 0.0,
     seed: int | None = None,
+    apply_pathloss: bool = True,
 ):
     ct = str(channel_type).lower()
     if ct in {"synthetic_rayleigh", "synthetic_ricean"}:
@@ -339,7 +345,8 @@ def generate_channel_tensors_by_type(
             k_factor_d_db=k_factor_d_db, k_factor_h1_db=k_factor_h1_db, k_factor_h2_db=k_factor_h2_db,
             freq_hz=freq_hz, pathloss_exp=pathloss_exp, tx_position=tx_position, ris_position=ris_position,
             rx_position=rx_position, extra_tx_rx_attenuation_db=extra_tx_rx_attenuation_db,
-            geo_pathloss_gain_db=geo_pathloss_gain_db, seed=seed
+            geo_pathloss_gain_db=geo_pathloss_gain_db, seed=seed,
+            apply_pathloss=bool(apply_pathloss),
         )
     raise ValueError(f"Unsupported channel_type '{channel_type}'")
 

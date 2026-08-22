@@ -23,17 +23,26 @@ with a reconfigurable-controller cascade matching `train_minn` metanet/sim
 DNN maps (H1, H2) -> per-layer phases; SimNet geometry/W is frozen. Use
 `--simnet_only true` to train/eval that path without the classic teacher. Kappa
 and SNR sweeps can plot teacher bound, wireless RIS, SimNet E2E, and AirFC
-(joint P, Phi, U) together. Wireless / SimNet use `--n_m`; AirFC can use a
-different `--airfc_n_m`. Wireless uses `--phi_iters`; AirFC uses
-`--airfc_phi_iters` (defaults to `--phi_iters`). AirFC RIS size `--airfc_n_m`
-defaults to `--n_m`. `--n_m_sweep` evaluates both methods at each shared N_m.
+(joint F1, Phi, F2) together. AirFC is routed by ``--data``: ``mnist`` uses
+paper Algorithm 1 offline (channel-level: Lagrange/bisection F1 with
+``P_max=N_t``, relative ridge F2, MM Phi); ``cifar`` uses the Figure_1-era
+P/Phi/U path (``_optimize_airfc_cifar`` / ``airfc_cifar_forward``). No
+data-vector ``s`` in either AO. Eval solves AO once per channel pool and
+reuses ``(phi, F1, F2)`` across test images and SNR. AirFC is fairest with
+``--mid_bn false`` (default) so the teacher mid is pure ``y = W s``.
+Wireless / SimNet use `--n_m`; AirFC can use a different `--airfc_n_m`.
+Wireless uses `--phi_iters`; AirFC uses `--airfc_phi_iters` (defaults to
+`--phi_iters`). AirFC RIS size `--airfc_n_m` defaults to `--n_m`. `--n_m_sweep`
+evaluates both methods at each shared N_m.
 `--inter {linear,relu,cnn,none,sim}` selects the teacher middle map
 (`W`, `W2 ReLU(W1 s)`, spatial Conv2d on reshaped `s`, enc/dec only, or
 Physical_SIM+controller); kinds other than `none`/`sim` share BatchNorm+Dropout
-on digital `y`. `--encoder_depth {1,2,3}` (default 3) sets how many
+on digital `y` when `--mid_bn true`. `--encoder_depth {1,2,3}` (default 3)
+sets how many
 conv+pool blocks the CNN teacher encoder uses (thin ignores it). Teacher
 checkpoints are named
-`{cifar|mnist}_{cnn|thin}_d{D}_{inter}_nt{Nt}_nr{Nr}__epochs{N}.pt`.
+`{cifar|mnist}_{cnn|thin}_{inter}[_bn]_nt{Nt}_nr{Nr}__epochs{N}.pt`
+(``_bn`` only when mid BN is enabled; default has no tag).
 `--teacher thin` uses `CifarThinCNN` (flat Linear encoder, single Linear
 decoder) instead of the CNN teacher. `--data {cifar,mnist}` selects the image
 dataset (default cifar). MNIST is padded to 32x32 and repeated to 3 channels
@@ -78,11 +87,22 @@ _DEFAULT_MNIST_DIR = os.path.join(_REPO_ROOT, "data", "MNIST")
 _DEFAULT_MODEL_DIR = os.path.join(_SCRIPT_DIR, "models")
 _DEFAULT_PLOT_DIR = os.path.join(_SCRIPT_DIR, "plots")
 
+# Extra CNN E2E SimNet (Nt=32, Nr=16) loaded in addition to the teacher-matched
+# SimNet when --compare_teachers / --simnet true. Dataset-tagged; never
+# cross-loaded across cifar/mnist. SimNet eval builds its own channel pool from
+# the loaded model's n_t/n_r/n_m.
+COMPARE_E2E_PATH = os.path.join(
+    _DEFAULT_MODEL_DIR, "cifar_cnn_e2e_sim_nt32_nr16__epochs500.pt"
+)
+COMPARE_E2E_PATH_MNIST = os.path.join(
+    _DEFAULT_MODEL_DIR, "mnist_cnn_e2e_sim_nt32_nr16__epochs500.pt"
+)
+
 # ---------------------------------------------------------------------------
 # Single source of truth for experiment defaults (models, run_once, CLI).
 # ---------------------------------------------------------------------------
-DEFAULT_N_T = 32
-DEFAULT_N_R = 16
+DEFAULT_N_T = 16
+DEFAULT_N_R = 8
 DEFAULT_N_M = 64
 DEFAULT_NUM_CLASSES = 10
 DEFAULT_POWER = 1.0
@@ -98,6 +118,10 @@ DEFAULT_KAPPA = 10.0
 DEFAULT_NUM_CHANNELS_TRAIN = 10000
 DEFAULT_NUM_CHANNELS_TEST = 1000
 DEFAULT_PHI_ITERS = 100
+# Paper Algorithm 1 ridge on F2: min ||F2 Υ - W||_F^2 + σ²||F2||_F^2 with σ² = 1.
+# Under pathloss, the F2 solve scales σ² by mean diag(Υ Υ^H) so the ridge
+# does not crush F2 when ||Υ|| is tiny (see `_airfc_update_F2_ridge`).
+DEFAULT_AIRFC_RIDGE_SIGMA2 = 1.0
 DEFAULT_SIM_NUM_LAYERS = 3
 DEFAULT_SIM_LAYER_DIST_LAMBDA = 5.0
 DEFAULT_SIM_ELEM_WIDTH_LAMBDA = 0.5
@@ -106,6 +130,7 @@ DEFAULT_SIM_ORIENTATION_PLANE = "yz"
 DEFAULT_INTERMEDIATE = "linear"
 INTERMEDIATE_KINDS = ("linear", "relu", "cnn", "none", "sim")
 DEFAULT_MID_DROPOUT = 0.1
+DEFAULT_MID_BN = False
 # Spatial CNN mid channels after reshape of real s (Conv2d capacity).
 DEFAULT_CNN_MID_C = 64
 DEFAULT_ENCODER_DEPTH = 3
@@ -375,16 +400,20 @@ class TeacherIntermediate(nn.Module):
       - cnn:    reshape real s to (C,H,W), Conv2d stack, Linear -> 2 N_r
       - none:   no learned mid; truncate/pad s to length N_r (encoder/decoder only)
 
-    Kinds other than `none` then apply BatchNorm1d(2 N_r) + Dropout on real y.
+    When ``use_bn=True`` (default), kinds other than `none` apply
+    BatchNorm1d(2 N_r) + Dropout on real y. For a fair AirFC comparison use
+    ``use_bn=False`` so the mid is purely ``y = W s`` (bias-free, no BN/Dropout).
     """
 
     def __init__(self, n_t: int, n_r: int, kind: str = DEFAULT_INTERMEDIATE,
                  dropout: float = DEFAULT_MID_DROPOUT,
-                 cnn_c: int = DEFAULT_CNN_MID_C):
+                 cnn_c: int = DEFAULT_CNN_MID_C,
+                 use_bn: bool = DEFAULT_MID_BN):
         super().__init__()
         self.n_t = int(n_t)
         self.n_r = int(n_r)
         self.kind = normalize_intermediate(kind)
+        self.use_bn = bool(use_bn) and self.kind != "none"
         if self.kind == "sim":
             raise ValueError(
                 "--inter sim uses the Physical_SIM path (CifarSimCNN), "
@@ -392,7 +421,7 @@ class TeacherIntermediate(nn.Module):
             )
         if self.kind == "linear":
             # Complex W only — a free real Linear(2Nt→2Nr) is not realizable by
-            # AirFC (U^H H2 diag(phi) H1 P), which is always complex-linear.
+            # AirFC (F2 H2 diag(phi) H1 F1), which is always complex-linear.
             w = torch.empty(self.n_r, self.n_t, 2)
             nn.init.kaiming_uniform_(w, a=math.sqrt(5))
             self.W_c = nn.Parameter(w)
@@ -407,9 +436,12 @@ class TeacherIntermediate(nn.Module):
             self.conv2 = nn.Conv2d(mid_c, mid_c, kernel_size=3, padding=1)
             self.fc_out = nn.Linear(mid_c * h * w, 2 * self.n_r)
         # kind == "none": no parameters
-        if self.kind != "none":
+        if self.use_bn:
             self.bn = nn.BatchNorm1d(2 * self.n_r)
             self.drop = nn.Dropout(p=float(dropout))
+        else:
+            self.bn = None
+            self.drop = None
 
     def complex_W(self) -> torch.Tensor:
         """Complex weight (N_r, N_t) for ``--inter linear``."""
@@ -436,7 +468,9 @@ class TeacherIntermediate(nn.Module):
         """Complex s (B, N_t) -> complex y (B, N_r)."""
         if self.kind == "none":
             return _resize_complex_vec(s, self.n_r)
-        y_flat = self.drop(self.bn(self._core_real(s)))
+        y_flat = self._core_real(s)
+        if self.bn is not None:
+            y_flat = self.drop(self.bn(y_flat))
         return torch.view_as_complex(
             y_flat.reshape(s.size(0), self.n_r, 2).contiguous()
         )
@@ -459,7 +493,8 @@ class CifarCNN(nn.Module):
                  n_m: int = DEFAULT_N_M, num_classes: int = DEFAULT_NUM_CLASSES,
                  snr_db: float = DEFAULT_SNR_DB, power: float = DEFAULT_POWER,
                  intermediate: str = DEFAULT_INTERMEDIATE,
-                 encoder_depth: int = DEFAULT_ENCODER_DEPTH):
+                 encoder_depth: int = DEFAULT_ENCODER_DEPTH,
+                 mid_bn: bool = DEFAULT_MID_BN):
         super().__init__()
         self.n_t = int(n_t)
         self.n_r = int(n_r)
@@ -469,11 +504,13 @@ class CifarCNN(nn.Module):
         self.power = float(power)
         self.intermediate_kind = normalize_intermediate(intermediate)
         self.encoder_depth = normalize_encoder_depth(encoder_depth)
+        self.mid_bn = bool(mid_bn)
         self.teacher_kind = "cnn"
         self.features, feat_dim = _build_cnn_encoder_features(self.encoder_depth)
         self.enc_fc = nn.Linear(feat_dim, 2 * self.n_t)
         self.mid = TeacherIntermediate(
             self.n_t, self.n_r, kind=self.intermediate_kind,
+            use_bn=self.mid_bn,
         )
         self.dec = nn.Sequential(
             nn.Linear(2 * self.n_r, 128),
@@ -521,7 +558,8 @@ class CifarThinCNN(nn.Module):
     def __init__(self, n_t: int = DEFAULT_N_T, n_r: int = DEFAULT_N_R,
                  n_m: int = DEFAULT_N_M, num_classes: int = DEFAULT_NUM_CLASSES,
                  snr_db: float = DEFAULT_SNR_DB, power: float = DEFAULT_POWER,
-                 intermediate: str = DEFAULT_INTERMEDIATE):
+                 intermediate: str = DEFAULT_INTERMEDIATE,
+                 mid_bn: bool = DEFAULT_MID_BN):
         super().__init__()
         self.n_t = int(n_t)
         self.n_r = int(n_r)
@@ -531,10 +569,12 @@ class CifarThinCNN(nn.Module):
         self.power = float(power)
         self.intermediate_kind = normalize_intermediate(intermediate)
         self.encoder_depth = 0  # no conv encoder; filename uses d0
+        self.mid_bn = bool(mid_bn)
         self.teacher_kind = "thin"
         self.enc_fc = nn.Linear(3 * 32 * 32, 2 * self.n_t)
         self.mid = TeacherIntermediate(
             self.n_t, self.n_r, kind=self.intermediate_kind,
+            use_bn=self.mid_bn,
         )
         self.dec = nn.Linear(2 * self.n_r, self.num_classes)
 
@@ -856,28 +896,286 @@ def _complex_W_from_linear(model):
     return torch.complex(W_r.contiguous(), W_i.contiguous())
 
 
-def _optimize_airfc_gd(W_target, H_1, H_2, n_t, n_r, n_m, iters=100, step_size=0.1,
-                       pinv_rtol=1e-4, phi_inner_steps=3):
-    """True alternating optimization for AirFC: closed-form P/U + PGD on phi.
+def _airfc_relative_residual(W_phys, W_target):
+    """Per-sample ||W_phys - W||_F / ||W||_F, then batch mean."""
+    diff = torch.linalg.norm(W_phys - W_target, dim=(-2, -1))
+    w_norm = torch.linalg.norm(W_target, dim=(-2, -1)).clamp_min(1e-8)
+    return (diff / w_norm).mean()
 
-    Fits `U^H H_2 diag(phi) H_1 P ≈ W_target` (Frobenius), independent of s.
-    P and U use damped Moore-Penrose updates; phi uses projected gradient
-    descent onto the unit-modulus manifold.
+
+def _norm_match_to_target(y, y_target):
+    """Per-sample AGC: scale y so ||y|| = ||y_target|| (same as wireless)."""
+    B = y.size(0)
+    n_r = y.size(-1)
+    y_real = torch.view_as_real(y).reshape(B, -1)
+    target_real = torch.view_as_real(y_target).reshape(B, -1)
+    target_norm = torch.linalg.norm(target_real, dim=1, keepdim=True)
+    y_norm = torch.linalg.norm(y_real, dim=1, keepdim=True)
+    y_real = y_real * (target_norm / (y_norm + 1e-8))
+    return torch.view_as_complex(y_real.reshape(B, n_r, 2).contiguous())
+
+
+def _airfc_update_F1_bisection(Upsilon, W, P_max=None, n_bisect=15, eps=1e-10):
+    """Paper Eq. (11)–(16): F1 via Lagrange duality.
+
+    Upsilon = F2 H2 diag(phi) H1, shape (B, Nr, Nt). W: (B, Nr, Nt).
+    If ``P_max`` is None, skip the power constraint (λ = 0, unconstrained LS).
+    Otherwise enforces ||F1||_F^2 <= P_max via bisection on λ.
     """
-    del n_t  # kept for call-site compatibility
+    B, _, n_t = Upsilon.shape
+    device, dtype = Upsilon.device, Upsilon.dtype
+    A = torch.bmm(Upsilon.mH, Upsilon)  # (B, Nt, Nt) Hermitian
+    # eigh on Hermitian (use real-symmetric via Hermitian part for stability)
+    A_h = 0.5 * (A + A.mH)
+    evals, evecs = torch.linalg.eigh(A_h)  # ascending
+    evals = evals.real.clamp_min(0.0)
+    YhW = torch.bmm(Upsilon.mH, W)                    # (B, Nt, Nr) effectively Nt x ...
+    Uh_YhW = torch.bmm(evecs.mH, YhW)                 # (B, Nt, Nr) wait W is Nr x Nt so YhW is Nt x Nt
+    # W: (B, Nr, Nt); Upsilon^H W: (B, Nt, Nt)
+    num = torch.diagonal(
+        torch.bmm(Uh_YhW, Uh_YhW.mH), dim1=-2, dim2=-1
+    ).real.clamp_min(0.0)  # (B, Nt)
+
+    def fro_power(lam):
+        den = (evals + lam.unsqueeze(-1)).clamp_min(eps)
+        return (num / (den * den)).sum(dim=-1)
+
+    lam = torch.zeros(B, device=device, dtype=evals.dtype)
+    if P_max is not None:
+        p0 = fro_power(lam)
+        need = p0 > float(P_max) + 1e-8
+        if need.any():
+            # λ_up from paper Eq. (16)
+            lam_up = torch.sqrt(num.sum(dim=-1).clamp_min(eps) / float(P_max))
+            lo = torch.zeros(B, device=device, dtype=evals.dtype)
+            hi = lam_up.clone()
+            for _ in range(n_bisect):
+                mid = 0.5 * (lo + hi)
+                p_mid = fro_power(mid)
+                too_big = p_mid > float(P_max)
+                lo = torch.where(too_big, mid, lo)
+                hi = torch.where(too_big, hi, mid)
+            lam = torch.where(need, hi, lam)
+
+    inv = 1.0 / (evals + lam.unsqueeze(-1)).clamp_min(eps)  # (B, Nt)
+    F1 = torch.bmm(evecs, inv.unsqueeze(-1) * Uh_YhW)       # (B, Nt, Nt)
+    return F1.to(dtype)
+
+
+def _airfc_update_F2_ridge(Upsilon_bar, W, sigma2):
+    """Paper Eq. (18): ridge / Tikhonov combiner F2.
+
+    Upsilon_bar = H2 diag(phi) H1 F1, shape (B, Nr, Nt).
+    F2 = (Υ_bar Υ_bar^H + σ²_eff I)^{-1} W Υ_bar^H.
+
+    ``sigma2`` is relative: ``σ²_eff = sigma2 * mean(diag(Gram))`` so a
+    static σ²=1 does not dominate Gram when pathloss makes ||Υ|| tiny.
+    """
+    B, n_r, _ = Upsilon_bar.shape
+    device, dtype = Upsilon_bar.device, Upsilon_bar.dtype
+    Gram = torch.bmm(Upsilon_bar, Upsilon_bar.mH)  # (B, Nr, Nr)
+    eye = torch.eye(n_r, device=device, dtype=dtype).unsqueeze(0).expand(B, -1, -1)
+    mean_power = (
+        torch.diagonal(Gram, dim1=-2, dim2=-1).real
+        .mean(dim=-1, keepdim=True).unsqueeze(-1)
+    )
+    dynamic_sigma2 = float(sigma2) * mean_power.clamp_min(1e-12)
+    rhs = torch.bmm(W, Upsilon_bar.mH)             # (B, Nr, Nr)
+    F2 = torch.linalg.solve(Gram + dynamic_sigma2 * eye, rhs)
+    return F2
+
+
+def _airfc_update_phi_mm(F2, H_1, H_2, F1, W):
+    """Paper Eq. (26): MM closed-form unit-modulus RIS phases.
+
+    Uses C = F2 H2, D = H1 F1 so
+      Ω = (C^H C) ⊙ (D D^H)^T ,
+      φ = diag(D W^H C),
+      v ← exp(j arg((λ_max I − Ω) v − φ*)).
+    """
+    C = torch.bmm(F2, H_2)   # (B, Nr, Nm)
+    D = torch.bmm(H_1, F1)   # (B, Nm, Nt)
+    CHC = torch.bmm(C.mH, C)                 # (B, Nm, Nm)
+    DDT = torch.bmm(D, D.mH).transpose(-1, -2)  # (B, Nm, Nm); (DD^H)^T
+    Omega = CHC * DDT
+    # φ_i = (D W^H C)_{i,i}
+    DWC = torch.bmm(D, torch.bmm(W.mH, C))   # (B, Nm, Nm)
+    varphi = torch.diagonal(DWC, dim1=-2, dim2=-1)  # (B, Nm)
+
+    # λ_max of Hermitian Ω via power iteration (O(N_m^2) vs eigvalsh O(N_m^3)).
+    # MM needs λ >= λ_max so (λI − Ω) ⪰ 0; inflate slightly if 5 steps undershoot.
+    Omega_h = 0.5 * (Omega + Omega.mH)
+    q = torch.randn(
+        C.size(0), C.size(-1), 1, dtype=Omega_h.dtype, device=Omega_h.device,
+    )
+    for _ in range(5):
+        q = torch.bmm(Omega_h, q)
+        q = q / torch.linalg.norm(q, dim=1, keepdim=True).clamp_min(1e-12)
+    lam_max = torch.bmm(q.mH, torch.bmm(Omega_h, q)).real  # (B, 1, 1)
+    lam_max = lam_max * 1.01
+
+    # current v from previous phi is not passed — caller passes phi as v
+    return Omega_h, lam_max, varphi, C, D
+
+
+def _optimize_airfc_offline(W_target, H_1, H_2, n_t, n_r, n_m, iters=100,
+                            sigma2=1e-2, P_max=None, n_bisect=15, debug=False):
+    """AirFC Algorithm 1 (channel-level only; no data vector s).
+
+    Alternating updates of F1 (Lagrange + bisection, ||F1||_F^2 <= P_max),
+    F2 (relative ridge), and Φ (MM) to minimize
+    ||F2 H2 diag(φ) H1 F1 − W||_F² + σ²_eff||F2||_F².
+
+    Returns ``(phi, F1, F2, rel_residual)`` with unit-modulus ``phi``.
+    When ``debug=True``, prints a short AO fit log (relF / powers) for this batch.
+    ``P_max`` defaults to ``N_t``.
+    """
+    n_t = int(n_t)
+    n_r = int(n_r)
+    n_m = int(n_m)
+    P_max = float(n_t if P_max is None else P_max)
+    H_1 = H_1.detach()
+    H_2 = H_2.detach()
+    dtype = H_1.dtype
+    device = H_1.device
+    W = W_target.detach().to(device=device, dtype=dtype)
+    B = H_1.size(0)
+    if W.dim() == 2:
+        W = W.unsqueeze(0).expand(B, -1, -1)
+    else:
+        W = W.expand(B, -1, -1) if W.size(0) == 1 else W
+
+    # Init: random unit-modulus phases, F2 = I
+    phi = torch.exp(1j * torch.randn((B, n_m), device=device, dtype=dtype))
+    F2 = torch.eye(n_r, dtype=dtype, device=device).unsqueeze(0).expand(B, -1, -1).contiguous()
+    F1 = torch.eye(n_t, dtype=dtype, device=device).unsqueeze(0).expand(B, -1, -1).contiguous()
+
+    best = {
+        "obj": torch.tensor(float("inf"), device=device),
+        "rel": torch.tensor(float("inf"), device=device),
+        "phi": phi, "F1": F1, "F2": F2,
+    }
+
+    eye_m = torch.eye(n_m, device=device, dtype=dtype).unsqueeze(0)
+    sigma2_f = float(sigma2)
+    iters = int(iters)
+    debug_checkpoints = {1, max(1, iters // 5), max(1, iters // 2), iters} if debug else set()
+    debug_rows = []
+
+    for it in range(iters):
+        Phi = torch.diag_embed(phi)
+
+        # --- F1: Υ = F2 H2 Φ H1 ---
+        H_eq = torch.bmm(H_2, torch.bmm(Phi, H_1))           # (B, Nr, Nt)
+        Upsilon = torch.bmm(F2, H_eq)
+        F1 = _airfc_update_F1_bisection(Upsilon, W, P_max, n_bisect=n_bisect)
+
+        # --- F2: Υ_bar = H2 Φ H1 F1 ---
+        Upsilon_bar = torch.bmm(H_eq, F1)
+        F2 = _airfc_update_F2_ridge(Upsilon_bar, W, sigma2_f)
+
+        # --- Φ: MM update ---
+        Omega_h, lam_max, varphi, _C, _D = _airfc_update_phi_mm(
+            F2, H_1, H_2, F1, W,
+        )
+        v = phi  # current phases as v^r
+        # (λ_max I − Ω) v − φ*
+        target = torch.bmm(
+            (lam_max * eye_m - Omega_h), v.unsqueeze(-1)
+        ).squeeze(-1) - torch.conj(varphi)
+        phi = torch.exp(1j * torch.angle(target))
+
+        # Track best by paper Eq. (8a): ||W_phys - W||_F^2 + σ^2 ||F2||_F^2
+        Phi = torch.diag_embed(phi)
+        H_eq = torch.bmm(H_2, torch.bmm(Phi, H_1))
+        W_phys = torch.bmm(F2, torch.bmm(H_eq, F1))
+        match = torch.linalg.norm(W_phys - W, dim=(-2, -1)) ** 2
+        # Same relative ridge as `_airfc_update_F2_ridge` (pathloss-safe).
+        Upsilon_bar = torch.bmm(H_eq, F1)
+        gram_pow = (
+            torch.diagonal(
+                torch.bmm(Upsilon_bar, Upsilon_bar.mH), dim1=-2, dim2=-1
+            ).real.mean(dim=-1).clamp_min(1e-12)
+        )
+        f2_pen = sigma2_f * gram_pow * (torch.linalg.norm(F2, dim=(-2, -1)) ** 2)
+        obj = (match + f2_pen).mean()
+        rel = _airfc_relative_residual(W_phys, W)
+        if obj < best["obj"]:
+            best = {
+                "obj": obj.detach(),
+                "rel": rel.detach(),
+                "phi": phi.detach(),
+                "F1": F1.detach(),
+                "F2": F2.detach(),
+            }
+
+    #     t = it + 1
+    #     if t in debug_checkpoints:
+    #         f1_pow = (torch.linalg.norm(F1, dim=(-2, -1)) ** 2).mean().item()
+    #         f2_fro = torch.linalg.norm(F2, dim=(-2, -1)).mean().item()
+    #         w_phys_fro = torch.linalg.norm(W_phys, dim=(-2, -1)).mean().item()
+    #         debug_rows.append(
+    #             (t, float(rel.item()), float(obj.item()), f1_pow, f2_fro, w_phys_fro)
+    #         )
+
+    # if debug:
+    #     w_fro = torch.linalg.norm(W, dim=(-2, -1)).mean().item()
+    #     h1_fro = torch.linalg.norm(H_1, dim=(-2, -1)).mean().item()
+    #     h2_fro = torch.linalg.norm(H_2, dim=(-2, -1)).mean().item()
+    #     print(
+    #         f"  [AirFC debug] B={B} Nt={n_t} Nr={n_r} Nm={n_m} iters={iters} "
+    #         f"P_max={'unconstrained' if P_max is None else f'{P_max:g}'} "
+    #         f"sigma2={sigma2_f:.3e}"
+    #     )
+    #     print(
+    #         f"  [AirFC debug] ||W||_F={w_fro:.4g} ||H1||_F={h1_fro:.4g} "
+    #         f"||H2||_F={h2_fro:.4g}"
+    #     )
+    #     print("  [AirFC debug] iter | relF | obj | ||F1||_F^2 | ||F2||_F | ||W_phys||_F")
+    #     for t, rel_v, obj_v, f1_pow, f2_fro, w_phys_fro in debug_rows:
+    #         print(
+    #             f"  [AirFC debug] {t:4d} | {rel_v:.4f} | {obj_v:.4g} | "
+    #             f"{f1_pow:.4g} | {f2_fro:.4g} | {w_phys_fro:.4g}"
+    #         )
+    #     best_f1 = (torch.linalg.norm(best["F1"], dim=(-2, -1)) ** 2).mean().item()
+    #     best_f2 = torch.linalg.norm(best["F2"], dim=(-2, -1)).mean().item()
+    #     print(
+    #         f"  [AirFC debug] best relF={float(best['rel'].item()):.4f} "
+    #         f"best_obj={float(best['obj'].item()):.4g} "
+    #         f"best||F1||_F^2={best_f1:.4g} best||F2||_F={best_f2:.4g}"
+    #     )
+
+    return best["phi"], best["F1"], best["F2"], float(best["rel"].item())
+
+
+def _optimize_airfc_cifar(W_target, H_1, H_2, n_t, n_r, n_m, iters=100, step_size=0.1,
+                          pinv_rtol=1e-4, phi_inner_steps=3):
+    """Figure_1 / CIFAR AirFC AO: closed-form P/U + PGD on phi.
+
+    Fits ``U^H H_2 diag(phi) H_1 P ≈ W_target`` (Frobenius), independent of ``s``.
+    ``P`` and ``U`` use Moore–Penrose updates (no ``P_max``, no ridge on ``U``);
+    ``phi`` uses projected gradient descent onto the unit-modulus manifold.
+
+    Returns ``(phi, P, U)`` with shapes ``(B, Nm)``, ``(B, Nt, Nt)``, ``(B, Nr, Nr)``.
+    Used when ``--data cifar``. MNIST uses Algorithm 1 (``_optimize_airfc_offline``).
+    """
+    del n_t, n_r  # kept for call-site compatibility
     H_1 = H_1.detach()
     H_2 = H_2.detach()
     dtype = H_1.dtype
     device = H_1.device
     W_target = W_target.detach().to(device=device, dtype=dtype)
     B = H_1.size(0)
-    W_target = W_target.unsqueeze(0).expand(B, -1, -1)
+    if W_target.dim() == 2:
+        W_target = W_target.unsqueeze(0).expand(B, -1, -1)
+    else:
+        W_target = W_target.expand(B, -1, -1) if W_target.size(0) == 1 else W_target
 
     phi = torch.exp(1j * torch.randn((B, n_m), device=device, dtype=dtype))
-    U = torch.eye(n_r, dtype=dtype, device=device).unsqueeze(0).expand(B, -1, -1).contiguous()
+    U = torch.eye(H_2.size(-2), dtype=dtype, device=device).unsqueeze(0).expand(B, -1, -1).contiguous()
     P = torch.eye(H_1.size(-1), dtype=dtype, device=device).unsqueeze(0).expand(B, -1, -1).contiguous()
 
-    for _ in range(iters):
+    for _ in range(int(iters)):
         # --- A: closed-form P ---
         # P = (U^H H_eq)^+ W
         Phi_diag = torch.diag_embed(phi)
@@ -894,7 +1192,7 @@ def _optimize_airfc_gd(W_target, H_1, H_2, n_t, n_r, n_m, iters=100, step_size=0
         # --- C: projected GD on unit-modulus phi ---
         C = torch.bmm(U.mH, H_2)
         D = torch.bmm(H_1, P)
-        for _inner in range(phi_inner_steps):
+        for _inner in range(int(phi_inner_steps)):
             Phi_diag = torch.diag_embed(phi)
             W_phys = torch.bmm(C, torch.bmm(Phi_diag, D))
             Error = W_phys - W_target
@@ -909,6 +1207,20 @@ def _optimize_airfc_gd(W_target, H_1, H_2, n_t, n_r, n_m, iters=100, step_size=0
     return phi.detach(), P.detach(), U.detach()
 
 
+# Back-compat alias.
+_optimize_airfc_gd_old = _optimize_airfc_cifar
+
+
+# Back-compat alias used by older call sites / docs.
+def _optimize_airfc_gd(W_target, H_1, H_2, n_t, n_r, n_m, iters=100, step_size=0.1,
+                       pinv_rtol=1e-4, phi_inner_steps=3, sigma2=1e-2, P_max=None):
+    """Deprecated name: redirects to Algorithm-1 offline solver (ignores GD knobs)."""
+    del step_size, pinv_rtol, phi_inner_steps
+    return _optimize_airfc_offline(
+        W_target, H_1, H_2, n_t, n_r, n_m, iters=iters, sigma2=sigma2, P_max=P_max,
+    )
+
+
 def channel_settings_label(channel_type, kappa=None):
     """Format channel settings for logs: Rayleigh has no kappa."""
     if channel_type == "geometric_rayleigh":
@@ -918,7 +1230,8 @@ def channel_settings_label(channel_type, kappa=None):
     return f"{channel_type.replace('geometric_', '')} | kappa={kappa:g}"
 
 
-def make_ris_channel_pools(n_t, n_r, n_m, device, channel_type, kappa, num_channels=1000):
+def make_ris_channel_pools(n_t, n_r, n_m, device, channel_type, kappa,
+                           num_channels=1000, apply_pathloss=True, seed=None):
     """Generate (H_1_all, H_2_all) RIS channel pools via channels.py.
 
     Uses the exact geometric channel generator from test_demo.py
@@ -927,6 +1240,10 @@ def make_ris_channel_pools(n_t, n_r, n_m, device, channel_type, kappa, num_chann
 
     For geometric_rayleigh, kappa is ignored (treated as None); a numeric
     placeholder is only passed because the channel API expects floats.
+
+    ``apply_pathloss`` (default True) scales geometric channels by Friis
+    ``sqrt(pl)``. Pass False for unit-fading (AirFC). Matching ``seed`` with
+    different ``apply_pathloss`` yields paired geometry/kappa, different PL.
     """
     from channels import generate_channel_tensors_by_type
     # Rayleigh has no K-factor; kappa is unused. Ricean requires a numeric value.
@@ -944,6 +1261,8 @@ def make_ris_channel_pools(n_t, n_r, n_m, device, channel_type, kappa, num_chann
         k_factor_h2_db=kappa_for_api,
         pathloss_exp=2.0,
         geo_pathloss_gain_db=0.0,
+        seed=seed,
+        apply_pathloss=bool(apply_pathloss),
     )
     return H_1_all.to(device), H_2_all.to(device)
 
@@ -985,67 +1304,231 @@ def wireless_forward(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
     y_ris = y_ris + noise(y_ris, snr_db)
 
     # Norm-match y_ris to the target (phi was cosine-optimized -> direction only).
-    y_ris_real = torch.view_as_real(y_ris).reshape(B, -1)
-    target_real = torch.view_as_real(y_learned).reshape(B, -1)
-    target_norm = torch.linalg.norm(target_real, dim=1, keepdim=True)
-    ris_norm = torch.linalg.norm(y_ris_real, dim=1, keepdim=True)
-    y_ris_real = y_ris_real * (target_norm / (ris_norm + 1e-8))
-    y_ris = torch.view_as_complex(y_ris_real.reshape(B, model.n_r, 2).contiguous())
+    y_ris = _norm_match_to_target(y_ris, y_learned)
 
     return model.decode(y_ris)                                   # (B, num_classes)
 
 
-def airfc_forward(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
-                  H_1_b=None, H_2_b=None):
-    """AirFC path: encoder -> P -> H1 -> diag(phi) -> H2 -> AWGN -> U^H -> BN -> decoder.
+def _precompute_airfc_cache(model, H_1_all, H_2_all, phi_iters, snr_db,
+                            debug=False):
+    """Run Algorithm 1 once per pool channel (W, H1, H2 only).
 
-    Fits `U^H H_2 diag(phi) H_1 P ≈ W` from `linear` (Frobenius, no s / y_teacher),
-    then applies the teacher's mid BatchNorm so AirFC matches the digital Linear
-    path (Linear+BN). If `H_1_b` / `H_2_b` are provided (batch channel tensors),
-    they are used as-is; otherwise channels are sampled randomly from the pools.
+    Ridge σ² is ``DEFAULT_AIRFC_RIDGE_SIGMA2`` (relative to Gram power), not
+    antenna SNR, so ``(phi, F1, F2)`` can be reused across images and SNR.
+    ``snr_db`` is unused by AO (kept for call-site compatibility).
+    ``P_max = N_t``. Per-sample AGC is applied later in ``airfc_forward``.
+
+    Returns dict with ``phi`` (Nch, Nm), ``F1`` (Nch, Nt, Nt),
+    ``F2`` (Nch, Nr, Nr), ``rel`` (raw AO ||W_phys-W||_F / ||W||_F).
+    """
+    del snr_db
+    n_m = H_1_all.size(-2)
+    W_target = _complex_W_from_linear(model)
+    sigma2 = float(DEFAULT_AIRFC_RIDGE_SIGMA2)
+    phi, F1, F2, rel = _optimize_airfc_offline(
+        W_target, H_1_all, H_2_all, model.n_t, model.n_r, n_m,
+        iters=int(phi_iters), sigma2=sigma2, P_max=float(model.n_t),
+        debug=bool(debug),
+    )
+    return {
+        "phi": phi.detach(),
+        "F1": F1.detach(),
+        "F2": F2.detach(),
+        "rel": float(rel),
+    }
+
+
+def _precompute_airfc_cifar_cache(model, H_1_all, H_2_all, phi_iters, debug=False):
+    """Run Figure_1 P/Phi/U AO once per pool channel (``--data cifar``).
+
+    Stores ``phi``, ``F1=P``, ``F2=U^H`` so the cascade ``F2 @ y_rx`` matches
+    the old forward ``U^H y_rx``. ``rel`` is ``||U^H H2 Phi H1 P - W||_F/||W||_F``.
+    """
+    n_m = H_1_all.size(-2)
+    W_target = _complex_W_from_linear(model)
+    phi, P, U = _optimize_airfc_cifar(
+        W_target, H_1_all, H_2_all, model.n_t, model.n_r, n_m,
+        iters=int(phi_iters),
+    )
+    F1 = P
+    F2 = U.mH.contiguous()
+    Phi = torch.diag_embed(phi)
+    H_eq = torch.bmm(H_2_all, torch.bmm(Phi, H_1_all))
+    W_phys = torch.bmm(F2, torch.bmm(H_eq, F1))
+    W = W_target
+    if W.dim() == 2:
+        W = W.unsqueeze(0).expand(H_1_all.size(0), -1, -1)
+    rel = float(_airfc_relative_residual(W_phys, W).item())
+    if debug:
+        print(
+            f"  [AirFC-cifar debug] pool={H_1_all.size(0)} "
+            f"Nm={n_m} iters={int(phi_iters)} relF={rel:.4f}"
+        )
+    return {
+        "phi": phi.detach(),
+        "F1": F1.detach(),
+        "F2": F2.detach(),
+        "rel": rel,
+    }
+
+
+def _precompute_airfc_cache_for_dataset(model, H_1_all, H_2_all, phi_iters, snr_db,
+                                        dataset, debug=False):
+    """Dispatch pool AO: cifar → P/Phi/U; mnist → Algorithm 1."""
+    if normalize_dataset(dataset) == "cifar":
+        return _precompute_airfc_cifar_cache(
+            model, H_1_all, H_2_all, phi_iters, debug=debug,
+        )
+    return _precompute_airfc_cache(
+        model, H_1_all, H_2_all, phi_iters, snr_db, debug=debug,
+    )
+
+
+def airfc_forward(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
+                  H_1_b=None, H_2_b=None, phi=None, F1=None, F2=None,
+                  return_residual=False, debug=False):
+    """AirFC path: physical cascade with Algorithm-1 (F1, Φ, F2).
+
+    Prefers precomputed batch ``phi`` / ``F1`` / ``F2`` (from
+    ``_precompute_airfc_cache``). If those are omitted, falls back to AO on
+    this batch's ``H1`` / ``H2``. Then::
+
+        y_rx = H2 diag(φ) H1 F1 s + n
+        y    = F2 y_rx
+        y    ← y * ||mid(s)|| / ||y||     # same per-sample AGC as wireless
+
+    ``mid(s)`` already includes BN when the teacher has it, so we do not
+    apply BN again after AGC. F1 uses ``P_max=N_t``; F2 ridge uses paper
+    ``σ²=1`` scaled by Gram power. Forward AWGN uses ``noise(y_rx, snr_db)``.
     """
     model.eval()
     x = x.to(device)
     B = x.size(0)
 
     s = model.encode(x)                                           # (B, Nt)
+    y_learned = model.intermediate(s)
 
     if H_1_b is None or H_2_b is None:
         idx = torch.randint(0, H_1_all.size(0), (B,), device=device)
         H_1_b = H_1_all[idx]
         H_2_b = H_2_all[idx]
+        if phi is not None and F1 is not None and F2 is not None:
+            phi = phi[idx]
+            F1 = F1[idx]
+            F2 = F2[idx]
     else:
         H_1_b = H_1_b.to(device)
         H_2_b = H_2_b.to(device)
 
-    # Fit P, Phi, U to the learned complex W (channel-dependent, data-independent)
-    n_m = H_1_b.size(-2)
-    W_target = _complex_W_from_linear(model)
-    phi, P, U = _optimize_airfc_gd(
-        W_target, H_1_b, H_2_b, model.n_t, model.n_r, n_m, iters=phi_iters,
-    )
+    rel_res = float("nan")
+    have_cache = phi is not None and F1 is not None and F2 is not None
+    if have_cache:
+        phi = phi.to(device)
+        F1 = F1.to(device)
+        F2 = F2.to(device)
+    else:
+        n_m = H_1_b.size(-2)
+        W_target = _complex_W_from_linear(model)
+        sigma2 = float(DEFAULT_AIRFC_RIDGE_SIGMA2)
+        phi, F1, F2, rel_res = _optimize_airfc_offline(
+            W_target, H_1_b, H_2_b, model.n_t, model.n_r, n_m,
+            iters=int(phi_iters), sigma2=sigma2, P_max=float(model.n_t),
+            debug=bool(debug),
+        )
+    if debug:
+        print(
+            f"  [AirFC debug] snr_db={float(snr_db):g} "
+            f"mid_bn={bool(getattr(model, 'mid_bn', False))} "
+            f"has_bn_module={getattr(getattr(model, 'mid', None), 'bn', None) is not None}"
+        )
 
-    # --- Physical Transmission ---
-    x_tx = torch.bmm(P, s.unsqueeze(-1)).squeeze(-1)
+    # Physical TX: y_rx = H2 diag(phi) H1 F1 s + n  (SNR from |y_rx| power)
+    x_tx = torch.bmm(F1, s.unsqueeze(-1)).squeeze(-1)
     H_1_x = torch.bmm(H_1_b, x_tx.unsqueeze(-1)).squeeze(-1)
     y_rx = torch.bmm(H_2_b, (H_1_x * phi).unsqueeze(-1)).squeeze(-1)
-
-    # AWGN hits the receiver antennas BEFORE the digital combiner
     y_rx = y_rx + noise(y_rx, snr_db)
+    y_airfc = torch.bmm(F2, y_rx.unsqueeze(-1)).squeeze(-1)
+    # y_airfc = _norm_match_to_target(y_airfc, y_learned)
 
-    # Digital Combiner (scale comes from Frobenius W fit; no y_teacher norm-match)
-    y_airfc = torch.bmm(U.mH, y_rx.unsqueeze(-1)).squeeze(-1)
+    logits = model.decode(y_airfc)
+    if return_residual:
+        return logits, rel_res
+    return logits
 
-    # Match the digital teacher mid: Linear then BatchNorm1d (Dropout is off in eval).
-    # Without this, AirFC only realizes W and sits far below the Linear teacher.
-    if hasattr(model, "mid") and hasattr(model.mid, "bn"):
+
+def airfc_cifar_forward(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
+                        H_1_b=None, H_2_b=None, phi=None, F1=None, F2=None,
+                        return_residual=False, debug=False):
+    """Figure_1 AirFC: encoder -> P -> H1 -> diag(phi) -> H2 -> AWGN -> U^H -> BN.
+
+    ``F1`` is ``P``, ``F2`` is ``U^H``. No AGC (scale comes from the Frobenius
+    fit). If the teacher mid has BatchNorm, apply it digitally after ``U^H``.
+    """
+    model.eval()
+    x = x.to(device)
+    B = x.size(0)
+
+    s = model.encode(x)
+
+    if H_1_b is None or H_2_b is None:
+        idx = torch.randint(0, H_1_all.size(0), (B,), device=device)
+        H_1_b = H_1_all[idx]
+        H_2_b = H_2_all[idx]
+        if phi is not None and F1 is not None and F2 is not None:
+            phi = phi[idx]
+            F1 = F1[idx]
+            F2 = F2[idx]
+    else:
+        H_1_b = H_1_b.to(device)
+        H_2_b = H_2_b.to(device)
+
+    rel_res = float("nan")
+    have_cache = phi is not None and F1 is not None and F2 is not None
+    if have_cache:
+        phi = phi.to(device)
+        F1 = F1.to(device)
+        F2 = F2.to(device)
+    else:
+        n_m = H_1_b.size(-2)
+        W_target = _complex_W_from_linear(model)
+        phi, P, U = _optimize_airfc_cifar(
+            W_target, H_1_b, H_2_b, model.n_t, model.n_r, n_m,
+            iters=int(phi_iters),
+        )
+        F1 = P
+        F2 = U.mH.contiguous()
+        Phi = torch.diag_embed(phi)
+        H_eq = torch.bmm(H_2_b, torch.bmm(Phi, H_1_b))
+        W_phys = torch.bmm(F2, torch.bmm(H_eq, F1))
+        W = W_target
+        if W.dim() == 2:
+            W = W.unsqueeze(0).expand(B, -1, -1)
+        rel_res = float(_airfc_relative_residual(W_phys, W).item())
+    if debug:
+        print(
+            f"  [AirFC-cifar debug] snr_db={float(snr_db):g} "
+            f"mid_bn={bool(getattr(model, 'mid_bn', False))} "
+            f"has_bn_module={getattr(getattr(model, 'mid', None), 'bn', None) is not None}"
+        )
+
+    x_tx = torch.bmm(F1, s.unsqueeze(-1)).squeeze(-1)
+    H_1_x = torch.bmm(H_1_b, x_tx.unsqueeze(-1)).squeeze(-1)
+    y_rx = torch.bmm(H_2_b, (H_1_x * phi).unsqueeze(-1)).squeeze(-1)
+    y_rx = y_rx + noise(y_rx, snr_db)
+    y_airfc = torch.bmm(F2, y_rx.unsqueeze(-1)).squeeze(-1)
+
+    # Match digital teacher mid: Linear then BatchNorm1d (Dropout off in eval).
+    if hasattr(model, "mid") and hasattr(model.mid, "bn") and model.mid.bn is not None:
         y_flat = torch.view_as_real(y_airfc).reshape(B, -1)
         y_flat = model.mid.bn(y_flat)
         y_airfc = torch.view_as_complex(
             y_flat.reshape(B, model.n_r, 2).contiguous()
         )
 
-    return model.decode(y_airfc)
+    logits = model.decode(y_airfc)
+    if return_residual:
+        return logits, rel_res
+    return logits
 
 
 @torch.no_grad()
@@ -1087,14 +1570,10 @@ def evaluate_wireless(model, x, y, H_1_all, H_2_all, snr_db, device, phi_iters,
 
 
 @torch.no_grad()
-def evaluate_airfc(model, x, y, H_1_all, H_2_all, snr_db, device, phi_iters,
-                   batch_size=500, channel_indices=None):
-    """Test accuracy (%) of the AirFC path.
-
-    If `channel_indices` has shape (N,) matching `x`, each test sample uses that
-    fixed pool index (for paired comparison with wireless / SimNet). Otherwise
-    channels are re-sampled randomly per batch.
-    """
+def evaluate_airfc_cifar(model, x, y, H_1_all, H_2_all, snr_db, device, phi_iters,
+                         batch_size=500, channel_indices=None, return_residual=False,
+                         debug=False, airfc_cache=None):
+    """Test accuracy (%) of the Figure_1 P/Phi/U AirFC path (``--data cifar``)."""
     model.eval()
     y = y.to(device)
     H_1_all = H_1_all.to(device)
@@ -1106,22 +1585,100 @@ def evaluate_airfc(model, x, y, H_1_all, H_2_all, snr_db, device, phi_iters,
                 f"channel_indices length ({channel_indices.numel()}) must match "
                 f"number of samples ({x.size(0)})"
             )
+    if airfc_cache is None:
+        airfc_cache = _precompute_airfc_cifar_cache(
+            model, H_1_all, H_2_all, phi_iters, debug=debug,
+        )
+    phi_all = airfc_cache["phi"].to(device)
+    F1_all = airfc_cache["F1"].to(device)
+    F2_all = airfc_cache["F2"].to(device)
+    pool_rel = float(airfc_cache["rel"])
     correct, total = 0, 0
+    debug_once = bool(debug)
     for start in range(0, x.size(0), batch_size):
         xb = x[start:start + batch_size]
         yb = y[start:start + batch_size]
+        do_debug = debug_once and start == 0
         if channel_indices is None:
-            logits = airfc_forward(
-                model, xb, H_1_all, H_2_all, snr_db, device, phi_iters)
+            idx = torch.randint(0, H_1_all.size(0), (xb.size(0),), device=device)
         else:
-            ch = channel_indices[start:start + batch_size]
-            logits = airfc_forward(
-                model, xb, H_1_all, H_2_all, snr_db, device, phi_iters,
-                H_1_b=H_1_all[ch], H_2_b=H_2_all[ch],
-            )
+            idx = channel_indices[start:start + batch_size]
+        logits = airfc_cifar_forward(
+            model, xb, H_1_all, H_2_all, snr_db, device, phi_iters,
+            H_1_b=H_1_all[idx], H_2_b=H_2_all[idx],
+            phi=phi_all[idx], F1=F1_all[idx], F2=F2_all[idx],
+            debug=do_debug,
+        )
         correct += (logits.argmax(1) == yb).sum().item()
         total += yb.size(0)
-    return 100.0 * correct / max(total, 1)
+    acc = 100.0 * correct / max(total, 1)
+    if return_residual:
+        return acc, pool_rel
+    return acc
+
+
+@torch.no_grad()
+def evaluate_airfc(model, x, y, H_1_all, H_2_all, snr_db, device, phi_iters,
+                   batch_size=500, channel_indices=None, return_residual=False,
+                   debug=False, airfc_cache=None, dataset=DEFAULT_DATASET):
+    """Test accuracy (%) of the AirFC path.
+
+    ``--data cifar`` → Figure_1 P/Phi/U (``evaluate_airfc_cifar``).
+    ``--data mnist`` → paper Algorithm 1 (F1, Phi, F2).
+
+    Algorithm 1 is solved once per pool channel (``airfc_cache``), then each
+    test sample indexes ``(phi, F1, F2)``. If ``airfc_cache`` is omitted it is
+    built here. If `channel_indices` has shape (N,) matching `x`, each test
+    sample uses that fixed pool index. When `return_residual`, also returns
+    the pool-mean raw AO residual ``||W_phys-W||_F/||W||_F``.
+    """
+    if normalize_dataset(dataset) == "cifar":
+        return evaluate_airfc_cifar(
+            model, x, y, H_1_all, H_2_all, snr_db, device, phi_iters,
+            batch_size=batch_size, channel_indices=channel_indices,
+            return_residual=return_residual, debug=debug, airfc_cache=airfc_cache,
+        )
+    model.eval()
+    y = y.to(device)
+    H_1_all = H_1_all.to(device)
+    H_2_all = H_2_all.to(device)
+    if channel_indices is not None:
+        channel_indices = channel_indices.to(device)
+        if channel_indices.numel() != x.size(0):
+            raise ValueError(
+                f"channel_indices length ({channel_indices.numel()}) must match "
+                f"number of samples ({x.size(0)})"
+            )
+    if airfc_cache is None:
+        airfc_cache = _precompute_airfc_cache(
+            model, H_1_all, H_2_all, phi_iters, snr_db, debug=debug,
+        )
+    phi_all = airfc_cache["phi"].to(device)
+    F1_all = airfc_cache["F1"].to(device)
+    F2_all = airfc_cache["F2"].to(device)
+    pool_rel = float(airfc_cache["rel"])
+    correct, total = 0, 0
+    debug_once = bool(debug)
+    for start in range(0, x.size(0), batch_size):
+        xb = x[start:start + batch_size]
+        yb = y[start:start + batch_size]
+        do_debug = debug_once and start == 0
+        if channel_indices is None:
+            idx = torch.randint(0, H_1_all.size(0), (xb.size(0),), device=device)
+        else:
+            idx = channel_indices[start:start + batch_size]
+        logits = airfc_forward(
+            model, xb, H_1_all, H_2_all, snr_db, device, phi_iters,
+            H_1_b=H_1_all[idx], H_2_b=H_2_all[idx],
+            phi=phi_all[idx], F1=F1_all[idx], F2=F2_all[idx],
+            debug=do_debug,
+        )
+        correct += (logits.argmax(1) == yb).sum().item()
+        total += yb.size(0)
+    acc = 100.0 * correct / max(total, 1)
+    if return_residual:
+        return acc, pool_rel
+    return acc
 
 
 def augment_cifar_batch(xb: torch.Tensor) -> torch.Tensor:
@@ -1200,25 +1757,132 @@ def evaluate(model, x, y, device, batch_size=1000):
 
 def model_path_for(model_dir, n_t, n_r, epochs, intermediate=DEFAULT_INTERMEDIATE,
                    teacher="cnn", dataset=DEFAULT_DATASET,
-                   encoder_depth=DEFAULT_ENCODER_DEPTH):
-    """Checkpoint path including teacher, depth, inter, and Nt/Nr.
+                   encoder_depth=DEFAULT_ENCODER_DEPTH,
+                   mid_bn=DEFAULT_MID_BN):
+    """Checkpoint path including teacher, inter, and Nt/Nr.
 
-    ``{cifar|mnist}_{cnn|thin}_d{D}_{inter}_nt{Nt}_nr{Nr}__epochs{N}.pt``
+    ``{cifar|mnist}_{cnn|thin}_{inter}[_bn]_nt{Nt}_nr{Nr}__epochs{N}.pt``
     The end-to-end SimNet path (``intermediate == "sim"``) inserts an ``e2e_``
-    tag after the teacher, e.g. ``mnist_cnn_e2e_d3_sim_nt32_nr16__epochs20.pt``.
-    Thin teachers use ``d0`` (no conv encoder).
+    tag after the teacher, e.g. ``mnist_cnn_e2e_sim_nt32_nr16__epochs20.pt``.
+    ``mid_bn=True`` appends ``_bn``; default (no BN) has no tag so existing
+    untagged checkpoints remain the AirFC-fair path. ``encoder_depth`` is kept
+    in checkpoint metadata but no longer tagged in the filename.
     """
     intermediate = normalize_intermediate(intermediate)
     dataset = normalize_dataset(dataset)
     teacher = "thin" if teacher == "thin" else "cnn"
-    depth_tag = 0 if teacher == "thin" else normalize_encoder_depth(encoder_depth)
     prefix = "mnist" if dataset == "mnist" else "cifar"
     e2e_tag = "e2e_" if intermediate == "sim" else ""
+    # SimNet mid has no BatchNorm flag in the filename.
+    bn_tag = "_bn" if (intermediate != "sim" and bool(mid_bn)) else ""
     return os.path.join(
         model_dir,
-        f"{prefix}_{teacher}_{e2e_tag}d{depth_tag}_{intermediate}_"
+        f"{prefix}_{teacher}_{e2e_tag}{intermediate}{bn_tag}_"
         f"nt{int(n_t)}_nr{int(n_r)}__epochs{int(epochs)}.pt",
     )
+
+_SIMNET_PLOT_STYLES = (
+    ("C2", "^"),
+    ("C4", "s"),
+    ("C5", "P"),
+    ("C6", "X"),
+)
+
+
+def _simnet_curve_label(model):
+    """Stable plot/table label from a loaded CifarSimCNN, e.g. ``E2E thin (Nt16/Nr8)``."""
+    kind = getattr(model, "teacher_kind", "cnn")
+    if kind not in ("cnn", "thin"):
+        kind = "cnn"
+    return f"E2E {kind} (Nt{int(model.n_t)}/Nr{int(model.n_r)})"
+
+
+def _compare_e2e_extra_path(dataset):
+    """Dataset-tagged extra CNN E2E checkpoint (Nt32/Nr16), never cross-loaded."""
+    dataset = normalize_dataset(dataset)
+    return COMPARE_E2E_PATH_MNIST if dataset == "mnist" else COMPARE_E2E_PATH
+
+
+def _compare_e2e_candidate_paths(model_dir, n_t, n_r, n_epochs, teacher, dataset,
+                                 encoder_depth):
+    """Teacher-matched E2E path, plus same-dataset extra CNN E2E (no existence check)."""
+    dataset = normalize_dataset(dataset)
+    teacher = "thin" if teacher == "thin" else "cnn"
+    candidates = []
+    if model_dir is not None:
+        candidates.append(model_path_for(
+            model_dir, n_t, n_r, n_epochs, intermediate="sim",
+            teacher=teacher, dataset=dataset, encoder_depth=encoder_depth,
+        ))
+    extra = _compare_e2e_extra_path(dataset)
+    if extra not in candidates:
+        candidates.append(extra)
+    return candidates
+
+
+def _resolve_compare_e2e_paths(model_dir, n_t, n_r, n_epochs, teacher, dataset,
+                               encoder_depth):
+    """Ordered unique existing E2E SimNet paths (teacher-matched + extra CNN E2E)."""
+    seen = set()
+    paths = []
+    for path in _compare_e2e_candidate_paths(
+        model_dir, n_t, n_r, n_epochs, teacher, dataset, encoder_depth,
+    ):
+        if path and os.path.isfile(path) and path not in seen:
+            seen.add(path)
+            paths.append(path)
+    return paths
+
+
+def _load_e2e_sim_entries(paths, device, snr_db):
+    """Load SimNet checkpoints as ``[(label, model), ...]``."""
+    entries = []
+    for path in paths:
+        model = load_sim_model(path, device)
+        model.snr_db = float(snr_db)
+        label = _simnet_curve_label(model)
+        print(f"  loaded E2E SimNet    : {path} "
+              f"(N_t={model.n_t}, N_r={model.n_r}, N_m={model.n_m}) [{label}]")
+        entries.append((label, model))
+    return entries
+
+
+def _sim_channel_pools_for_entries(sim_entries, x_te, device, channel_type, kappa,
+                                   num_channels):
+    """Per-SimNet channel pools (geometry may differ across entries)."""
+    pools = []
+    for _label, model in sim_entries:
+        H_1, H_2 = make_ris_channel_pools(
+            model.n_t, model.n_r, model.n_m, device,
+            channel_type, kappa, num_channels=num_channels,
+            apply_pathloss=True,
+        )
+        ch = torch.randint(0, H_1.size(0), (x_te.size(0),), device=device)
+        pools.append((H_1, H_2, ch))
+    return pools
+
+
+def _eval_sim_entries(sim_entries, pools, x_te, y_te, device, snr_db=None):
+    """Evaluate each SimNet on its matching pool; returns a list of accuracies."""
+    accs = []
+    for (_label, model), (H_1, H_2, ch) in zip(sim_entries, pools):
+        accs.append(evaluate_sim(
+            model, x_te, y_te, H_1, H_2, device,
+            channel_indices=ch, snr_db=snr_db,
+        ))
+    return accs
+
+
+def _plot_simnet_series(ax, x_values, order, simnet_series):
+    """Draw one or more E2E SimNet curves; ``simnet_series`` is ``[(label, accs), ...]``."""
+    if not simnet_series:
+        return
+    for i, (label, accs) in enumerate(simnet_series):
+        series = np.asarray(accs, dtype=np.float64)[order]
+        if not np.isfinite(series).any():
+            continue
+        color, marker = _SIMNET_PLOT_STYLES[i % len(_SIMNET_PLOT_STYLES)]
+        ax.plot(x_values, series, marker=marker, color=color, label=label)
 
 
 def sim_model_path_for(model_dir, n_t, n_r, n_m, epochs, dataset=DEFAULT_DATASET):
@@ -1257,6 +1921,7 @@ def save_model(model, path, epochs, dataset=DEFAULT_DATASET):
         "teacher": teacher,
         "dataset": dataset,
         "encoder_depth": encoder_depth,
+        "mid_bn": bool(getattr(model, "mid_bn", DEFAULT_MID_BN)),
     }
     torch.save(checkpoint, path)
     print(f"  saved model to: {path}")
@@ -1327,6 +1992,12 @@ def load_model(path, device):
         teacher = "thin" if "thin" in base else "cnn"
     cls = CifarThinCNN if teacher == "thin" else CifarCNN
     encoder_depth = checkpoint.get("encoder_depth", DEFAULT_ENCODER_DEPTH)
+    state = _remap_legacy_intermediate_state_dict(checkpoint["state_dict"])
+    # Prefer explicit metadata; else infer from weights (legacy BN teachers).
+    if "mid_bn" in checkpoint:
+        mid_bn = bool(checkpoint["mid_bn"])
+    else:
+        mid_bn = any(k.startswith("mid.bn.") for k in state)
     kwargs = dict(
         n_t=checkpoint["n_t"],
         n_r=checkpoint["n_r"],
@@ -1335,13 +2006,13 @@ def load_model(path, device):
         snr_db=checkpoint.get("snr_db", DEFAULT_SNR_DB),
         power=checkpoint.get("power", DEFAULT_POWER),
         intermediate=intermediate,
+        mid_bn=mid_bn,
     )
     if teacher == "cnn":
         kwargs["encoder_depth"] = normalize_encoder_depth(
             encoder_depth if encoder_depth not in (0, None) else DEFAULT_ENCODER_DEPTH
         )
     model = cls(**kwargs).to(device)
-    state = _remap_legacy_intermediate_state_dict(checkpoint["state_dict"])
     model.load_state_dict(state)
     model.eval()
     return model
@@ -1631,127 +2302,108 @@ def plot_sample_predictions(model, x_te, y_te, device, label_names, path=None,
     _show_or_close_plot(plt, fig, path)
 
 
-def _load_linear_and_cnn_teachers(
-    primary_model, model_dir, n_t, n_r, n_epochs, teacher, dataset, encoder_depth,
-    device, snr_db, model_path=None,
-):
-    """Load thin/cnn-encoder teachers for both `--inter linear` and `--inter cnn`.
-
-    Reuses `primary_model` when its intermediate already matches. Otherwise loads
-    the sibling checkpoint from `model_dir` (same Nt/Nr/epochs/teacher/dataset).
-    """
-    primary_kind = normalize_intermediate(
-        getattr(primary_model, "intermediate_kind", DEFAULT_INTERMEDIATE)
-    )
-    models = {"linear": None, "cnn": None}
-    if primary_kind in models:
-        models[primary_kind] = primary_model
-
-    for kind in ("linear", "cnn"):
-        if models[kind] is not None:
-            continue
-        # Prefer an explicit --model path only for the primary inter; siblings
-        # always resolve via the standard naming convention.
-        path = model_path_for(
-            model_dir, n_t, n_r, n_epochs, intermediate=kind,
-            teacher=teacher, dataset=dataset, encoder_depth=encoder_depth,
-        )
-        if not os.path.isfile(path):
-            raise FileNotFoundError(
-                f"Kappa compare needs both --inter linear and --inter cnn "
-                f"checkpoints; missing {kind}: {path}"
-            )
-        print(f"  loading {kind} teacher from: {path}")
-        models[kind] = load_model(path, device)
-        models[kind].snr_db = float(snr_db)
-
-    return models["linear"], models["cnn"]
-
-
 def _make_method_channel_pools(
     n_t, n_r, n_m, airfc_n_m, device, channel_type, kappa, num_channels, n_test,
 ):
-    """Build wireless and AirFC channel pools (shared when N_m matches).
+    """Build wireless (pathloss on) and AirFC (pathloss off) channel pools.
+
+    When ``airfc_n_m == n_m``, both pools share the same RNG seed and per-sample
+    indices so geometry/kappa match; only Friis scaling differs.
 
     Returns (H1_wl, H2_wl, ch_wl, H1_af, H2_af, ch_af).
     """
+    pool_seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
     H_1_wl, H_2_wl = make_ris_channel_pools(
         n_t, n_r, n_m, device, channel_type, kappa, num_channels=num_channels,
+        apply_pathloss=True, seed=pool_seed,
     )
     ch_wl = torch.randint(0, H_1_wl.size(0), (n_test,), device=device)
     if int(airfc_n_m) == int(n_m):
-        return H_1_wl, H_2_wl, ch_wl, H_1_wl, H_2_wl, ch_wl
+        H_1_af, H_2_af = make_ris_channel_pools(
+            n_t, n_r, airfc_n_m, device, channel_type, kappa,
+            num_channels=num_channels, apply_pathloss=False, seed=pool_seed,
+        )
+        return H_1_wl, H_2_wl, ch_wl, H_1_af, H_2_af, ch_wl
     H_1_af, H_2_af = make_ris_channel_pools(
-        n_t, n_r, airfc_n_m, device, channel_type, kappa, num_channels=num_channels,
+        n_t, n_r, airfc_n_m, device, channel_type, kappa,
+        num_channels=num_channels, apply_pathloss=False,
     )
     ch_af = torch.randint(0, H_1_af.size(0), (n_test,), device=device)
     return H_1_wl, H_2_wl, ch_wl, H_1_af, H_2_af, ch_af
 
 
 @torch.no_grad()
-def evaluate_kappa_sweep(linear_model, cnn_model, x_te, y_te,
-                         linear_teacher_acc, cnn_teacher_acc, kappas, device,
-                         snr_db, phi_iters, num_channels, sim_model=None,
-                         n_m=None, airfc_n_m=None, airfc_phi_iters=None):
-    """Compare Linear-inter vs CNN-inter teachers across Ricean kappa.
+def evaluate_kappa_sweep(model, x_te, y_te, teacher_acc, kappas, device,
+                         snr_db, phi_iters, num_channels, sim_models=None,
+                         n_m=None, inter_label="RIS",
+                         do_wireless=True, do_airfc=False,
+                         airfc_n_m=None, airfc_phi_iters=None,
+                         dataset=DEFAULT_DATASET):
+    """Sweep a single teacher's wireless RIS / AirFC across Ricean kappa.
 
-    - Linear / CNN digital accuracies are fixed bounds (passed in).
-    - Linear RIS / CNN RIS: wireless phi-GD path for each intermediate.
-    - AirFC: only from the Linear-inter teacher (W-compatible).
-    - SimNet E2E: optional separate Physical_SIM model.
+    - teacher_acc: fixed digital bound (passed in).
+    - wireless RIS: optional phi-GD path for the primary --inter teacher.
+    - AirFC: Algorithm 1 (mnist) or P/Phi/U (cifar); requires --inter linear.
+    - SimNet E2E: optional list of ``(label, CifarSimCNN)`` (each own channel pool).
 
     Returns list of
-    (kappa, linear_teacher_acc, cnn_teacher_acc, linear_ris, cnn_ris,
-     simnet_acc_or_nan, airfc_acc).
+    ``(kappa, teacher_acc, ris_acc_or_nan, sim_accs_tuple, airfc_acc_or_nan)``.
     """
-    n_m = int(linear_model.n_m if n_m is None else n_m)
-    airfc_n_m = n_m if airfc_n_m is None else int(airfc_n_m)
+    n_m = int(model.n_m if n_m is None else n_m)
+    airfc_n_m = int(n_m if airfc_n_m is None else airfc_n_m)
     airfc_phi_iters = int(phi_iters if airfc_phi_iters is None else airfc_phi_iters)
+    sim_models = list(sim_models or [])
     results = []
     for kappa in kappas:
         print(
             f"\n=== Kappa sweep | kappa={kappa:g} | channel=geometric_ricean | "
             f"N_m(wl)={n_m} | N_m(AirFC)={airfc_n_m} ==="
         )
-        H_1_wl, H_2_wl, ch_wl, H_1_af, H_2_af, ch_af = _make_method_channel_pools(
-            linear_model.n_t, linear_model.n_r, n_m, airfc_n_m, device,
-            "geometric_ricean", kappa, num_channels, x_te.size(0),
-        )
-        linear_ris = evaluate_wireless(
-            linear_model, x_te, y_te, H_1_wl, H_2_wl, snr_db, device, phi_iters,
-            channel_indices=ch_wl,
-        )
-        cnn_ris = evaluate_wireless(
-            cnn_model, x_te, y_te, H_1_wl, H_2_wl, snr_db, device, phi_iters,
-            channel_indices=ch_wl,
-        )
-        airfc_acc = evaluate_airfc(
-            linear_model, x_te, y_te, H_1_af, H_2_af, snr_db, device,
-            airfc_phi_iters, channel_indices=ch_af,
-        )
-        if sim_model is not None:
-            simnet_acc = evaluate_sim(
-                sim_model, x_te, y_te, H_1_wl, H_2_wl, device,
-                channel_indices=ch_wl,
+        ris = float("nan")
+        airfc_acc = float("nan")
+        airfc_res = float("nan")
+        if do_wireless or do_airfc:
+            H_1_wl, H_2_wl, ch_wl, H_1_af, H_2_af, ch_af = _make_method_channel_pools(
+                model.n_t, model.n_r, n_m, airfc_n_m, device,
+                "geometric_ricean", kappa, num_channels, x_te.size(0),
             )
-            print(
-                f"  Linear RIS={linear_ris:.2f}% | CNN RIS={cnn_ris:.2f}% | "
-                f"AirFC={airfc_acc:.2f}% | Simnet E2E={simnet_acc:.2f}%"
+            if do_wireless:
+                ris = evaluate_wireless(
+                    model, x_te, y_te, H_1_wl, H_2_wl, snr_db, device, phi_iters,
+                    channel_indices=ch_wl,
+                )
+            if do_airfc:
+                airfc_acc, airfc_res = evaluate_airfc(
+                    model, x_te, y_te, H_1_af, H_2_af, snr_db, device,
+                    airfc_phi_iters, channel_indices=ch_af, return_residual=True,
+                    dataset=dataset,
+                )
+        if sim_models:
+            sim_pools = _sim_channel_pools_for_entries(
+                sim_models, x_te, device, "geometric_ricean", kappa, num_channels,
+            )
+            sim_accs = tuple(
+                float(a) for a in _eval_sim_entries(
+                    sim_models, sim_pools, x_te, y_te, device,
+                )
             )
         else:
-            simnet_acc = float("nan")
-            print(
-                f"  Linear RIS={linear_ris:.2f}% | CNN RIS={cnn_ris:.2f}% | "
-                f"AirFC={airfc_acc:.2f}%"
-            )
+            sim_accs = ()
+        parts = []
+        if do_wireless:
+            parts.append(f"{inter_label} RIS={ris:.2f}%")
+        if do_airfc:
+            parts.append(f"AirFC={airfc_acc:.2f}% (relF={airfc_res:.3f})")
+        for (label, _m), acc in zip(sim_models, sim_accs):
+            parts.append(f"{label}={acc:.2f}%")
+        if parts:
+            print("  " + " | ".join(parts))
         results.append(
             (
                 float(kappa),
-                float(linear_teacher_acc),
-                float(cnn_teacher_acc),
-                float(linear_ris),
-                float(cnn_ris),
-                float(simnet_acc),
+                float(teacher_acc),
+                float(ris),
+                sim_accs,
                 float(airfc_acc),
             )
         )
@@ -1780,7 +2432,7 @@ def evaluate_simnet_kappa_sweep(sim_model, x_te, y_te, kappas, device,
         H_1_all, H_2_all = make_ris_channel_pools(
             sim_model.n_t, sim_model.n_r, n_m, device,
             channel_type="geometric_ricean", kappa=kappa,
-            num_channels=num_channels,
+            num_channels=num_channels, apply_pathloss=True,
         )
         channel_indices = torch.randint(
             0, H_1_all.size(0), (x_te.size(0),), device=device,
@@ -1821,37 +2473,37 @@ def plot_simnet_kappa_sweep(kappas, simnet_accs, path=None, snr_db=None):
     _show_or_close_plot(plt, fig, path)
 
 
-def plot_kappa_sweep(kappas, linear_teacher_acc, cnn_teacher_acc,
-                     linear_ris_accs, cnn_ris_accs, path=None,
-                     simnet_accs=None, airfc_accs=None, snr_db=None):
-    """Plot Linear/CNN teacher bounds + RIS / AirFC / Simnet vs log10(1/kappa)."""
+def plot_kappa_sweep(kappas, teacher_acc, ris_accs=None, path=None,
+                     simnet_accs=None, airfc_accs=None, snr_db=None,
+                     inter_label="RIS", simnet_series=None):
+    """Plot teacher bound + optional wireless RIS / AirFC / SimNet vs log10(1/kappa).
+
+    ``simnet_series`` is ``[(label, accs), ...]``. A single 1-D ``simnet_accs``
+    is treated as one curve labeled ``E2E``.
+    """
     plt = _matplotlib_pyplot()
     inv_kappa = 1.0 / np.asarray(kappas, dtype=np.float64)
     x_values = np.log10(inv_kappa)  # log10(1 / kappa)
     order = np.argsort(x_values)
     x_values = x_values[order]
-    linear_ris_accs = np.asarray(linear_ris_accs, dtype=np.float64)[order]
-    cnn_ris_accs = np.asarray(cnn_ris_accs, dtype=np.float64)[order]
 
     fig, ax = plt.subplots(figsize=(7, 4))
-    # Legend order: CNN teacher, Linear teacher, CNN RIS, AirFC, Linear RIS, Simnet E2E
     ax.axhline(
-        cnn_teacher_acc, linestyle="--", color="C3",
-        label=f"CNN teacher ({cnn_teacher_acc:.1f}%)",
+        teacher_acc, linestyle="--", color="C3",
+        label=f"Teacher ({teacher_acc:.1f}%)",
     )
-    ax.axhline(
-        linear_teacher_acc, linestyle="--", color="black",
-        label=f"Linear teacher ({linear_teacher_acc:.1f}%)",
-    )
-    ax.plot(x_values, cnn_ris_accs, marker="o", color="C0", label="CNN RIS")
+    if ris_accs is not None:
+        ris_accs = np.asarray(ris_accs, dtype=np.float64)[order]
+        if np.isfinite(ris_accs).any():
+            ax.plot(x_values, ris_accs, marker="o", color="C0", label="RIS")
     if airfc_accs is not None:
         airfc_accs = np.asarray(airfc_accs, dtype=np.float64)[order]
-        ax.plot(x_values, airfc_accs, marker="D", color="C1", label="AirFC")
-    ax.plot(x_values, linear_ris_accs, marker="s", color="C4", label="Linear RIS")
-    if simnet_accs is not None:
-        simnet_accs = np.asarray(simnet_accs, dtype=np.float64)[order]
-        if np.isfinite(simnet_accs).any():
-            ax.plot(x_values, simnet_accs, marker="^", color="C2", label="Simnet E2E")
+        if np.isfinite(airfc_accs).any():
+            ax.plot(x_values, airfc_accs, marker="D", color="C1",
+                    label="AirFC (P, Phi, U)")
+    if simnet_series is None and simnet_accs is not None:
+        simnet_series = [("E2E", simnet_accs)]
+    _plot_simnet_series(ax, x_values, order, simnet_series)
     ax.set_xlabel(r"$\log_{10}(1 / \kappa)$")
     ax.set_ylabel("Accuracy (%)")
     ax.grid(True, alpha=0.3)
@@ -1866,27 +2518,45 @@ def plot_kappa_sweep(kappas, linear_teacher_acc, cnn_teacher_acc,
 
 @torch.no_grad()
 def evaluate_snr_sweep(model, x_te, y_te, snrs, device, channel_type, kappa,
-                       phi_iters, num_channels, sim_model=None,
-                       n_m=None, airfc_n_m=None, airfc_phi_iters=None):
+                       phi_iters, num_channels, sim_models=None,
+                       n_m=None, airfc_n_m=None, airfc_phi_iters=None,
+                       do_wireless=True, do_airfc=True,
+                       dataset=DEFAULT_DATASET):
     """Evaluate teacher / wireless / AirFC / SimNet accuracy vs SNR at fixed kappa.
 
-    Wireless (and SimNet) use `n_m`; AirFC uses `airfc_n_m`. Channel indices are
+    Wireless uses `n_m`; AirFC uses `airfc_n_m`. Channel indices are
     fixed across SNR for each method's pool. Wireless uses `phi_iters`; AirFC
     uses `airfc_phi_iters` (defaults to `phi_iters`).
+    AirFC AO is solved once on the pool (mnist: Algorithm 1; cifar: P/Phi/U)
+    and reused at every SNR; only `noise(y_rx, snr_db)` changes.
+    ``sim_models`` is an optional list of ``(label, CifarSimCNN)``.
 
-    Returns list of (snr_db, teacher_acc, wireless_acc, simnet_acc_or_nan, airfc_acc).
+    Returns list of (snr_db, teacher_acc, wireless_acc_or_nan, sim_accs_tuple,
+    airfc_acc_or_nan).
     """
     n_m = int(model.n_m if n_m is None else n_m)
     airfc_n_m = n_m if airfc_n_m is None else int(airfc_n_m)
     airfc_phi_iters = int(phi_iters if airfc_phi_iters is None else airfc_phi_iters)
+    sim_models = list(sim_models or [])
     print(
         f"\n=== SNR sweep setup | channel={channel_settings_label(channel_type, kappa)} | "
         f"test_pool={num_channels} | N_m(wl)={n_m} | N_m(AirFC)={airfc_n_m} ==="
     )
-    H_1_wl, H_2_wl, ch_wl, H_1_af, H_2_af, ch_af = _make_method_channel_pools(
-        model.n_t, model.n_r, n_m, airfc_n_m, device,
-        channel_type, kappa, num_channels, x_te.size(0),
-    )
+    H_1_wl = H_2_wl = ch_wl = H_1_af = H_2_af = ch_af = None
+    airfc_cache = None
+    if do_wireless or do_airfc:
+        H_1_wl, H_2_wl, ch_wl, H_1_af, H_2_af, ch_af = _make_method_channel_pools(
+            model.n_t, model.n_r, n_m, airfc_n_m, device,
+            channel_type, kappa, num_channels, x_te.size(0),
+        )
+        if do_airfc:
+            airfc_cache = _precompute_airfc_cache_for_dataset(
+                model, H_1_af, H_2_af, airfc_phi_iters, snrs[0], dataset,
+                debug=False,
+            )
+    sim_pools = _sim_channel_pools_for_entries(
+        sim_models, x_te, device, channel_type, kappa, num_channels,
+    ) if sim_models else []
     results = []
     prev_teacher_snr = model.snr_db
     for snr in snrs:
@@ -1895,35 +2565,37 @@ def evaluate_snr_sweep(model, x_te, y_te, snrs, device, channel_type, kappa,
               f"channel={channel_settings_label(channel_type, kappa)} ===")
         model.snr_db = snr
         teacher_acc = evaluate(model, x_te, y_te, device)
-        wireless_acc = evaluate_wireless(
-            model, x_te, y_te, H_1_wl, H_2_wl, snr, device, phi_iters,
-            channel_indices=ch_wl,
-        )
-        airfc_acc = evaluate_airfc(
-            model, x_te, y_te, H_1_af, H_2_af, snr, device, airfc_phi_iters,
-            channel_indices=ch_af,
-        )
-        if sim_model is not None:
-            simnet_acc = evaluate_sim(
-                sim_model, x_te, y_te, H_1_wl, H_2_wl, device,
-                channel_indices=ch_wl, snr_db=snr,
+        wireless_acc = float("nan")
+        airfc_acc = float("nan")
+        if do_wireless:
+            wireless_acc = evaluate_wireless(
+                model, x_te, y_te, H_1_wl, H_2_wl, snr, device, phi_iters,
+                channel_indices=ch_wl,
             )
-            print(
-                f"  teacher={teacher_acc:.2f}% | wireless={wireless_acc:.2f}% | "
-                f"AirFC={airfc_acc:.2f}% | SimNet E2E={simnet_acc:.2f}%"
+        if do_airfc:
+            airfc_acc = evaluate_airfc(
+                model, x_te, y_te, H_1_af, H_2_af, snr, device, airfc_phi_iters,
+                channel_indices=ch_af, airfc_cache=airfc_cache, dataset=dataset,
             )
-        else:
-            simnet_acc = float("nan")
-            print(
-                f"  teacher={teacher_acc:.2f}% | wireless={wireless_acc:.2f}% | "
-                f"AirFC={airfc_acc:.2f}%"
+        sim_accs = tuple(
+            float(a) for a in _eval_sim_entries(
+                sim_models, sim_pools, x_te, y_te, device, snr_db=snr,
             )
+        ) if sim_models else ()
+        parts = [f"teacher={teacher_acc:.2f}%"]
+        if do_wireless:
+            parts.append(f"wireless={wireless_acc:.2f}%")
+        if do_airfc:
+            parts.append(f"AirFC={airfc_acc:.2f}%")
+        for (label, _m), acc in zip(sim_models, sim_accs):
+            parts.append(f"{label}={acc:.2f}%")
+        print("  " + " | ".join(parts))
         results.append(
             (
                 snr,
                 float(teacher_acc),
                 float(wireless_acc),
-                float(simnet_acc),
+                sim_accs,
                 float(airfc_acc),
             )
         )
@@ -1934,7 +2606,7 @@ def evaluate_snr_sweep(model, x_te, y_te, snrs, device, channel_type, kappa,
 @torch.no_grad()
 def evaluate_n_m_sweep(model, x_te, y_te, teacher_acc, n_ms, device, snr_db,
                        channel_type, kappa, phi_iters, num_channels,
-                       airfc_phi_iters=None):
+                       airfc_phi_iters=None, dataset=DEFAULT_DATASET):
     """Evaluate wireless RIS and AirFC accuracy vs N_m (same N_m for both).
 
     Wireless uses `phi_iters`; AirFC uses `airfc_phi_iters` (defaults to `phi_iters`).
@@ -1948,22 +2620,33 @@ def evaluate_n_m_sweep(model, x_te, y_te, teacher_acc, n_ms, device, snr_db,
             f"\n=== N_m sweep | N_m={n_m} | SNR={snr_db:g} dB | "
             f"channel={channel_settings_label(channel_type, kappa)} ==="
         )
-        H_1_all, H_2_all = make_ris_channel_pools(
+        pool_seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
+        H_1_wl, H_2_wl = make_ris_channel_pools(
             model.n_t, model.n_r, n_m, device,
             channel_type=channel_type,
             kappa=kappa,
             num_channels=num_channels,
+            apply_pathloss=True,
+            seed=pool_seed,
+        )
+        H_1_af, H_2_af = make_ris_channel_pools(
+            model.n_t, model.n_r, n_m, device,
+            channel_type=channel_type,
+            kappa=kappa,
+            num_channels=num_channels,
+            apply_pathloss=False,
+            seed=pool_seed,
         )
         channel_indices = torch.randint(
-            0, H_1_all.size(0), (x_te.size(0),), device=device,
+            0, H_1_wl.size(0), (x_te.size(0),), device=device,
         )
         wireless_acc = evaluate_wireless(
-            model, x_te, y_te, H_1_all, H_2_all, snr_db, device, phi_iters,
+            model, x_te, y_te, H_1_wl, H_2_wl, snr_db, device, phi_iters,
             channel_indices=channel_indices,
         )
         airfc_acc = evaluate_airfc(
-            model, x_te, y_te, H_1_all, H_2_all, snr_db, device, airfc_phi_iters,
-            channel_indices=channel_indices,
+            model, x_te, y_te, H_1_af, H_2_af, snr_db, device, airfc_phi_iters,
+            channel_indices=channel_indices, dataset=dataset,
         )
         print(f"  wireless acc={wireless_acc:.2f}% | AirFC acc={airfc_acc:.2f}%")
         results.append(
@@ -2001,29 +2684,35 @@ def plot_n_m_sweep(n_ms, teacher_acc, wireless_accs, airfc_accs, path=None):
     _show_or_close_plot(plt, fig, path)
 
 
-def plot_snr_sweep(snrs, teacher_accs, wireless_accs, path=None, simnet_accs=None,
-                   airfc_accs=None, kappa=None):
-    """Show or optionally save accuracy vs SNR (dB)."""
+def plot_snr_sweep(snrs, teacher_accs, wireless_accs=None, path=None, simnet_accs=None,
+                   airfc_accs=None, kappa=None, simnet_series=None):
+    """Show or optionally save accuracy vs SNR (dB).
+
+    ``simnet_series`` is ``[(label, accs), ...]``. A single 1-D ``simnet_accs``
+    is treated as one curve labeled ``SimNet E2E``.
+    """
     plt = _matplotlib_pyplot()
     x_values = np.asarray(snrs, dtype=np.float64)
     order = np.argsort(x_values)
     x_values = x_values[order]
     teacher_accs = np.asarray(teacher_accs, dtype=np.float64)[order]
-    wireless_accs = np.asarray(wireless_accs, dtype=np.float64)[order]
 
     fig, ax = plt.subplots(figsize=(7, 4))
     ax.plot(x_values, teacher_accs, marker="^", linestyle="--", color="black",
             label="teacher (digital)")
-    ax.plot(x_values, wireless_accs, marker="o", color="C0", label="wireless RIS")
+    if wireless_accs is not None:
+        wireless_accs = np.asarray(wireless_accs, dtype=np.float64)[order]
+        if np.isfinite(wireless_accs).any():
+            ax.plot(x_values, wireless_accs, marker="o", color="C0",
+                    label="wireless RIS")
     if airfc_accs is not None:
         airfc_accs = np.asarray(airfc_accs, dtype=np.float64)[order]
-        ax.plot(x_values, airfc_accs, marker="D", color="C1",
-                label="AirFC (P, Phi, U)")
-    if simnet_accs is not None:
-        simnet_accs = np.asarray(simnet_accs, dtype=np.float64)[order]
-        if np.isfinite(simnet_accs).any():
-            ax.plot(x_values, simnet_accs, marker="s", color="C2",
-                    label="SimNet E2E")
+        if np.isfinite(airfc_accs).any():
+            ax.plot(x_values, airfc_accs, marker="D", color="C1",
+                    label="AirFC (P, Phi, U)")
+    if simnet_series is None and simnet_accs is not None:
+        simnet_series = [("SimNet E2E", simnet_accs)]
+    _plot_simnet_series(ax, x_values, order, simnet_series)
     ax.set_xlabel("SNR (dB)")
     ax.set_ylabel("Accuracy (%)")
     title = "CIFAR accuracy vs SNR"
@@ -2067,16 +2756,22 @@ def _train_or_load_sim_model(
             teacher=teacher, dataset=dataset, encoder_depth=encoder_depth,
         )
     if load_only:
-        # Prefer the current e2e-tagged name, then fall back to older schemes:
-        #   1) explicit model_path / current model_path_for (e2e_ tag)
-        #   2) pre-e2e model_path_for name (no e2e_ tag)
-        #   3) legacy nm-tagged sim_model_path_for name
+        # Prefer the current depth-free name, then fall back to older schemes:
+        #   1) explicit model_path / current model_path_for (e2e_, no _dN_)
+        #   2) legacy e2e + depth-tagged name
+        #   3) legacy pre-e2e + depth-tagged name
+        #   4) legacy nm-tagged sim_model_path_for name
         candidates = []
         if sim_path is not None:
             candidates.append(sim_path)
         if model_dir is not None:
             prefix = "mnist" if dataset == "mnist" else "cifar"
             depth_tag = 0 if teacher == "thin" else encoder_depth
+            candidates.append(os.path.join(
+                model_dir,
+                f"{prefix}_{teacher}_e2e_d{depth_tag}_sim_"
+                f"nt{int(n_t)}_nr{int(n_r)}__epochs{int(n_epochs)}.pt",
+            ))
             candidates.append(os.path.join(
                 model_dir,
                 f"{prefix}_{teacher}_d{depth_tag}_sim_"
@@ -2111,7 +2806,7 @@ def _train_or_load_sim_model(
           f"train_pool={num_channels} ===")
     H_1_train, H_2_train = make_ris_channel_pools(
         n_t, n_r, n_m, device, channel_type, kappa,
-        num_channels=num_channels,
+        num_channels=num_channels, apply_pathloss=True,
     )
     torch.manual_seed(seed + 1)
     sim_model = CifarSimCNN(
@@ -2148,6 +2843,7 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
              device="cpu", make_plots=True, plot_dir=None, save_models=True,
              model_dir=None, load_only=False, model_path=None,
              save_plot_files=False, snr_db=DEFAULT_SNR_DB, wireless=False,
+             airfc=True,
              channel_type=DEFAULT_CHANNEL_TYPE, kappa=DEFAULT_KAPPA,
              phi_iters=DEFAULT_PHI_ITERS,
              airfc_phi_iters=None,
@@ -2162,13 +2858,17 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
              intermediate=DEFAULT_INTERMEDIATE,
              teacher="thin",
              encoder_depth=DEFAULT_ENCODER_DEPTH,
+             mid_bn=DEFAULT_MID_BN,
              dataset=DEFAULT_DATASET,
-             data_dir=None):
+             data_dir=None,
+             airfc_debug=False):
     """Train (or load) the teacher net and return (test_acc, wireless_acc, simnet_acc).
 
     When `load_only=True`, skip training and load a saved checkpoint from
     `model_dir` (or the explicit `--model` path), then test and plot as usual.
     When `wireless=True`, also evaluate the RIS-channel inference path.
+    When `airfc=True` and `--inter linear`, also evaluate the AirFC (P, Phi, U)
+    path (single-point, kappa sweep, and SNR sweep).
     When `simnet=True` (or kappa/snr sweep is set), also train/eval `CifarSimCNN`.
     When `simnet_only=True`, skip the classic teacher entirely and only
     train/eval `CifarSimCNN` (incompatible with wireless / sweeps).
@@ -2176,13 +2876,15 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
     (`linear` / `relu` / `cnn` / `none` / `sim`); each kind uses a separate
     checkpoint tag. `none` skips a learned mid (truncate/pad `s` to `N_r`).
     `sim` trains Physical_SIM+controller (same as SimNet E2E) as the teacher mid.
+    `mid_bn=True` enables mid BatchNorm+Dropout and tags checkpoints with
+    ``_bn``. Default is no BN (untagged path; fairest for AirFC).
     `dataset` selects `cifar` or `mnist` (MNIST padded/repeated to 3x32x32).
     `teacher` selects `CifarCNN` (`cnn`) or `CifarThinCNN` (`thin`).
     `encoder_depth` is 1–3 conv+pool blocks for the CNN teacher encoder
     (ignored for thin; default 3).
     `n_m` is wireless / SimNet RIS size; `airfc_n_m` is AirFC RIS size (defaults
     to `n_m`). `phi_iters` is wireless RIS GD iters; `airfc_phi_iters` is AirFC
-    P/Phi/U GD iters (defaults to `phi_iters`). `n_m_sweep`
+    Algorithm-1 outer iters (defaults to `phi_iters`). `n_m_sweep`
     evaluates both methods at each shared N_m.
     `num_channels` sizes the training RIS pool; `num_channels_test` sizes the
     eval / wireless / sweep pools (separate realizations).
@@ -2199,10 +2901,15 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
         else normalize_encoder_depth(encoder_depth)
     )
     teacher_cls = CifarThinCNN if teacher == "thin" else CifarCNN
+    mid_bn = bool(mid_bn)
     if channel_type == "geometric_rayleigh":
         kappa = None
     airfc_n_m = int(n_m if airfc_n_m is None else airfc_n_m)
     airfc_phi_iters = int(phi_iters if airfc_phi_iters is None else airfc_phi_iters)
+    # AirFC realizes a complex-linear mid; only meaningful for --inter linear.
+    run_airfc = bool(airfc) and intermediate == "linear"
+    if airfc and intermediate != "linear":
+        print(f"  AirFC skipped (--inter {intermediate}; requires --inter linear)")
     if simnet_only:
         if wireless:
             raise ValueError("--simnet_only cannot be combined with --wireless "
@@ -2215,7 +2922,8 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
                              "(N_m sweep needs the classic teacher)")
         use_simnet = True
     else:
-        use_simnet = bool(simnet) or (kappa_sweep is not None) or (snr_sweep is not None)
+        # Respect --simnet: sweeps no longer force-enable the SimNet E2E curve.
+        use_simnet = bool(simnet)
 
     x_te, y_te = load_dataset(dataset, train=False, data_dir=data_dir)
     label_names = dataset_label_names(dataset, cifar_dir=_DEFAULT_CIFAR_DIR)
@@ -2266,7 +2974,7 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
               f"test_pool={num_channels_test} ===")
         H_1_eval, H_2_eval = make_ris_channel_pools(
             n_t, n_r, n_m, device, channel_type, kappa,
-            num_channels=num_channels_test,
+            num_channels=num_channels_test, apply_pathloss=True,
         )
         simnet_acc = evaluate_sim(sim_model, x_te, y_te, H_1_eval, H_2_eval, device)
         return None, None, simnet_acc
@@ -2300,7 +3008,7 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
               f"test_pool={num_channels_test} | intermediate={mid} ===")
         H_1_eval, H_2_eval = make_ris_channel_pools(
             n_t, n_r, n_m, device, channel_type, kappa,
-            num_channels=num_channels_test,
+            num_channels=num_channels_test, apply_pathloss=True,
         )
         acc = evaluate_sim(sim_model, x_te, y_te, H_1_eval, H_2_eval, device)
         if make_plots:
@@ -2317,7 +3025,19 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
             path = model_path_for(
                 model_dir, n_t, n_r, n_epochs, intermediate=intermediate,
                 teacher=teacher, dataset=dataset, encoder_depth=encoder_depth,
+                mid_bn=mid_bn,
             )
+            if not os.path.isfile(path):
+                # Fall back to the legacy depth-tagged filename.
+                prefix = "mnist" if normalize_dataset(dataset) == "mnist" else "cifar"
+                depth_tag = 0 if teacher == "thin" else normalize_encoder_depth(encoder_depth)
+                legacy_path = os.path.join(
+                    model_dir,
+                    f"{prefix}_{teacher}_d{depth_tag}_{normalize_intermediate(intermediate)}_"
+                    f"nt{int(n_t)}_nr{int(n_r)}__epochs{int(n_epochs)}.pt",
+                )
+                if os.path.isfile(legacy_path):
+                    path = legacy_path
         if not os.path.isfile(path):
             raise FileNotFoundError(f"Checkpoint not found: {path}")
         mid = intermediate_label(intermediate)
@@ -2331,7 +3051,7 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
         torch.manual_seed(seed)
         model_kwargs = dict(
             n_t=n_t, n_r=n_r, n_m=n_m, num_classes=10, snr_db=snr_db,
-            intermediate=intermediate,
+            intermediate=intermediate, mid_bn=mid_bn,
         )
         if teacher == "cnn":
             model_kwargs["encoder_depth"] = encoder_depth
@@ -2340,7 +3060,7 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
         use_aug = dataset == "cifar"
         print(f"\n=== Training net | dataset={dataset} | teacher={teacher} | "
               f"n_t={n_t}, n_r={n_r}, n_m={n_m}, epochs={n_epochs}, "
-              f"SNR={snr_db:g} dB, intermediate={mid}, "
+              f"SNR={snr_db:g} dB, intermediate={mid}, mid_bn={mid_bn}, "
               f"encoder_depth={encoder_depth if teacher == 'cnn' else 'n/a'}, "
               f"augment={use_aug} ===")
         train(model, x_tr, y_tr, device, epochs=n_epochs, lr=lr,
@@ -2351,6 +3071,7 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
             path = model_path_for(
                 model_dir, n_t, n_r, n_epochs, intermediate=intermediate,
                 teacher=teacher, dataset=dataset, encoder_depth=encoder_depth,
+                mid_bn=mid_bn,
             )
             save_model(model, path, n_epochs, dataset=dataset)
             model = load_model(path, device)
@@ -2360,82 +3081,113 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
 
     acc = evaluate(model, x_te, y_te, device)
 
-    sim_model = None
+    sim_entries = []
     simnet_acc = None
     if use_simnet:
-        sim_model, x_tr, y_tr = _train_or_load_sim_model(
-            n_t, n_r, n_m, n_epochs, batch_size, lr, weight_decay, seed, device,
-            save_models, model_dir, load_only, snr_db, channel_type, kappa,
-            num_channels, sim_num_layers, sim_layer_dist_lambda,
-            sim_elem_width_lambda, carrier_freq_hz, x_tr, y_tr,
-            dataset=dataset, data_dir=data_dir, teacher=teacher,
-            encoder_depth=encoder_depth,
+        extra_paths = _resolve_compare_e2e_paths(
+            model_dir, n_t, n_r, n_epochs, teacher, dataset, encoder_depth,
         )
+        primary_path = model_path_for(
+            model_dir, n_t, n_r, n_epochs, intermediate="sim",
+            teacher=teacher, dataset=dataset, encoder_depth=encoder_depth,
+        ) if model_dir is not None else None
+        if load_only and extra_paths:
+            print("\n=== Loading SimNet E2E checkpoint(s) ===")
+            sim_entries = _load_e2e_sim_entries(extra_paths, device, snr_db)
+        else:
+            sim_model, x_tr, y_tr = _train_or_load_sim_model(
+                n_t, n_r, n_m, n_epochs, batch_size, lr, weight_decay, seed, device,
+                save_models, model_dir, load_only, snr_db, channel_type, kappa,
+                num_channels, sim_num_layers, sim_layer_dist_lambda,
+                sim_elem_width_lambda, carrier_freq_hz, x_tr, y_tr,
+                dataset=dataset, data_dir=data_dir, teacher=teacher,
+                encoder_depth=encoder_depth,
+            )
+            sim_entries.append((_simnet_curve_label(sim_model), sim_model))
+            for path in extra_paths:
+                if path == primary_path:
+                    continue
+                extra = load_sim_model(path, device)
+                extra.snr_db = float(snr_db)
+                extra_label = _simnet_curve_label(extra)
+                print(f"  loaded extra E2E SimNet: {path} "
+                      f"(N_t={extra.n_t}, N_r={extra.n_r}, N_m={extra.n_m}) "
+                      f"[{extra_label}]")
+                sim_entries.append((extra_label, extra))
         print(f"\n=== SimNet E2E eval | channel={channel_settings_label(channel_type, kappa)} | "
               f"test_pool={num_channels_test} ===")
-        H_1_eval, H_2_eval = make_ris_channel_pools(
-            n_t, n_r, n_m, device, channel_type, kappa,
-            num_channels=num_channels_test,
+        sim_pools = _sim_channel_pools_for_entries(
+            sim_entries, x_te, device, channel_type, kappa, num_channels_test,
         )
-        simnet_acc = evaluate_sim(sim_model, x_te, y_te, H_1_eval, H_2_eval, device)
+        eval_accs = _eval_sim_entries(
+            sim_entries, sim_pools, x_te, y_te, device,
+        )
+        for (label, _m), acc_i in zip(sim_entries, eval_accs):
+            print(f"  {label}: {acc_i:.2f}%")
+        simnet_acc = float(eval_accs[0]) if eval_accs else None
 
     wireless_acc = None
+    airfc_acc = None
+    sim_labels = [label for label, _m in sim_entries]
     if kappa_sweep is not None:
+        # Single-teacher sweep: primary --inter wireless RIS (always) + AirFC when
+        # --airfc true and --inter linear. SimNet only when --simnet true.
+        inter_name = {
+            "linear": "Linear", "cnn": "CNN", "relu": "ReLU", "none": "None",
+        }.get(intermediate, intermediate)
+        has_sim = bool(sim_entries)
+        do_wireless_sweep = bool(wireless)
+        do_airfc_sweep = run_airfc
+        if not do_wireless_sweep and not do_airfc_sweep and not has_sim:
+            print("  kappa sweep: nothing to evaluate "
+                  "(enable --wireless / --airfc / --simnet)")
+        extras = []
+        if do_wireless_sweep:
+            extras.append(f"{inter_name} RIS")
+        if do_airfc_sweep:
+            extras.append("AirFC")
+        extras.extend(sim_labels)
+        extra_txt = (" + ".join(extras)) if extras else "teacher only"
         print(
-            f"\n=== Kappa sweep (Linear/CNN inter teachers + RIS / AirFC / Simnet) | "
-            f"N_m(wl)={n_m} | N_m(AirFC)={airfc_n_m} ==="
-        )
-        # Compare --inter linear vs --inter cnn (same thin/cnn encoder teacher).
-        linear_model, cnn_model = _load_linear_and_cnn_teachers(
-            model, model_dir, n_t, n_r, n_epochs, teacher, dataset, encoder_depth,
-            device, snr_db, model_path=model_path,
-        )
-        # Reuse primary digital accuracy when it matches one of the two inters.
-        linear_teacher_acc = (
-            acc if intermediate == "linear" else evaluate(linear_model, x_te, y_te, device)
-        )
-        cnn_teacher_acc = (
-            acc if intermediate == "cnn" else evaluate(cnn_model, x_te, y_te, device)
+            f"\n=== Kappa sweep ({extra_txt})"
+            + f" | N_m(wl)={n_m} | N_m(AirFC)={airfc_n_m} ==="
         )
         sweep_results = evaluate_kappa_sweep(
-            linear_model, cnn_model, x_te, y_te,
-            linear_teacher_acc, cnn_teacher_acc, kappa_sweep, device, snr_db,
-            phi_iters, num_channels_test, sim_model=sim_model,
-            n_m=n_m, airfc_n_m=airfc_n_m, airfc_phi_iters=airfc_phi_iters,
+            model, x_te, y_te, acc, kappa_sweep, device, snr_db,
+            phi_iters, num_channels_test, sim_models=sim_entries, n_m=n_m,
+            inter_label=inter_name,
+            do_wireless=do_wireless_sweep, do_airfc=do_airfc_sweep,
+            airfc_n_m=airfc_n_m, airfc_phi_iters=airfc_phi_iters,
+            dataset=dataset,
         )
-        print(
-            f"CNN teacher : {cnn_teacher_acc:.2f}% | "
-            f"Linear teacher : {linear_teacher_acc:.2f}%"
-        )
-        has_sim = sim_model is not None
-        if has_sim:
-            print(
-                "\n   kappa | 1/kappa | CNN RIS | Linear RIS | AirFC | Simnet E2E"
-            )
-            for (
-                kappa_value, _, _, linear_ris, cnn_ris, sweep_sim_acc, sweep_airfc_acc,
-            ) in sweep_results:
-                print(
-                    f"{kappa_value:8g} | {1.0 / kappa_value:7.4f} | "
-                    f"{cnn_ris:7.2f}% | {linear_ris:10.2f}% | "
-                    f"{sweep_airfc_acc:5.2f}% | {sweep_sim_acc:10.2f}%"
-                )
-        else:
-            print("\n   kappa | 1/kappa | CNN RIS | Linear RIS | AirFC")
-            for (
-                kappa_value, _, _, linear_ris, cnn_ris, _, sweep_airfc_acc,
-            ) in sweep_results:
-                print(
-                    f"{kappa_value:8g} | {1.0 / kappa_value:7.4f} | "
-                    f"{cnn_ris:7.2f}% | {linear_ris:10.2f}% | "
-                    f"{sweep_airfc_acc:5.2f}%"
-                )
+        print(f"{inter_name} teacher : {acc:.2f}%")
+        headers = ["kappa", "1/kappa"]
+        if do_wireless_sweep:
+            headers.append(f"{inter_name} RIS")
+        if do_airfc_sweep:
+            headers.append("AirFC")
+        headers.extend(sim_labels)
+        print("\n   " + " | ".join(f"{h:>10}" for h in headers))
+        for kappa_value, _, ris, sweep_sim_accs, sweep_airfc_acc in sweep_results:
+            cols = [
+                f"{kappa_value:10g}",
+                f"{1.0 / kappa_value:10.4f}",
+            ]
+            if do_wireless_sweep:
+                cols.append(f"{ris:9.2f}%")
+            if do_airfc_sweep:
+                cols.append(f"{sweep_airfc_acc:9.2f}%")
+            for acc_i in sweep_sim_accs:
+                cols.append(f"{acc_i:10.2f}%")
+            print("   " + " | ".join(cols))
         if make_plots:
             kappas = [row[0] for row in sweep_results]
-            linear_ris_accs = [row[3] for row in sweep_results]
-            cnn_ris_accs = [row[4] for row in sweep_results]
-            simnet_accs = [row[5] for row in sweep_results] if has_sim else None
-            airfc_accs = [row[6] for row in sweep_results]
+            ris_accs = [row[2] for row in sweep_results] if do_wireless_sweep else None
+            simnet_series = [
+                (lab, [row[3][i] for row in sweep_results])
+                for i, lab in enumerate(sim_labels)
+            ] if has_sim else None
+            airfc_accs = [row[4] for row in sweep_results] if do_airfc_sweep else None
             sweep_plot_path = (
                 os.path.join(
                     plot_dir,
@@ -2444,47 +3196,60 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
                 if save_plot_files else None
             )
             plot_kappa_sweep(
-                kappas, linear_teacher_acc, cnn_teacher_acc,
-                linear_ris_accs, cnn_ris_accs, path=sweep_plot_path,
-                simnet_accs=simnet_accs, airfc_accs=airfc_accs, snr_db=snr_db,
+                kappas, acc, ris_accs=ris_accs, path=sweep_plot_path,
+                airfc_accs=airfc_accs, snr_db=snr_db, inter_label=inter_name,
+                simnet_series=simnet_series,
             )
 
     if snr_sweep is not None:
+        do_wireless_sweep = bool(wireless)
+        do_airfc_sweep = run_airfc
+        has_sim = bool(sim_entries)
+        sim_extra = (" / " + " / ".join(sim_labels)) if sim_labels else ""
         print(
-            f"\n=== SNR sweep (teacher / wireless RIS / AirFC / SimNet E2E vs SNR) | "
-            f"N_m(wl)={n_m} | N_m(AirFC)={airfc_n_m} ==="
+            f"\n=== SNR sweep (teacher"
+            + (" / wireless RIS" if do_wireless_sweep else "")
+            + (" / AirFC" if do_airfc_sweep else "")
+            + sim_extra
+            + f" vs SNR) | N_m(wl)={n_m} | N_m(AirFC)={airfc_n_m} ==="
         )
         sweep_results = evaluate_snr_sweep(
             model, x_te, y_te, snr_sweep, device, channel_type, kappa,
-            phi_iters, num_channels_test, sim_model=sim_model,
+            phi_iters, num_channels_test, sim_models=sim_entries,
             n_m=n_m, airfc_n_m=airfc_n_m, airfc_phi_iters=airfc_phi_iters,
+            do_wireless=do_wireless_sweep, do_airfc=do_airfc_sweep,
+            dataset=dataset,
         )
-        has_sim = sim_model is not None
-        if has_sim:
-            print("\n   SNR(dB) | teacher acc | wireless acc | AirFC acc | SimNet E2E")
-            for (
-                snr_value, teacher_acc, sweep_wireless_acc, sweep_sim_acc, sweep_airfc_acc,
-            ) in sweep_results:
-                print(
-                    f"{snr_value:9g} | {teacher_acc:11.2f}% | "
-                    f"{sweep_wireless_acc:12.2f}% | {sweep_airfc_acc:9.2f}% | "
-                    f"{sweep_sim_acc:10.2f}%"
-                )
-        else:
-            print("\n   SNR(dB) | teacher acc | wireless acc | AirFC acc")
-            for (
-                snr_value, teacher_acc, sweep_wireless_acc, _, sweep_airfc_acc,
-            ) in sweep_results:
-                print(
-                    f"{snr_value:9g} | {teacher_acc:11.2f}% | "
-                    f"{sweep_wireless_acc:12.2f}% | {sweep_airfc_acc:9.2f}%"
-                )
+        hdr = ["SNR(dB)", "teacher acc"]
+        if do_wireless_sweep:
+            hdr.append("wireless acc")
+        if do_airfc_sweep:
+            hdr.append("AirFC acc")
+        hdr.extend(sim_labels)
+        print("\n   " + " | ".join(hdr))
+        for (
+            snr_value, teacher_acc, sweep_wireless_acc, sweep_sim_accs, sweep_airfc_acc,
+        ) in sweep_results:
+            cols = [
+                f"{snr_value:9g}",
+                f"{teacher_acc:11.2f}%",
+            ]
+            if do_wireless_sweep:
+                cols.append(f"{sweep_wireless_acc:12.2f}%")
+            if do_airfc_sweep:
+                cols.append(f"{sweep_airfc_acc:9.2f}%")
+            for acc_i in sweep_sim_accs:
+                cols.append(f"{acc_i:10.2f}%")
+            print("   " + " | ".join(cols))
         if make_plots:
             snrs = [row[0] for row in sweep_results]
             teacher_accs = [row[1] for row in sweep_results]
-            wireless_accs = [row[2] for row in sweep_results]
-            simnet_accs = [row[3] for row in sweep_results] if has_sim else None
-            airfc_accs = [row[4] for row in sweep_results]
+            wireless_accs = [row[2] for row in sweep_results] if do_wireless_sweep else None
+            simnet_series = [
+                (lab, [row[3][i] for row in sweep_results])
+                for i, lab in enumerate(sim_labels)
+            ] if has_sim else None
+            airfc_accs = [row[4] for row in sweep_results] if do_airfc_sweep else None
             sweep_plot_path = (
                 os.path.join(
                     plot_dir,
@@ -2493,8 +3258,10 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
                 if save_plot_files else None
             )
             plot_snr_sweep(
-                snrs, teacher_accs, wireless_accs, path=sweep_plot_path,
-                simnet_accs=simnet_accs, airfc_accs=airfc_accs, kappa=kappa,
+                snrs, teacher_accs, wireless_accs=wireless_accs,
+                path=sweep_plot_path,
+                airfc_accs=airfc_accs, kappa=kappa,
+                simnet_series=simnet_series,
             )
 
     if n_m_sweep is not None:
@@ -2502,7 +3269,7 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
         sweep_results = evaluate_n_m_sweep(
             model, x_te, y_te, acc, n_m_sweep, device, snr_db,
             channel_type, kappa, phi_iters, num_channels_test,
-            airfc_phi_iters=airfc_phi_iters,
+            airfc_phi_iters=airfc_phi_iters, dataset=dataset,
         )
         print(f"simulation upper bound : {acc:.2f}%")
         print("\n     N_m | wireless acc | AirFC acc | gap(wl) | gap(airfc)")
@@ -2528,32 +3295,46 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
                 n_ms, acc, wireless_accs, airfc_accs, path=sweep_plot_path,
             )
 
-    if wireless:
-        print(
-            f"\n=== Wireless RIS path | n_t={model.n_t}, n_r={model.n_r}, "
-            f"n_m={n_m}, SNR={snr_db:g} dB, phi_iters={phi_iters}, "
-            f"channel={channel_settings_label(channel_type, kappa)} ==="
-        )
-        H_1_all, H_2_all = make_ris_channel_pools(
-            model.n_t, model.n_r, n_m, device, channel_type, kappa,
-            num_channels=num_channels_test,
-        )
-        wireless_acc = evaluate_wireless(
-            model, x_te, y_te, H_1_all, H_2_all, snr_db, device, phi_iters)
-        print(
-            f"\n=== AirFC path | n_t={model.n_t}, n_r={model.n_r}, "
-            f"n_m={airfc_n_m}, SNR={snr_db:g} dB, airfc_phi_iters={airfc_phi_iters}, "
-            f"channel={channel_settings_label(channel_type, kappa)} ==="
-        )
-        H_1_af, H_2_af = make_ris_channel_pools(
-            model.n_t, model.n_r, airfc_n_m, device, channel_type, kappa,
-            num_channels=num_channels_test,
-        )
-        airfc_acc = evaluate_airfc(
-            model, x_te, y_te, H_1_af, H_2_af, snr_db, device, airfc_phi_iters)
-        print(f"  AirFC acc={airfc_acc:.2f}%")
+    if (
+        (wireless or run_airfc)
+        and kappa_sweep is None
+        and snr_sweep is None
+        and n_m_sweep is None
+    ):
+        if wireless:
+            print(
+                f"\n=== Wireless RIS path | n_t={model.n_t}, n_r={model.n_r}, "
+                f"n_m={n_m}, SNR={snr_db:g} dB, phi_iters={phi_iters}, "
+                f"channel={channel_settings_label(channel_type, kappa)} ==="
+            )
+            H_1_all, H_2_all = make_ris_channel_pools(
+                model.n_t, model.n_r, n_m, device, channel_type, kappa,
+                num_channels=num_channels_test, apply_pathloss=True,
+            )
+            wireless_acc = evaluate_wireless(
+                model, x_te, y_te, H_1_all, H_2_all, snr_db, device, phi_iters)
+        if run_airfc:
+            solver = (
+                "P/Phi/U (cifar)"
+                if normalize_dataset(dataset) == "cifar"
+                else "paper Alg.1 (mnist)"
+            )
+            print(
+                f"\n=== AirFC path | solver={solver} | n_t={model.n_t}, n_r={model.n_r}, "
+                f"n_m={airfc_n_m}, SNR={snr_db:g} dB, airfc_phi_iters={airfc_phi_iters}, "
+                f"channel={channel_settings_label(channel_type, kappa)} ==="
+            )
+            H_1_af, H_2_af = make_ris_channel_pools(
+                model.n_t, model.n_r, airfc_n_m, device, channel_type, kappa,
+                num_channels=num_channels_test, apply_pathloss=False,
+            )
+            airfc_acc, airfc_res = evaluate_airfc(
+                model, x_te, y_te, H_1_af, H_2_af, snr_db, device, airfc_phi_iters,
+                return_residual=True, debug=airfc_debug, dataset=dataset,
+            )
+            print(f"  AirFC acc={airfc_acc:.2f}% (relF={airfc_res:.3f})")
 
-    if make_plots:
+    if make_plots and kappa_sweep is None and snr_sweep is None and n_m_sweep is None:
         plot_path = (
             os.path.join(plot_dir, f"cifar_wl_nt{n_t}_nr{n_r}_epochs{n_epochs}.png")
             if save_plot_files else None
@@ -2564,17 +3345,19 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
 
 
 @torch.no_grad()
-def _evaluate_compare_sweep(kind, values, cnn_model, lin_model, sim_model,
+def _evaluate_compare_sweep(kind, values, cnn_model, lin_model, sim_entries,
                             x_te, y_te, device, snr_db, channel_type, kappa,
                             n_m, airfc_n_m, phi_iters, airfc_phi_iters,
-                            num_channels):
-    """Run both teachers + AirFC(linear) (+ optional SimNet) across a sweep.
+                            num_channels, dataset=DEFAULT_DATASET):
+    """Run both teachers + AirFC(linear) (+ optional SimNets) across a sweep.
 
     `kind` is one of "kappa" / "snr" / "n_m". Both teachers share the same pools
-    and per-sample channel indices at every point (paired comparison). Returns a
-    list of rows ``(x, cnn_clean, lin_clean, wl_cnn, wl_lin, airfc_lin, sim_or_nan)``.
+    and per-sample channel indices at every point (paired comparison).
+    ``sim_entries`` is ``[(label, CifarSimCNN), ...]``. Returns a list of rows
+    ``(x, cnn_clean, lin_clean, wl_cnn, wl_lin, airfc_lin, *sim_accs)``.
     """
     n_t, n_r = cnn_model.n_t, cnn_model.n_r
+    sim_entries = list(sim_entries or [])
     rows = []
 
     if kind == "snr":
@@ -2582,6 +3365,13 @@ def _evaluate_compare_sweep(kind, values, cnn_model, lin_model, sim_model,
         H1_wl, H2_wl, ch_wl, H1_af, H2_af, ch_af = _make_method_channel_pools(
             n_t, n_r, n_m, airfc_n_m, device,
             channel_type, kappa, num_channels, x_te.size(0),
+        )
+        sim_pools = _sim_channel_pools_for_entries(
+            sim_entries, x_te, device, channel_type, kappa, num_channels,
+        ) if sim_entries else []
+        airfc_cache = _precompute_airfc_cache_for_dataset(
+            lin_model, H1_af, H2_af, airfc_phi_iters, values[0], dataset,
+            debug=False,
         )
         prev_cnn, prev_lin = cnn_model.snr_db, lin_model.snr_db
         for value in values:
@@ -2594,15 +3384,24 @@ def _evaluate_compare_sweep(kind, values, cnn_model, lin_model, sim_model,
                                        device, phi_iters, channel_indices=ch_wl)
             wl_lin = evaluate_wireless(lin_model, x_te, y_te, H1_wl, H2_wl, v,
                                        device, phi_iters, channel_indices=ch_wl)
-            airfc_lin = evaluate_airfc(lin_model, x_te, y_te, H1_af, H2_af, v,
-                                       device, airfc_phi_iters, channel_indices=ch_af)
-            sim = (evaluate_sim(sim_model, x_te, y_te, H1_wl, H2_wl, device,
-                                channel_indices=ch_wl, snr_db=v)
-                   if sim_model is not None else float("nan"))
+            airfc_lin, airfc_res = evaluate_airfc(
+                lin_model, x_te, y_te, H1_af, H2_af, v, device, airfc_phi_iters,
+                channel_indices=ch_af, return_residual=True,
+                airfc_cache=airfc_cache, dataset=dataset,
+            )
+            sims = _eval_sim_entries(
+                sim_entries, sim_pools, x_te, y_te, device, snr_db=v,
+            ) if sim_entries else []
+            sim_txt = " | ".join(
+                f"{label}={acc:.2f}%" for (label, _m), acc in zip(sim_entries, sims)
+            )
+            extra = f" | {sim_txt}" if sim_txt else ""
             print(f"  SNR={v:g} dB | CNN clean={cnn_clean:.2f}% | "
                   f"Lin clean={lin_clean:.2f}% | wl(CNN)={wl_cnn:.2f}% | "
-                  f"wl(Lin)={wl_lin:.2f}% | AirFC={airfc_lin:.2f}%")
-            rows.append((v, cnn_clean, lin_clean, wl_cnn, wl_lin, airfc_lin, sim))
+                  f"wl(Lin)={wl_lin:.2f}% | AirFC={airfc_lin:.2f}% "
+                  f"(relF={airfc_res:.3f}){extra}")
+            rows.append((v, cnn_clean, lin_clean, wl_cnn, wl_lin, airfc_lin,
+                         *[float(a) for a in sims]))
         cnn_model.snr_db, lin_model.snr_db = prev_cnn, prev_lin
         return rows
 
@@ -2629,25 +3428,43 @@ def _evaluate_compare_sweep(kind, values, cnn_model, lin_model, sim_model,
                                    device, phi_iters, channel_indices=ch_wl)
         wl_lin = evaluate_wireless(lin_model, x_te, y_te, H1_wl, H2_wl, snr_db,
                                    device, phi_iters, channel_indices=ch_wl)
-        airfc_lin = evaluate_airfc(lin_model, x_te, y_te, H1_af, H2_af, snr_db,
-                                   device, airfc_phi_iters, channel_indices=ch_af)
-        sim = (evaluate_sim(sim_model, x_te, y_te, H1_wl, H2_wl, device,
-                            channel_indices=ch_wl)
-               if sim_model is not None else float("nan"))
+        airfc_lin, airfc_res = evaluate_airfc(
+            lin_model, x_te, y_te, H1_af, H2_af, snr_db, device, airfc_phi_iters,
+            channel_indices=ch_af, return_residual=True, dataset=dataset,
+        )
+        if sim_entries:
+            sim_pools = _sim_channel_pools_for_entries(
+                sim_entries, x_te, device, pt_ct, pt_kappa, num_channels,
+            )
+            sims = _eval_sim_entries(
+                sim_entries, sim_pools, x_te, y_te, device,
+            )
+        else:
+            sims = []
         label = f"kappa={x_val:g}" if kind == "kappa" else f"N_m={int(x_val)}"
+        sim_txt = " | ".join(
+            f"{s_label}={acc:.2f}%" for (s_label, _m), acc in zip(sim_entries, sims)
+        )
+        extra = f" | {sim_txt}" if sim_txt else ""
         print(f"  {label} | wl(CNN)={wl_cnn:.2f}% | wl(Lin)={wl_lin:.2f}% | "
-              f"AirFC={airfc_lin:.2f}%")
-        rows.append((x_val, cnn_clean, lin_clean, wl_cnn, wl_lin, airfc_lin, sim))
+              f"AirFC={airfc_lin:.2f}% (relF={airfc_res:.3f}){extra}")
+        rows.append((x_val, cnn_clean, lin_clean, wl_cnn, wl_lin, airfc_lin,
+                     *[float(a) for a in sims]))
     return rows
 
 
-def plot_compare_sweep(kind, rows, path=None, snr_db=None, kappa=None):
+def plot_compare_sweep(kind, rows, path=None, snr_db=None, kappa=None,
+                       sim_labels=None):
     """Combined two-teacher comparison plot for a kappa / snr / n_m sweep."""
     plt = _matplotlib_pyplot()
     arr = np.asarray(rows, dtype=np.float64)
     xs = arr[:, 0]
     cnn_clean, lin_clean = arr[:, 1], arr[:, 2]
-    wl_cnn, wl_lin, airfc, sim = arr[:, 3], arr[:, 4], arr[:, 5], arr[:, 6]
+    wl_cnn, wl_lin, airfc = arr[:, 3], arr[:, 4], arr[:, 5]
+    n_sim = arr.shape[1] - 6
+    sim_labels = list(sim_labels or [])
+    if len(sim_labels) < n_sim:
+        sim_labels = sim_labels + [f"SimNet {i + 1}" for i in range(len(sim_labels), n_sim)]
 
     if kind == "kappa":
         x = np.log10(1.0 / xs)
@@ -2680,8 +3497,12 @@ def plot_compare_sweep(kind, rows, path=None, snr_db=None, kappa=None):
     ax.plot(x, wl_lin[order], marker="o", color="C3",
             label="wireless RIS (Linear)")
     ax.plot(x, airfc[order], marker="D", color="C1", label="AirFC")
-    if np.isfinite(sim).any():
-        ax.plot(x, sim[order], marker="s", color="C2", label="SimNet")
+    sim_series = [
+        (sim_labels[i], arr[:, 6 + i]) for i in range(n_sim)
+    ]
+    _plot_simnet_series(ax, x, np.arange(len(x)), [
+        (lab, np.asarray(accs, dtype=np.float64)[order]) for lab, accs in sim_series
+    ])
 
     ax.set_xlabel(xlabel)
     ax.set_ylabel("Accuracy (%)")
@@ -2695,20 +3516,69 @@ def plot_compare_sweep(kind, rows, path=None, snr_db=None, kappa=None):
     _show_or_close_plot(plt, fig, path)
 
 
+def dump_compare_sweep_arrays(
+    path, kind, rows, sim_labels, *, snr_db, kappa, dataset, n_t, n_r, n_m,
+):
+    """Persist compare-sweep curve arrays to ``path`` (.npz).
+
+    Named keys match plot curves: ``x``, ``cnn_clean``, ``lin_clean``,
+    ``wl_cnn``, ``wl_lin``, ``airfc``, plus ``simnet`` (n_sim, n_points) and
+    ``sim_labels``. Meta scalars: ``kind``, ``snr_db``, ``kappa``, ``dataset``,
+    ``n_t``, ``n_r``, ``n_m``. Also stores ``rows`` for ``plot_compare_sweep``.
+    """
+    arr = np.asarray(rows, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[1] < 6:
+        raise ValueError(f"unexpected compare-sweep rows shape: {arr.shape}")
+    n_sim = arr.shape[1] - 6
+    labels = list(sim_labels or [])
+    if len(labels) < n_sim:
+        labels = labels + [f"SimNet {i + 1}" for i in range(len(labels), n_sim)]
+    elif len(labels) > n_sim:
+        labels = labels[:n_sim]
+    out = {
+        "x": arr[:, 0],
+        "cnn_clean": arr[:, 1],
+        "lin_clean": arr[:, 2],
+        "wl_cnn": arr[:, 3],
+        "wl_lin": arr[:, 4],
+        "airfc": arr[:, 5],
+        "simnet": arr[:, 6:].T.copy() if n_sim else np.zeros((0, arr.shape[0])),
+        "sim_labels": np.asarray(labels, dtype=object),
+        "rows": arr,
+        "kind": np.asarray(str(kind)),
+        "snr_db": np.asarray(float(snr_db)),
+        "kappa": np.asarray(float(kappa) if kappa is not None else np.nan),
+        "dataset": np.asarray(str(dataset)),
+        "n_t": np.asarray(int(n_t)),
+        "n_r": np.asarray(int(n_r)),
+        "n_m": np.asarray(int(n_m)),
+    }
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    np.savez(path, **out)
+    print(f"  saved compare-sweep arrays to: {path}")
+    return path
+
+
 def run_compare_teachers(
     n_t, n_r, n_m, n_epochs, device, model_dir, snr_db, channel_type, kappa,
     phi_iters, airfc_phi_iters, num_channels_test, airfc_n_m, encoder_depth,
     dataset, teacher="thin", make_plots=False, plot_dir=None,
     save_plot_files=False, kappa_sweep=None, snr_sweep=None, n_m_sweep=None,
-    include_e2e=True, data_dir=None,
+    include_e2e=True, data_dir=None, dump_arrays=None,
 ):
     """Load the cnn + linear teachers and compare inference paths.
 
     Reports both clean teachers, the wireless RIS path imitating each teacher's
-    intermediate, and AirFC mimicking the linear teacher. When an E2E SimNet
-    checkpoint exists (and `include_e2e`), it is added too. With a sweep list
-    (kappa precedence, then snr, then n_m) it evaluates every point and writes a
-    combined plot; otherwise it prints a single-point table.
+    intermediate, and AirFC mimicking the linear teacher. When `include_e2e`,
+    every existing E2E SimNet candidate is loaded (teacher-matched checkpoint
+    plus same-dataset extra CNN E2E if distinct) and plotted as separate curves.
+    With a sweep list (kappa precedence, then snr, then n_m) it evaluates every
+    point and writes a combined plot; otherwise it prints a single-point table.
+
+    ``dump_arrays``: optional path to a ``.npz`` file, or a directory (then
+    auto-named ``{dataset}_compare_nt{n_t}_nr{n_r}_epochs{n_epochs}_{kind}_sweep.npz``).
     """
     dataset = normalize_dataset(dataset)
     if data_dir is None:
@@ -2717,9 +3587,10 @@ def run_compare_teachers(
     cnn_path = model_path_for(model_dir, n_t, n_r, n_epochs, intermediate="cnn",
                               teacher=teacher, dataset=dataset,
                               encoder_depth=encoder_depth)
+    # Default untagged linear path (no BN tag); existing checkpoints match this.
     lin_path = model_path_for(model_dir, n_t, n_r, n_epochs, intermediate="linear",
                               teacher=teacher, dataset=dataset,
-                              encoder_depth=encoder_depth)
+                              encoder_depth=encoder_depth, mid_bn=False)
     for pth, tag in ((cnn_path, "cnn"), (lin_path, "linear")):
         if not os.path.isfile(pth):
             raise FileNotFoundError(
@@ -2732,19 +3603,23 @@ def run_compare_teachers(
     print(f"  loaded CNN teacher   : {cnn_path}")
     print(f"  loaded Linear teacher: {lin_path}")
 
-    sim_model = None
+    sim_entries = []
     if include_e2e:
-        sim_path = model_path_for(model_dir, n_t, n_r, n_epochs, intermediate="sim",
-                                  teacher=teacher, dataset=dataset,
-                                  encoder_depth=encoder_depth)
-        if os.path.isfile(sim_path):
-            sim_model = load_sim_model(sim_path, device)
-            sim_model.snr_db = float(snr_db)
-            print(f"  loaded E2E SimNet    : {sim_path}")
+        # Load every distinct existing candidate: teacher-matched SimNet, then
+        # same-dataset extra CNN E2E (cifar/mnist COMPARE_E2E_PATH*).
+        sim_candidates = _compare_e2e_candidate_paths(
+            model_dir, n_t, n_r, n_epochs, teacher, dataset, encoder_depth,
+        )
+        load_sim_paths = _resolve_compare_e2e_paths(
+            model_dir, n_t, n_r, n_epochs, teacher, dataset, encoder_depth,
+        )
+        if load_sim_paths:
+            sim_entries = _load_e2e_sim_entries(load_sim_paths, device, snr_db)
         else:
-            print(f"  E2E SimNet checkpoint not found ({sim_path}); skipping E2E")
+            print("  E2E SimNet checkpoint not found for "
+                  f"dataset={dataset} ({', '.join(sim_candidates)}); skipping E2E")
     else:
-        print("  E2E SimNet skipped (--compare_e2e false)")
+        print("  E2E SimNet skipped (--simnet false or --compare_e2e false)")
 
     x_te, y_te = load_dataset(dataset, train=False, data_dir=data_dir)
     print(f"\n=== Compare teachers | dataset={dataset} | teacher={teacher} | "
@@ -2761,20 +3636,45 @@ def run_compare_teachers(
     else:
         kind, values = None, None
 
+    sim_labels = [label for label, _m in sim_entries]
     if kind is not None:
         print(f"\n=== Compare {kind} sweep ({len(values)} points) ===")
         rows = _evaluate_compare_sweep(
-            kind, values, cnn_model, lin_model, sim_model, x_te, y_te, device,
+            kind, values, cnn_model, lin_model, sim_entries, x_te, y_te, device,
             snr_db, channel_type, kappa, n_m, airfc_n_m, phi_iters,
-            airfc_phi_iters, num_channels_test,
+            airfc_phi_iters, num_channels_test, dataset=dataset,
         )
         x_head = {"kappa": "kappa", "snr": "SNR(dB)", "n_m": "N_m"}[kind]
+        sim_hdr = " | ".join(f"{lab:>18}" for lab in sim_labels) if sim_labels else "SimNet"
         print(f"\n   {x_head:>8} | CNN clean | Lin clean | wl(CNN) | "
-              f"wl(Lin) | AirFC | SimNet")
-        for (xv, cnn_c, lin_c, wc, wl, af, sm) in rows:
-            sim_txt = f"{sm:6.2f}" if np.isfinite(sm) else "   n/a"
+              f"wl(Lin) | AirFC | {sim_hdr}")
+        for row in rows:
+            xv, cnn_c, lin_c, wc, wl, af = row[:6]
+            sims = row[6:]
+            if sim_labels:
+                sim_txt = " | ".join(
+                    f"{sm:17.2f}%" if np.isfinite(sm) else "              n/a"
+                    for sm in sims
+                )
+            else:
+                sim_txt = "              n/a"
             print(f"   {xv:8g} | {cnn_c:8.2f}% | {lin_c:8.2f}% | {wc:6.2f}% | "
-                  f"{wl:6.2f}% | {af:5.2f}% | {sim_txt}%")
+                  f"{wl:6.2f}% | {af:5.2f}% | {sim_txt}")
+        if dump_arrays:
+            dump_path = dump_arrays
+            if os.path.isdir(dump_path) or (
+                not dump_path.endswith(".npz") and not os.path.splitext(dump_path)[1]
+            ):
+                os.makedirs(dump_path, exist_ok=True)
+                dump_path = os.path.join(
+                    dump_path,
+                    f"{dataset}_compare_nt{n_t}_nr{n_r}_epochs{n_epochs}_{kind}_sweep.npz",
+                )
+            dump_compare_sweep_arrays(
+                dump_path, kind, rows, sim_labels,
+                snr_db=snr_db, kappa=kappa, dataset=dataset,
+                n_t=n_t, n_r=n_r, n_m=n_m,
+            )
         if make_plots:
             prefix = "mnist" if dataset == "mnist" else "cifar"
             plot_path = (
@@ -2785,7 +3685,7 @@ def run_compare_teachers(
                 if save_plot_files else None
             )
             plot_compare_sweep(kind, rows, path=plot_path, snr_db=snr_db,
-                               kappa=kappa)
+                               kappa=kappa, sim_labels=sim_labels)
         return rows
 
     # ----- single channel point -----
@@ -2799,11 +3699,20 @@ def run_compare_teachers(
                                device, phi_iters, channel_indices=ch_wl)
     wl_lin = evaluate_wireless(lin_model, x_te, y_te, H1_wl, H2_wl, snr_db,
                                device, phi_iters, channel_indices=ch_wl)
-    airfc_lin = evaluate_airfc(lin_model, x_te, y_te, H1_af, H2_af, snr_db,
-                               device, airfc_phi_iters, channel_indices=ch_af)
-    sim_acc = (evaluate_sim(sim_model, x_te, y_te, H1_wl, H2_wl, device,
-                            channel_indices=ch_wl)
-               if sim_model is not None else None)
+    airfc_lin, airfc_res = evaluate_airfc(
+        lin_model, x_te, y_te, H1_af, H2_af, snr_db, device, airfc_phi_iters,
+        channel_indices=ch_af, return_residual=True, dataset=dataset,
+    )
+    sim_accs = {}
+    if sim_entries:
+        sim_pools = _sim_channel_pools_for_entries(
+            sim_entries, x_te, device, channel_type, kappa, num_channels_test,
+        )
+        for (label, _m), acc in zip(
+            sim_entries,
+            _eval_sim_entries(sim_entries, sim_pools, x_te, y_te, device),
+        ):
+            sim_accs[label] = acc
 
     print("\n=== Compare results (single channel point) ===")
     print(f"  CNN teacher    (clean)         : {cnn_clean:6.2f}%")
@@ -2813,13 +3722,15 @@ def run_compare_teachers(
     print(f"  Wireless RIS (imitate Linear)  : {wl_lin:6.2f}%  "
           f"(gap {lin_clean - wl_lin:+.2f})")
     print(f"  AirFC (mimic Linear)           : {airfc_lin:6.2f}%  "
-          f"(gap {lin_clean - airfc_lin:+.2f})")
-    if sim_acc is not None:
-        print(f"  E2E SimNet                     : {sim_acc:6.2f}%")
+          f"(gap {lin_clean - airfc_lin:+.2f}, relF={airfc_res:.3f})")
+    for label, acc in sim_accs.items():
+        print(f"  {label:<32}: {acc:6.2f}%")
+    primary_sim = next(iter(sim_accs.values()), None)
     return {
         "cnn_clean": cnn_clean, "lin_clean": lin_clean,
         "wireless_cnn": wl_cnn, "wireless_linear": wl_lin,
-        "airfc_linear": airfc_lin, "simnet": sim_acc,
+        "airfc_linear": airfc_lin, "simnet": primary_sim,
+        "simnet_all": sim_accs,
     }
 
 
@@ -2863,23 +3774,39 @@ if __name__ == "__main__":
     parser.add_argument("--snr", type=float, default=None,
                         help=f"AWGN SNR in dB on decoder input / RIS channel "
                              f"(default {DEFAULT_SNR_DB:g})")
-    parser.add_argument("--wireless", type=str, default="false", choices=["true", "false"],
-                        help="Also evaluate the wireless RIS inference path")
+    parser.add_argument("--wireless", type=str, default="true", choices=["true", "false"],
+                        help="Evaluate wireless RIS (single-point, kappa_sweep, snr_sweep; "
+                             "default true)")
+    parser.add_argument("--airfc", type=str, default="true", choices=["true", "false"],
+                        help="Evaluate AirFC P/Phi/U when --inter linear "
+                             "(single-point, kappa_sweep, snr_sweep; default true)")
+    parser.add_argument("--airfc_debug", type=str, default="true",
+                        choices=["true", "false"],
+                        help="Print one-batch AirFC AO fit diagnostics "
+                             "(relF over iters, norms; default true)")
     parser.add_argument("--compare_teachers", type=str, default="false",
                         choices=["true", "false"],
                         help="Load the cnn + linear teachers and compare clean / "
-                             "wireless (both) / AirFC (linear) / E2E SimNet (if present); "
+                             "wireless (both) / AirFC (linear) / E2E SimNet curves "
+                             "(teacher-matched + same-dataset cnn E2E fallback if present); "
                              "honors --kappa_sweep / --snr_sweep / --n_m_sweep for a plot")
     parser.add_argument("--compare_e2e", type=str, default="true",
                         choices=["true", "false"],
-                        help="In --compare_teachers, load the E2E SimNet if its "
-                             "checkpoint exists (true) or skip it entirely (false)")
+                        help="In --compare_teachers, load every existing E2E SimNet "
+                             "checkpoint (teacher-matched and same-dataset extra CNN E2E) "
+                             "when --simnet true (default true; ignored if --simnet false)")
+    parser.add_argument("--dump_arrays", type=str, default=None,
+                        help="With --compare_teachers + a sweep: write curve arrays to "
+                             "this .npz path, or to DIR/<auto_name>.npz if a directory")
     parser.add_argument("--inter", type=str, default=DEFAULT_INTERMEDIATE,
                         choices=list(INTERMEDIATE_KINDS),
                         help="Teacher mid (--inter): linear (W), relu (W2 ReLU W1), "
                              "cnn (spatial Conv2d on reshaped s), none (enc/dec only), "
                              "or sim (Physical_SIM + controller, needs H1/H2). "
-                             "BN+Dropout on digital y except none/sim. Separate checkpoint tag.")
+                             "Separate checkpoint tag.")
+    parser.add_argument("--mid_bn", type=str, default="false", choices=["true", "false"],
+                        help="BatchNorm+Dropout on digital mid y (default false). "
+                             "true saves as *_bn.pt; false uses the untagged path.")
     parser.add_argument("--data", type=str, default=DEFAULT_DATASET,
                         choices=list(DATASET_KINDS),
                         help="Image dataset: cifar (default) or mnist "
@@ -2923,10 +3850,11 @@ if __name__ == "__main__":
                         help=f"Test / wireless / sweep RIS pool size "
                              f"(default {DEFAULT_NUM_CHANNELS_TEST})")
     parser.add_argument("--kappa_sweep", type=str, nargs="?", const="auto", default=None,
-                        help="Compare Linear/CNN inter (thin teacher) + RIS/AirFC/Simnet "
-                             "vs log10(1/kappa). Loads both --inter linear and --inter cnn "
-                             "checkpoints. Pass no value/auto for 7 log-spaced kappa=1..100, "
-                             "or comma-separated values.")
+                        help="Sweep the primary --inter teacher's wireless RIS vs "
+                             "log10(1/kappa). With --airfc true (default) and "
+                             "--inter linear, also plots AirFC. Add --simnet true for "
+                             "the E2E curve. Pass no value/auto for 7 log-spaced "
+                             "kappa=1..100, or comma-separated values.")
     parser.add_argument("--snr_sweep", type=str, nargs="?", const="auto", default=None,
                         help="SNR sweep in dB at fixed --kappa. Pass no value/auto for "
                              "0..60 step 5, or comma-separated values.")
@@ -2946,9 +3874,12 @@ if __name__ == "__main__":
     save_models = args.save == "true"
     load_only = args.load == "true"
     wireless = args.wireless == "true"
+    airfc = args.airfc == "true"
+    airfc_debug = args.airfc_debug == "true"
     compare_teachers = args.compare_teachers == "true"
     compare_e2e = args.compare_e2e == "true"
     intermediate = normalize_intermediate(args.inter)
+    mid_bn = args.mid_bn == "true"
     dataset = normalize_dataset(args.data)
     teacher = args.teacher
     encoder_depth = (
@@ -3040,11 +3971,22 @@ if __name__ == "__main__":
     print(f"Encoder depth: {encoder_depth if teacher == 'cnn' else 'n/a (thin)'}")
     print(f"Dataset: {dataset}")
     print(f"Intermediate: {intermediate} ({intermediate_label(intermediate)})")
+    print(f"Mid BN+Dropout: {mid_bn}")
     print(f"Wireless RIS path: {wireless}")
+    print(f"AirFC path: {airfc}"
+          + ("" if (not airfc or intermediate == "linear")
+             else f" (skipped: needs --inter linear, got {intermediate})"))
+    if airfc and intermediate == "linear":
+        print(
+            "AirFC solver: "
+            + ("P/Phi/U (cifar)" if dataset == "cifar" else "paper Alg.1 (mnist)")
+        )
+    print(f"AirFC debug log: {airfc_debug}")
     print(f"Compare teachers: {compare_teachers}"
-          + (f" (E2E {'on' if compare_e2e else 'off'})" if compare_teachers else ""))
+          + (f" (E2E {'on' if (compare_e2e and simnet) else 'off'})"
+             if compare_teachers else ""))
     print(f"SimNet E2E only: {simnet_only}")
-    print(f"SimNet E2E path: {simnet_only or simnet or (kappa_sweep is not None) or (snr_sweep is not None)}")
+    print(f"SimNet E2E path: {simnet_only or simnet}")
     print(f"Channel: {channel_settings_label(channel_type, kappa)}")
     print(f"Channel pools: train={num_channels} | test={num_channels_test}")
     if snr_sweep is not None:
@@ -3053,6 +3995,7 @@ if __name__ == "__main__":
         print(f"N_m sweep: {', '.join(f'{m:g}' for m in n_m_sweep)}")
     print(
         f"N_t: {n_t} | N_r: {n_r} | N_m(wl/SimNet): {n_m} | N_m(AirFC): {airfc_n_m} | "
+        f"P_max: N_t={n_t} | "
         f"Epochs: {epochs} | Batch: {batch_size} | LR: {lr} | "
         f"weight_decay: {weight_decay} | SNR: {snr_db:g} dB | "
         f"phi_iters: {phi_iters} | airfc_phi_iters: {airfc_phi_iters}"
@@ -3071,7 +4014,8 @@ if __name__ == "__main__":
             make_plots=make_plots, plot_dir=plot_dir,
             save_plot_files=save_plot_files,
             kappa_sweep=kappa_sweep, snr_sweep=snr_sweep, n_m_sweep=n_m_sweep,
-            include_e2e=compare_e2e,
+            include_e2e=(compare_e2e and simnet),
+            dump_arrays=args.dump_arrays,
         )
     else:
         acc, wireless_acc, simnet_acc = run_once(
@@ -3081,7 +4025,7 @@ if __name__ == "__main__":
             save_models=save_models, model_dir=model_dir,
             load_only=load_only, model_path=args.model,
             save_plot_files=save_plot_files, snr_db=snr_db,
-            wireless=wireless, channel_type=channel_type, kappa=kappa,
+            wireless=wireless, airfc=airfc, channel_type=channel_type, kappa=kappa,
             phi_iters=phi_iters, airfc_phi_iters=airfc_phi_iters,
             num_channels=num_channels,
             num_channels_test=num_channels_test,
@@ -3094,7 +4038,9 @@ if __name__ == "__main__":
             intermediate=intermediate,
             teacher=teacher,
             encoder_depth=encoder_depth,
+            mid_bn=mid_bn,
             dataset=dataset,
+            airfc_debug=airfc_debug,
         )
         if wireless_acc is not None:
             print(f"wireless acc : {wireless_acc:.2f}%")
