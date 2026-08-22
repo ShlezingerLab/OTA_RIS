@@ -26,21 +26,25 @@ N_t: 16 | N_r: 8 | N_m(wl/SimNet): 64 | N_m(AirFC): 64 | P_max: N_t=16 | Epochs:
 
 === Compare teachers | dataset=cifar | teacher=thin | n_t=16, n_r=8, n_m=64, airfc_n_m=64, SNR=60 dB, phi_iters=100, channel=ricean | kappa=10 ===
 
-=== Compare kappa sweep (6 points) ===
-  kappa=1 | wl(CNN)=57.28% | wl(Lin)=42.99% | AirFC=42.97% (relF=0.037) | E2E thin (Nt16/Nr8)=17.05% | E2E cnn (Nt32/Nr16)=25.18%
-  kappa=2 | wl(CNN)=57.31% | wl(Lin)=43.03% | AirFC=43.02% (relF=0.042) | E2E thin (Nt16/Nr8)=17.05% | E2E cnn (Nt32/Nr16)=35.14%
-  kappa=3 | wl(CNN)=57.30% | wl(Lin)=43.07% | AirFC=42.85% (relF=0.046) | E2E thin (Nt16/Nr8)=17.05% | E2E cnn (Nt32/Nr16)=41.39%
-  kappa=5 | wl(CNN)=57.31% | wl(Lin)=43.08% | AirFC=42.67% (relF=0.059) | E2E thin (Nt16/Nr8)=17.05% | E2E cnn (Nt32/Nr16)=47.44%
-  kappa=10 | wl(CNN)=57.28% | wl(Lin)=43.13% | AirFC=41.67% (relF=0.100) | E2E thin (Nt16/Nr8)=17.05% | E2E cnn (Nt32/Nr16)=47.77%
-  kappa=20 | wl(CNN)=51.00% | wl(Lin)=36.53% | AirFC=35.83% (relF=0.307) | E2E thin (Nt16/Nr8)=17.05% | E2E cnn (Nt32/Nr16)=45.81%
+=== Compare kappa sweep (8 points) ===
+  kappa=1 | wl(CNN)=57.33% | wl(Lin)=43.08% | AirFC=43.23% (relF=0.037) | E2E thin (Nt16/Nr8)=17.05% | E2E cnn (Nt32/Nr16)=25.78%
+  kappa=2 | wl(CNN)=57.25% | wl(Lin)=43.09% | AirFC=43.07% (relF=0.041) | E2E thin (Nt16/Nr8)=17.05% | E2E cnn (Nt32/Nr16)=35.07%
+  kappa=3 | wl(CNN)=57.26% | wl(Lin)=42.98% | AirFC=42.80% (relF=0.046) | E2E thin (Nt16/Nr8)=17.05% | E2E cnn (Nt32/Nr16)=41.44%
+  kappa=5 | wl(CNN)=57.35% | wl(Lin)=43.09% | AirFC=42.70% (relF=0.057) | E2E thin (Nt16/Nr8)=17.05% | E2E cnn (Nt32/Nr16)=47.67%
+  kappa=10 | wl(CNN)=57.14% | wl(Lin)=43.21% | AirFC=41.49% (relF=0.100) | E2E thin (Nt16/Nr8)=17.05% | E2E cnn (Nt32/Nr16)=48.02%
+  kappa=20 | wl(CNN)=50.60% | wl(Lin)=37.28% | AirFC=35.19% (relF=0.308) | E2E thin (Nt16/Nr8)=17.05% | E2E cnn (Nt32/Nr16)=45.81%
+  kappa=33 | wl(CNN)=24.34% | wl(Lin)=19.80% | AirFC=20.34% (relF=1.190) | E2E thin (Nt16/Nr8)=17.05% | E2E cnn (Nt32/Nr16)=45.61%
+  kappa=50 | wl(CNN)=24.61% | wl(Lin)=20.28% | AirFC=18.47% (relF=0.820) | E2E thin (Nt16/Nr8)=17.05% | E2E cnn (Nt32/Nr16)=45.59%
 
       kappa | CNN clean | Lin clean | wl(CNN) | wl(Lin) | AirFC | E2E thin (Nt16/Nr8) | E2E cnn (Nt32/Nr16)
-          1 |    57.29% |    43.04% |  57.28% |  42.99% | 42.97% |             17.05% |             25.18%
-          2 |    57.29% |    43.04% |  57.31% |  43.03% | 43.02% |             17.05% |             35.14%
-          3 |    57.29% |    43.04% |  57.30% |  43.07% | 42.85% |             17.05% |             41.39%
-          5 |    57.29% |    43.04% |  57.31% |  43.08% | 42.67% |             17.05% |             47.44%
-         10 |    57.29% |    43.04% |  57.28% |  43.13% | 41.67% |             17.05% |             47.77%
-         20 |    57.29% |    43.04% |  51.00% |  36.53% | 35.83% |             17.05% |             45.81%
+          1 |    57.30% |    43.03% |  57.33% |  43.08% | 43.23% |             17.05% |             25.78%
+          2 |    57.30% |    43.03% |  57.25% |  43.09% | 43.07% |             17.05% |             35.07%
+          3 |    57.30% |    43.03% |  57.26% |  42.98% | 42.80% |             17.05% |             41.44%
+          5 |    57.30% |    43.03% |  57.35% |  43.09% | 42.70% |             17.05% |             47.67%
+         10 |    57.30% |    43.03% |  57.14% |  43.21% | 41.49% |             17.05% |             48.02%
+         20 |    57.30% |    43.03% |  50.60% |  37.28% | 35.19% |             17.05% |             45.81%
+         33 |    57.30% |    43.03% |  24.34% |  19.80% | 20.34% |             17.05% |             45.61%
+         50 |    57.30% |    43.03% |  24.61% |  20.28% | 18.47% |             17.05% |             45.59%
   saved compare-sweep arrays to: /home/mazya/OTA_RIS/cifar/plots_sim/arrays/sim_2.npz
 Using device: cuda
 Mode: demo
@@ -70,21 +74,25 @@ N_t: 16 | N_r: 8 | N_m(wl/SimNet): 64 | N_m(AirFC): 64 | P_max: N_t=16 | Epochs:
 
 === Compare teachers | dataset=mnist | teacher=thin | n_t=16, n_r=8, n_m=64, airfc_n_m=64, SNR=60 dB, phi_iters=100, channel=ricean | kappa=10 ===
 
-=== Compare kappa sweep (6 points) ===
-  kappa=1 | wl(CNN)=98.34% | wl(Lin)=93.97% | AirFC=77.25% (relF=0.511) | E2E thin (Nt16/Nr8)=11.35% | E2E cnn (Nt32/Nr16)=22.24%
-  kappa=2 | wl(CNN)=98.35% | wl(Lin)=93.94% | AirFC=80.01% (relF=0.493) | E2E thin (Nt16/Nr8)=11.35% | E2E cnn (Nt32/Nr16)=29.30%
-  kappa=3 | wl(CNN)=98.36% | wl(Lin)=93.91% | AirFC=80.28% (relF=0.479) | E2E thin (Nt16/Nr8)=11.35% | E2E cnn (Nt32/Nr16)=36.63%
-  kappa=5 | wl(CNN)=98.35% | wl(Lin)=93.93% | AirFC=83.23% (relF=0.443) | E2E thin (Nt16/Nr8)=11.35% | E2E cnn (Nt32/Nr16)=53.93%
-  kappa=10 | wl(CNN)=98.33% | wl(Lin)=93.82% | AirFC=76.76% (relF=0.535) | E2E thin (Nt16/Nr8)=11.35% | E2E cnn (Nt32/Nr16)=97.36%
-  kappa=20 | wl(CNN)=91.52% | wl(Lin)=63.21% | AirFC=81.14% (relF=0.517) | E2E thin (Nt16/Nr8)=11.35% | E2E cnn (Nt32/Nr16)=84.79%
+=== Compare kappa sweep (8 points) ===
+  kappa=1 | wl(CNN)=98.36% | wl(Lin)=93.93% | AirFC=77.22% (relF=0.511) | E2E thin (Nt16/Nr8)=11.35% | E2E cnn (Nt32/Nr16)=22.40%
+  kappa=2 | wl(CNN)=98.36% | wl(Lin)=93.95% | AirFC=79.12% (relF=0.495) | E2E thin (Nt16/Nr8)=11.35% | E2E cnn (Nt32/Nr16)=29.41%
+  kappa=3 | wl(CNN)=98.36% | wl(Lin)=93.94% | AirFC=80.63% (relF=0.475) | E2E thin (Nt16/Nr8)=11.35% | E2E cnn (Nt32/Nr16)=36.81%
+  kappa=5 | wl(CNN)=98.36% | wl(Lin)=93.92% | AirFC=83.65% (relF=0.444) | E2E thin (Nt16/Nr8)=11.35% | E2E cnn (Nt32/Nr16)=53.81%
+  kappa=10 | wl(CNN)=98.35% | wl(Lin)=93.88% | AirFC=76.95% (relF=0.537) | E2E thin (Nt16/Nr8)=11.35% | E2E cnn (Nt32/Nr16)=97.30%
+  kappa=20 | wl(CNN)=91.47% | wl(Lin)=63.49% | AirFC=80.73% (relF=0.518) | E2E thin (Nt16/Nr8)=11.35% | E2E cnn (Nt32/Nr16)=84.60%
+  kappa=33 | wl(CNN)=37.38% | wl(Lin)=21.39% | AirFC=29.42% (relF=1.640) | E2E thin (Nt16/Nr8)=11.35% | E2E cnn (Nt32/Nr16)=81.01%
+  kappa=50 | wl(CNN)=37.27% | wl(Lin)=21.55% | AirFC=27.32% (relF=1.394) | E2E thin (Nt16/Nr8)=11.35% | E2E cnn (Nt32/Nr16)=80.87%
 
       kappa | CNN clean | Lin clean | wl(CNN) | wl(Lin) | AirFC | E2E thin (Nt16/Nr8) | E2E cnn (Nt32/Nr16)
-          1 |    98.36% |    93.96% |  98.34% |  93.97% | 77.25% |             11.35% |             22.24%
-          2 |    98.36% |    93.96% |  98.35% |  93.94% | 80.01% |             11.35% |             29.30%
-          3 |    98.36% |    93.96% |  98.36% |  93.91% | 80.28% |             11.35% |             36.63%
-          5 |    98.36% |    93.96% |  98.35% |  93.93% | 83.23% |             11.35% |             53.93%
-         10 |    98.36% |    93.96% |  98.33% |  93.82% | 76.76% |             11.35% |             97.36%
-         20 |    98.36% |    93.96% |  91.52% |  63.21% | 81.14% |             11.35% |             84.79%
+          1 |    98.36% |    93.96% |  98.36% |  93.93% | 77.22% |             11.35% |             22.40%
+          2 |    98.36% |    93.96% |  98.36% |  93.95% | 79.12% |             11.35% |             29.41%
+          3 |    98.36% |    93.96% |  98.36% |  93.94% | 80.63% |             11.35% |             36.81%
+          5 |    98.36% |    93.96% |  98.36% |  93.92% | 83.65% |             11.35% |             53.81%
+         10 |    98.36% |    93.96% |  98.35% |  93.88% | 76.95% |             11.35% |             97.30%
+         20 |    98.36% |    93.96% |  91.47% |  63.49% | 80.73% |             11.35% |             84.60%
+         33 |    98.36% |    93.96% |  37.38% |  21.39% | 29.42% |             11.35% |             81.01%
+         50 |    98.36% |    93.96% |  37.27% |  21.55% | 27.32% |             11.35% |             80.87%
   saved compare-sweep arrays to: /home/mazya/OTA_RIS/cifar/plots_sim/arrays/sim_3.npz
 Using device: cuda
 Mode: demo
@@ -106,7 +114,7 @@ SimNet E2E only: False
 SimNet E2E path: True
 Channel: ricean | kappa=10
 Channel pools: train=10000 | test=1000
-SNR sweep (dB): 5, 10, 20, 33, 50, 70
+SNR sweep (dB): 1, 5, 10, 20, 33, 50, 70
 N_t: 16 | N_r: 8 | N_m(wl/SimNet): 64 | N_m(AirFC): 64 | P_max: N_t=16 | Epochs: 500 | Batch: 256 | LR: 0.001 | weight_decay: 0.0 | SNR: 60 dB | phi_iters: 100 | airfc_phi_iters: 100
   loaded CNN teacher   : /home/mazya/OTA_RIS/cifar/models/cifar_thin_cnn_nt16_nr8__epochs500.pt
   loaded Linear teacher: /home/mazya/OTA_RIS/cifar/models/cifar_thin_linear_nt16_nr8__epochs500.pt
@@ -115,31 +123,33 @@ N_t: 16 | N_r: 8 | N_m(wl/SimNet): 64 | N_m(AirFC): 64 | P_max: N_t=16 | Epochs:
 
 === Compare teachers | dataset=cifar | teacher=thin | n_t=16, n_r=8, n_m=64, airfc_n_m=64, SNR=60 dB, phi_iters=100, channel=ricean | kappa=10 ===
 
-=== Compare snr sweep (6 points) ===
-  SNR=5 dB | CNN clean=51.96% | Lin clean=39.23% | wl(CNN)=48.47% | wl(Lin)=37.62% | AirFC=30.03% (relF=0.101) | E2E thin (Nt16/Nr8)=17.05% | E2E cnn (Nt32/Nr16)=44.62%
-  SNR=10 dB | CNN clean=54.99% | Lin clean=41.80% | wl(CNN)=54.20% | wl(Lin)=40.72% | AirFC=37.12% (relF=0.101) | E2E thin (Nt16/Nr8)=17.05% | E2E cnn (Nt32/Nr16)=46.57%
-  SNR=20 dB | CNN clean=57.13% | Lin clean=43.16% | wl(CNN)=56.55% | wl(Lin)=43.01% | AirFC=41.43% (relF=0.101) | E2E thin (Nt16/Nr8)=17.05% | E2E cnn (Nt32/Nr16)=47.62%
-  SNR=33 dB | CNN clean=57.22% | Lin clean=42.98% | wl(CNN)=57.02% | wl(Lin)=43.05% | AirFC=42.32% (relF=0.101) | E2E thin (Nt16/Nr8)=17.05% | E2E cnn (Nt32/Nr16)=47.86%
-  SNR=50 dB | CNN clean=57.31% | Lin clean=43.07% | wl(CNN)=57.30% | wl(Lin)=43.00% | AirFC=42.25% (relF=0.101) | E2E thin (Nt16/Nr8)=17.05% | E2E cnn (Nt32/Nr16)=47.93%
-  SNR=70 dB | CNN clean=57.28% | Lin clean=43.01% | wl(CNN)=57.23% | wl(Lin)=43.10% | AirFC=42.25% (relF=0.101) | E2E thin (Nt16/Nr8)=17.05% | E2E cnn (Nt32/Nr16)=47.94%
+=== Compare snr sweep (7 points) ===
+  SNR=1 dB | CNN clean=46.89% | Lin clean=34.86% | wl(CNN)=43.00% | wl(Lin)=32.39% | AirFC=24.82% (relF=0.099) | E2E thin (Nt16/Nr8)=17.19% | E2E cnn (Nt32/Nr16)=41.21%
+  SNR=5 dB | CNN clean=52.81% | Lin clean=39.39% | wl(CNN)=48.83% | wl(Lin)=36.82% | AirFC=30.31% (relF=0.099) | E2E thin (Nt16/Nr8)=17.04% | E2E cnn (Nt32/Nr16)=45.28%
+  SNR=10 dB | CNN clean=55.59% | Lin clean=42.29% | wl(CNN)=54.04% | wl(Lin)=40.44% | AirFC=36.44% (relF=0.099) | E2E thin (Nt16/Nr8)=17.05% | E2E cnn (Nt32/Nr16)=47.06%
+  SNR=20 dB | CNN clean=56.95% | Lin clean=42.73% | wl(CNN)=56.97% | wl(Lin)=42.86% | AirFC=41.13% (relF=0.099) | E2E thin (Nt16/Nr8)=17.05% | E2E cnn (Nt32/Nr16)=47.76%
+  SNR=33 dB | CNN clean=57.26% | Lin clean=43.26% | wl(CNN)=57.21% | wl(Lin)=42.96% | AirFC=41.84% (relF=0.099) | E2E thin (Nt16/Nr8)=17.05% | E2E cnn (Nt32/Nr16)=47.91%
+  SNR=50 dB | CNN clean=57.29% | Lin clean=43.04% | wl(CNN)=57.23% | wl(Lin)=43.15% | AirFC=41.96% (relF=0.099) | E2E thin (Nt16/Nr8)=17.05% | E2E cnn (Nt32/Nr16)=47.93%
+  SNR=70 dB | CNN clean=57.28% | Lin clean=43.03% | wl(CNN)=57.29% | wl(Lin)=43.06% | AirFC=41.99% (relF=0.099) | E2E thin (Nt16/Nr8)=17.05% | E2E cnn (Nt32/Nr16)=47.97%
 
     SNR(dB) | CNN clean | Lin clean | wl(CNN) | wl(Lin) | AirFC | E2E thin (Nt16/Nr8) | E2E cnn (Nt32/Nr16)
-          5 |    51.96% |    39.23% |  48.47% |  37.62% | 30.03% |             17.05% |             44.62%
-         10 |    54.99% |    41.80% |  54.20% |  40.72% | 37.12% |             17.05% |             46.57%
-         20 |    57.13% |    43.16% |  56.55% |  43.01% | 41.43% |             17.05% |             47.62%
-         33 |    57.22% |    42.98% |  57.02% |  43.05% | 42.32% |             17.05% |             47.86%
-         50 |    57.31% |    43.07% |  57.30% |  43.00% | 42.25% |             17.05% |             47.93%
-         70 |    57.28% |    43.01% |  57.23% |  43.10% | 42.25% |             17.05% |             47.94%
+          1 |    46.89% |    34.86% |  43.00% |  32.39% | 24.82% |             17.19% |             41.21%
+          5 |    52.81% |    39.39% |  48.83% |  36.82% | 30.31% |             17.04% |             45.28%
+         10 |    55.59% |    42.29% |  54.04% |  40.44% | 36.44% |             17.05% |             47.06%
+         20 |    56.95% |    42.73% |  56.97% |  42.86% | 41.13% |             17.05% |             47.76%
+         33 |    57.26% |    43.26% |  57.21% |  42.96% | 41.84% |             17.05% |             47.91%
+         50 |    57.29% |    43.04% |  57.23% |  43.15% | 41.96% |             17.05% |             47.93%
+         70 |    57.28% |    43.03% |  57.29% |  43.06% | 41.99% |             17.05% |             47.97%
   saved compare-sweep arrays to: /home/mazya/OTA_RIS/cifar/plots_sim/arrays/sim_4.npz
 
 === Running sim_2 ===
-  /home/mazya/.conda/envs/py310/bin/python /home/mazya/OTA_RIS/cifar/cifar_minimal_dnn.py --load true --compare_teachers true --epochs 500 --kappa_sweep 1,2,3,5,10,20 --save_plots false --simnet true --dump_arrays /home/mazya/OTA_RIS/cifar/plots_sim/arrays/sim_2.npz --make_plots false
+  /home/mazya/.conda/envs/py310/bin/python /home/mazya/OTA_RIS/cifar/cifar_minimal_dnn.py --load true --compare_teachers true --epochs 500 --kappa_sweep 1,2,3,5,10,20,33,50 --save_plots false --simnet true --dump_arrays /home/mazya/OTA_RIS/cifar/plots_sim/arrays/sim_2.npz --make_plots false
 
 === Running sim_3 ===
-  /home/mazya/.conda/envs/py310/bin/python /home/mazya/OTA_RIS/cifar/cifar_minimal_dnn.py --load true --compare_teachers true --epochs 500 --kappa_sweep 1,2,3,5,10,20 --save_plots false --simnet true --data mnist --dump_arrays /home/mazya/OTA_RIS/cifar/plots_sim/arrays/sim_3.npz --make_plots false
+  /home/mazya/.conda/envs/py310/bin/python /home/mazya/OTA_RIS/cifar/cifar_minimal_dnn.py --load true --compare_teachers true --epochs 500 --kappa_sweep 1,2,3,5,10,20,33,50 --save_plots false --simnet true --data mnist --dump_arrays /home/mazya/OTA_RIS/cifar/plots_sim/arrays/sim_3.npz --make_plots false
 
 === Running sim_4 ===
-  /home/mazya/.conda/envs/py310/bin/python /home/mazya/OTA_RIS/cifar/cifar_minimal_dnn.py --load true --compare_teachers true --epochs 500 --kappa 10 --snr_sweep 5,10,20,33,50,70 --save_plots false --simnet true --dump_arrays /home/mazya/OTA_RIS/cifar/plots_sim/arrays/sim_4.npz --make_plots false
+  /home/mazya/.conda/envs/py310/bin/python /home/mazya/OTA_RIS/cifar/cifar_minimal_dnn.py --load true --compare_teachers true --epochs 500 --kappa 10 --snr_sweep 1,5,10,20,33,50,70 --save_plots false --simnet true --dump_arrays /home/mazya/OTA_RIS/cifar/plots_sim/arrays/sim_4.npz --make_plots false
 
 Wrote manifest: /home/mazya/OTA_RIS/cifar/plots_sim/arrays/manifest.json
 Arrays dir: /home/mazya/OTA_RIS/cifar/plots_sim/arrays
