@@ -10,7 +10,7 @@ uses a 2D checkerboard instead of CIFAR so the depth gap is large and
 explainable (~35% vs ~2% on CIFAR).
 
 ---
-
+## kappa for simulation: kappa=5, 10, 20, 33, 50, 70
 ## The checkerboard task
 
 Input is a 2D coordinate `[x, y]` in `[0, 1]^2`. The label is **black or white**

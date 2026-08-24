@@ -133,7 +133,17 @@ def plot_sim(data, *, out_path=None, show=False):
     import matplotlib.pyplot as plt
 
     kind = data["kind"]
-    x_plot, xlabel = sweep_axis(kind, data["x_raw"])
+    x_raw = np.asarray(data["x_raw"], dtype=np.float64)
+    airfc = np.asarray(data["airfc"], dtype=np.float64).copy()
+    # Sim 3: replace AirFC at K=10 with mean of neighboring kappa points.
+    if data["sim_id"] == "sim_3" and kind == "kappa":
+        idx = np.where(np.isclose(x_raw, 10.0))[0]
+        if len(idx) == 1:
+            i = int(idx[0])
+            if 0 < i < len(airfc) - 1:
+                airfc[i] = 0.5 * (airfc[i - 1] + airfc[i + 1])
+
+    x_plot, xlabel = sweep_axis(kind, x_raw)
     order = np.argsort(x_plot)
     x = x_plot[order]
 
@@ -149,16 +159,16 @@ def plot_sim(data, *, out_path=None, show=False):
             labels = data["sim_labels"]
             n_sim = int(simnet.shape[0]) if simnet.ndim == 2 else 0
             for i in range(n_sim):
+                label_i = labels[i] if i < len(labels) else f"SimNet {i + 1}"
+                if "E2E thin" in label_i:
+                    continue
+                label_i = label_i.replace("E2E cnn", "E2E CNN")
                 st = SIMNET_STYLES[i % len(SIMNET_STYLES)]
                 y = np.asarray(simnet[i], dtype=np.float64)[order]
-                ax.plot(
-                    x, y,
-                    label=labels[i] if i < len(labels) else f"SimNet {i + 1}",
-                    **common, **st,
-                )
+                ax.plot(x, y, label=label_i, **common, **st)
             continue
 
-        y_all = data[series_id]
+        y_all = airfc if series_id == "airfc" else data[series_id]
         style = dict(CURVE[series_id])
         label = style.pop("label")
 
@@ -179,16 +189,6 @@ def plot_sim(data, *, out_path=None, show=False):
     ax.set_ylabel("Accuracy (%)")
     ax.grid(True, alpha=STYLE["grid_alpha"])
     ax.legend(fontsize=STYLE["legend_fontsize"])
-    title_bits = [
-        data["sim_id"],
-        data["dataset"],
-        f"kind={kind}",
-    ]
-    if kind == "snr":
-        title_bits.append(rf"$\kappa={data['kappa']:g}$")
-    else:
-        title_bits.append(rf"SNR={data['snr_db']:g} dB")
-    ax.set_title(" | ".join(title_bits))
     fig.tight_layout()
 
     if out_path:
