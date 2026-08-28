@@ -380,13 +380,28 @@ def _show_or_close_plot(plt, fig, path):
     plt.close(fig)
 
 
+def _save_panel_image(plt, image, path):
+    """Save one decision-region panel as a square PNG with no axes/title."""
+    fig, ax = plt.subplots(1, 1, figsize=(5, 5))
+    ax.imshow(image, origin="lower", extent=(0, 1, 0, 1), cmap="coolwarm", alpha=0.9)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fig.savefig(path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  saved decision-boundary plot to: {path}")
+
+
 @torch.no_grad()
 def plot_decision_comparison(models, accuracies, device, grid_n, path=None, res: int = 300,
-                             wireless_cfg=None):
+                             wireless_cfg=None, separate_plots=False):
     """Show or optionally save ground-truth / with-W_lin / bypass regions.
 
     When `path` is None, nothing is written to disk — figure is only displayed
     when matplotlib has an inline or GUI display. When `path` is set, also saves a PNG.
+    When `separate_plots=True` and `path` is a directory, save each panel as its own PNG
+    under that directory (benchmark / with_wlin / bypass / wireless).
     """
     plt = _matplotlib_pyplot()
 
@@ -414,22 +429,25 @@ def plot_decision_comparison(models, accuracies, device, grid_n, path=None, res:
         )
         wireless_pred = wlogits.argmax(1).cpu().numpy().reshape(res, res)
 
-    n_panels = 4 if wireless_pred is not None else 3
-    fig, axes = plt.subplots(1, n_panels, figsize=(5 * n_panels, 5))
-    axes[0].imshow(truth, origin="lower", extent=(0, 1, 0, 1), cmap="coolwarm", alpha=0.9)
-    axes[0].set_title(f"Benchmark: true {grid_n}x{grid_n} checkerboard")
-    axes[1].imshow(preds[True], origin="lower", extent=(0, 1, 0, 1), cmap="coolwarm", alpha=0.9)
-    axes[1].set_title(f"With W_lin (acc {accuracies[True]:.2f}%)")
-    axes[2].imshow(preds[False], origin="lower", extent=(0, 1, 0, 1), cmap="coolwarm", alpha=0.9)
-    axes[2].set_title(f"Without W_lin / bypass (acc {accuracies[False]:.2f}%)")
+    panels = [
+        ("benchmark", truth),
+        ("with_wlin", preds[True]),
+        ("bypass", preds[False]),
+    ]
     if wireless_pred is not None:
-        axes[3].imshow(wireless_pred, origin="lower", extent=(0, 1, 0, 1), cmap="coolwarm", alpha=0.9)
-        settings_title = wireless_settings_title(
-            wireless_cfg["channel_type"], wireless_cfg["snr_db"], wireless_cfg["kappa"],
-            wireless_cfg["n_m"], wireless_cfg["phi_iters"],
-        )
-        axes[3].set_title(f"Wireless RIS (acc {accuracies['wireless']:.2f}%)\n{settings_title}")
-    for ax in axes:
+        panels.append(("wireless", wireless_pred))
+
+    if separate_plots and path is not None:
+        for name, image in panels:
+            _save_panel_image(plt, image, os.path.join(path, f"{name}.png"))
+        return
+
+    n_panels = len(panels)
+    fig, axes = plt.subplots(1, n_panels, figsize=(5 * n_panels, 5))
+    if n_panels == 1:
+        axes = [axes]
+    for ax, (_, image) in zip(axes, panels):
+        ax.imshow(image, origin="lower", extent=(0, 1, 0, 1), cmap="coolwarm", alpha=0.9)
         ax.set_xticks([])
         ax.set_yticks([])
     fig.tight_layout()
@@ -540,7 +558,7 @@ def run_once(grid_n, hidden, n_train, n_test, batch_size, epochs, lr, weight_dec
              wireless=False, channel_type="geometric_rayleigh", kappa=10, snr_db=10.0, n_m=100, phi_iters=100,
              load_only=False, model_with_path=None, model_bypass_path=None,
              phi_iters_sweep=None, snr_sweep=None, kappa_sweep=None, n_m_sweep=None,
-             decision_plot=True, save_plot_files=False):
+             decision_plot=True, save_plot_files=False, separate_plots=False):
     """Train (or load) both routing modes and return (acc_with, acc_bypass).
 
     When `load_only=True`, skip training and load saved checkpoints from
@@ -553,7 +571,8 @@ def run_once(grid_n, hidden, n_train, n_test, batch_size, epochs, lr, weight_dec
     added as a 4th panel.
 
     Plots are shown when running in Interactive Window. PNG files are written
-    only when `save_plot_files=True`.
+    only when `save_plot_files=True`. When `separate_plots=True`, decision panels
+    are saved as individual PNGs under `plots/epochs_<epochs>/`.
     """
     x_te, y_te = make_checkerboard(n_test, grid_n=grid_n, seed=seed + 1)
     if not load_only:
@@ -613,13 +632,17 @@ def run_once(grid_n, hidden, n_train, n_test, batch_size, epochs, lr, weight_dec
     if make_plots:
         # Display-only by default (path=None). PNG only when save_plot_files=True.
         if decision_plot and not wireless_sweep_requested:
-            plot_path = (
-                os.path.join(plot_dir, f"epochs_{epochs}.png") if save_plot_files else None
-            )
+            if save_plot_files and separate_plots:
+                plot_path = os.path.join(plot_dir, f"epochs_{epochs}")
+            elif save_plot_files:
+                plot_path = os.path.join(plot_dir, f"epochs_{epochs}.png")
+            else:
+                plot_path = None
             plot_decision_comparison(
                 eval_models, acc, device, grid_n=grid_n,
                 path=plot_path,
                 wireless_cfg=wireless_cfg,
+                separate_plots=separate_plots,
             )
         if wireless_cfg is not None:
             channel_label = channel_type.replace("geometric_", "")
@@ -676,6 +699,9 @@ if __name__ == "__main__":
                         help="Show decision-boundary plots (Interactive Window): true or false")
     parser.add_argument("--save_plots", type=str, default="false", choices=["true", "false"],
                         help="Also write plot PNGs under plots/: true or false (default false)")
+    parser.add_argument("--sub", type=str, default="false", choices=["true", "false"],
+                        help="With --save_plots true, save decision panels as separate PNGs "
+                             "under plots/epochs_<epochs>/ (benchmark, with_wlin, bypass, wireless)")
     parser.add_argument("--save", type=str, default="true", choices=["true", "false"],
                         help="Save trained models before loading them for evaluation: true or false")
     parser.add_argument("--load", type=str, default="true", choices=["true", "false"],
@@ -740,12 +766,14 @@ if __name__ == "__main__":
     SWEEP = SWEEP or args.sweep
     make_plots = args.make_plots == "true" and not args.no_plots
     save_plot_files = args.save_plots == "true"
+    separate_plots = args.sub == "true"
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     print(f"Mode: {mode}")
     print(f"Make plots: {make_plots}")
     print(f"Save plot files: {save_plot_files}")
+    print(f"Separate subplot files: {separate_plots}")
     print(f"Save models: {save_models}")
     print(f"Load only: {load_only}")
     print(f"Wireless RIS panel: {wireless}")
@@ -773,6 +801,7 @@ if __name__ == "__main__":
                 phi_iters_sweep=phi_iters_sweep, snr_sweep=snr_sweep,
                 kappa_sweep=kappa_sweep, n_m_sweep=n_m_sweep,
                 decision_plot=False, save_plot_files=save_plot_files,
+                separate_plots=separate_plots,
             )
             results.append((g, acc_with, acc_bypass))
         for g, acc_with, acc_bypass in results:
@@ -790,7 +819,7 @@ if __name__ == "__main__":
             model_bypass_path=args.model_bypass,
             phi_iters_sweep=phi_iters_sweep, snr_sweep=snr_sweep,
             kappa_sweep=kappa_sweep, n_m_sweep=n_m_sweep,
-            save_plot_files=save_plot_files,
+            save_plot_files=save_plot_files, separate_plots=separate_plots,
         )
         if wireless:
             print(f"wireless : {channel_accuracy:.2f}%")
