@@ -134,14 +134,7 @@ def plot_sim(data, *, out_path=None, show=False):
 
     kind = data["kind"]
     x_raw = np.asarray(data["x_raw"], dtype=np.float64)
-    airfc = np.asarray(data["airfc"], dtype=np.float64).copy()
-    # Sim 3: replace AirFC at K=10 with mean of neighboring kappa points.
-    if data["sim_id"] == "sim_3" and kind == "kappa":
-        idx = np.where(np.isclose(x_raw, 10.0))[0]
-        if len(idx) == 1:
-            i = int(idx[0])
-            if 0 < i < len(airfc) - 1:
-                airfc[i] = 0.5 * (airfc[i - 1] + airfc[i + 1])
+    airfc = np.asarray(data["airfc"], dtype=np.float64)
 
     x_plot, xlabel = sweep_axis(kind, x_raw)
     order = np.argsort(x_plot)
