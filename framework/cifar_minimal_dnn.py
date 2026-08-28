@@ -23,12 +23,9 @@ with a reconfigurable-controller cascade matching `train_minn` metanet/sim
 DNN maps (H1, H2) -> per-layer phases; SimNet geometry/W is frozen. Use
 `--simnet_only true` to train/eval that path without the classic teacher. Kappa
 and SNR sweeps can plot teacher bound, wireless RIS, SimNet E2E, and AirFC
-(joint F1, Phi, F2) together. AirFC is routed by ``--data``: ``mnist`` uses
-paper Algorithm 1 offline (channel-level: Lagrange/bisection F1 with
-``P_max=N_t``, relative ridge F2, MM Phi); ``cifar`` uses the Figure_1-era
-P/Phi/U path (``_optimize_airfc_cifar`` / ``airfc_cifar_forward``). No
-data-vector ``s`` in either AO. Eval solves AO once per channel pool and
-reuses ``(phi, F1, F2)`` across test images and SNR. AirFC is fairest with
+together. AirFC fits ``U^H H2 diag(phi) H1 P ≈ W`` (closed-form P/U + PGD on
+phi; no data-vector ``s`` in the AO). Eval solves AO once per channel pool and
+reuses ``(phi, P, U)`` across test images and SNR. AirFC is fairest with
 ``--mid_bn false`` (default) so the teacher mid is pure ``y = W s``.
 Wireless / SimNet use `--n_m`; AirFC can use a different `--airfc_n_m`.
 Wireless uses `--phi_iters`; AirFC uses `--airfc_phi_iters` (defaults to
@@ -76,7 +73,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
-# Script lives under cifar/; models/plots are local, shared assets live at repo root.
+# Script lives under framework/; models/plots are local, shared assets live at repo root.
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_SCRIPT_DIR)
 if _REPO_ROOT not in sys.path:
@@ -118,10 +115,6 @@ DEFAULT_KAPPA = 10.0
 DEFAULT_NUM_CHANNELS_TRAIN = 10000
 DEFAULT_NUM_CHANNELS_TEST = 1000
 DEFAULT_PHI_ITERS = 100
-# Paper Algorithm 1 ridge on F2: min ||F2 Υ - W||_F^2 + σ²||F2||_F^2 with σ² = 1.
-# Under pathloss, the F2 solve scales σ² by mean diag(Υ Υ^H) so the ridge
-# does not crush F2 when ||Υ|| is tiny (see `_airfc_update_F2_ridge`).
-DEFAULT_AIRFC_RIDGE_SIGMA2 = 1.0
 DEFAULT_SIM_NUM_LAYERS = 3
 DEFAULT_SIM_LAYER_DIST_LAMBDA = 5.0
 DEFAULT_SIM_ELEM_WIDTH_LAMBDA = 0.5
@@ -421,7 +414,7 @@ class TeacherIntermediate(nn.Module):
             )
         if self.kind == "linear":
             # Complex W only — a free real Linear(2Nt→2Nr) is not realizable by
-            # AirFC (F2 H2 diag(phi) H1 F1), which is always complex-linear.
+            # AirFC (U^H H2 diag(phi) H1 P), which is always complex-linear.
             w = torch.empty(self.n_r, self.n_t, 2)
             nn.init.kaiming_uniform_(w, a=math.sqrt(5))
             self.W_c = nn.Parameter(w)
@@ -820,7 +813,7 @@ class CifarSimCNN(nn.Module):
 
 
 def noise(y, target_snr_db):
-    """AWGN matched to signal power (vendored from gan/gan.py; real + complex)."""
+    """AWGN matched to signal power (vendored from GAN - playground/gan.py; real + complex)."""
     p_signal = torch.mean(torch.abs(y) ** 2)
     sigma_sqr = p_signal / (10 ** (target_snr_db / 10.0))
     noise_std = torch.sqrt(sigma_sqr)
@@ -915,249 +908,15 @@ def _norm_match_to_target(y, y_target):
     return torch.view_as_complex(y_real.reshape(B, n_r, 2).contiguous())
 
 
-def _airfc_update_F1_bisection(Upsilon, W, P_max=None, n_bisect=15, eps=1e-10):
-    """Paper Eq. (11)–(16): F1 via Lagrange duality.
-
-    Upsilon = F2 H2 diag(phi) H1, shape (B, Nr, Nt). W: (B, Nr, Nt).
-    If ``P_max`` is None, skip the power constraint (λ = 0, unconstrained LS).
-    Otherwise enforces ||F1||_F^2 <= P_max via bisection on λ.
-    """
-    B, _, n_t = Upsilon.shape
-    device, dtype = Upsilon.device, Upsilon.dtype
-    A = torch.bmm(Upsilon.mH, Upsilon)  # (B, Nt, Nt) Hermitian
-    # eigh on Hermitian (use real-symmetric via Hermitian part for stability)
-    A_h = 0.5 * (A + A.mH)
-    evals, evecs = torch.linalg.eigh(A_h)  # ascending
-    evals = evals.real.clamp_min(0.0)
-    YhW = torch.bmm(Upsilon.mH, W)                    # (B, Nt, Nr) effectively Nt x ...
-    Uh_YhW = torch.bmm(evecs.mH, YhW)                 # (B, Nt, Nr) wait W is Nr x Nt so YhW is Nt x Nt
-    # W: (B, Nr, Nt); Upsilon^H W: (B, Nt, Nt)
-    num = torch.diagonal(
-        torch.bmm(Uh_YhW, Uh_YhW.mH), dim1=-2, dim2=-1
-    ).real.clamp_min(0.0)  # (B, Nt)
-
-    def fro_power(lam):
-        den = (evals + lam.unsqueeze(-1)).clamp_min(eps)
-        return (num / (den * den)).sum(dim=-1)
-
-    lam = torch.zeros(B, device=device, dtype=evals.dtype)
-    if P_max is not None:
-        p0 = fro_power(lam)
-        need = p0 > float(P_max) + 1e-8
-        if need.any():
-            # λ_up from paper Eq. (16)
-            lam_up = torch.sqrt(num.sum(dim=-1).clamp_min(eps) / float(P_max))
-            lo = torch.zeros(B, device=device, dtype=evals.dtype)
-            hi = lam_up.clone()
-            for _ in range(n_bisect):
-                mid = 0.5 * (lo + hi)
-                p_mid = fro_power(mid)
-                too_big = p_mid > float(P_max)
-                lo = torch.where(too_big, mid, lo)
-                hi = torch.where(too_big, hi, mid)
-            lam = torch.where(need, hi, lam)
-
-    inv = 1.0 / (evals + lam.unsqueeze(-1)).clamp_min(eps)  # (B, Nt)
-    F1 = torch.bmm(evecs, inv.unsqueeze(-1) * Uh_YhW)       # (B, Nt, Nt)
-    return F1.to(dtype)
-
-
-def _airfc_update_F2_ridge(Upsilon_bar, W, sigma2):
-    """Paper Eq. (18): ridge / Tikhonov combiner F2.
-
-    Upsilon_bar = H2 diag(phi) H1 F1, shape (B, Nr, Nt).
-    F2 = (Υ_bar Υ_bar^H + σ²_eff I)^{-1} W Υ_bar^H.
-
-    ``sigma2`` is relative: ``σ²_eff = sigma2 * mean(diag(Gram))`` so a
-    static σ²=1 does not dominate Gram when pathloss makes ||Υ|| tiny.
-    """
-    B, n_r, _ = Upsilon_bar.shape
-    device, dtype = Upsilon_bar.device, Upsilon_bar.dtype
-    Gram = torch.bmm(Upsilon_bar, Upsilon_bar.mH)  # (B, Nr, Nr)
-    eye = torch.eye(n_r, device=device, dtype=dtype).unsqueeze(0).expand(B, -1, -1)
-    mean_power = (
-        torch.diagonal(Gram, dim1=-2, dim2=-1).real
-        .mean(dim=-1, keepdim=True).unsqueeze(-1)
-    )
-    dynamic_sigma2 = float(sigma2) * mean_power.clamp_min(1e-12)
-    rhs = torch.bmm(W, Upsilon_bar.mH)             # (B, Nr, Nr)
-    F2 = torch.linalg.solve(Gram + dynamic_sigma2 * eye, rhs)
-    return F2
-
-
-def _airfc_update_phi_mm(F2, H_1, H_2, F1, W):
-    """Paper Eq. (26): MM closed-form unit-modulus RIS phases.
-
-    Uses C = F2 H2, D = H1 F1 so
-      Ω = (C^H C) ⊙ (D D^H)^T ,
-      φ = diag(D W^H C),
-      v ← exp(j arg((λ_max I − Ω) v − φ*)).
-    """
-    C = torch.bmm(F2, H_2)   # (B, Nr, Nm)
-    D = torch.bmm(H_1, F1)   # (B, Nm, Nt)
-    CHC = torch.bmm(C.mH, C)                 # (B, Nm, Nm)
-    DDT = torch.bmm(D, D.mH).transpose(-1, -2)  # (B, Nm, Nm); (DD^H)^T
-    Omega = CHC * DDT
-    # φ_i = (D W^H C)_{i,i}
-    DWC = torch.bmm(D, torch.bmm(W.mH, C))   # (B, Nm, Nm)
-    varphi = torch.diagonal(DWC, dim1=-2, dim2=-1)  # (B, Nm)
-
-    # λ_max of Hermitian Ω via power iteration (O(N_m^2) vs eigvalsh O(N_m^3)).
-    # MM needs λ >= λ_max so (λI − Ω) ⪰ 0; inflate slightly if 5 steps undershoot.
-    Omega_h = 0.5 * (Omega + Omega.mH)
-    q = torch.randn(
-        C.size(0), C.size(-1), 1, dtype=Omega_h.dtype, device=Omega_h.device,
-    )
-    for _ in range(5):
-        q = torch.bmm(Omega_h, q)
-        q = q / torch.linalg.norm(q, dim=1, keepdim=True).clamp_min(1e-12)
-    lam_max = torch.bmm(q.mH, torch.bmm(Omega_h, q)).real  # (B, 1, 1)
-    lam_max = lam_max * 1.01
-
-    # current v from previous phi is not passed — caller passes phi as v
-    return Omega_h, lam_max, varphi, C, D
-
-
-def _optimize_airfc_offline(W_target, H_1, H_2, n_t, n_r, n_m, iters=100,
-                            sigma2=1e-2, P_max=None, n_bisect=15, debug=False):
-    """AirFC Algorithm 1 (channel-level only; no data vector s).
-
-    Alternating updates of F1 (Lagrange + bisection, ||F1||_F^2 <= P_max),
-    F2 (relative ridge), and Φ (MM) to minimize
-    ||F2 H2 diag(φ) H1 F1 − W||_F² + σ²_eff||F2||_F².
-
-    Returns ``(phi, F1, F2, rel_residual)`` with unit-modulus ``phi``.
-    When ``debug=True``, prints a short AO fit log (relF / powers) for this batch.
-    ``P_max`` defaults to ``N_t``.
-    """
-    n_t = int(n_t)
-    n_r = int(n_r)
-    n_m = int(n_m)
-    P_max = float(n_t if P_max is None else P_max)
-    H_1 = H_1.detach()
-    H_2 = H_2.detach()
-    dtype = H_1.dtype
-    device = H_1.device
-    W = W_target.detach().to(device=device, dtype=dtype)
-    B = H_1.size(0)
-    if W.dim() == 2:
-        W = W.unsqueeze(0).expand(B, -1, -1)
-    else:
-        W = W.expand(B, -1, -1) if W.size(0) == 1 else W
-
-    # Init: random unit-modulus phases, F2 = I
-    phi = torch.exp(1j * torch.randn((B, n_m), device=device, dtype=dtype))
-    F2 = torch.eye(n_r, dtype=dtype, device=device).unsqueeze(0).expand(B, -1, -1).contiguous()
-    F1 = torch.eye(n_t, dtype=dtype, device=device).unsqueeze(0).expand(B, -1, -1).contiguous()
-
-    best = {
-        "obj": torch.tensor(float("inf"), device=device),
-        "rel": torch.tensor(float("inf"), device=device),
-        "phi": phi, "F1": F1, "F2": F2,
-    }
-
-    eye_m = torch.eye(n_m, device=device, dtype=dtype).unsqueeze(0)
-    sigma2_f = float(sigma2)
-    iters = int(iters)
-    debug_checkpoints = {1, max(1, iters // 5), max(1, iters // 2), iters} if debug else set()
-    debug_rows = []
-
-    for it in range(iters):
-        Phi = torch.diag_embed(phi)
-
-        # --- F1: Υ = F2 H2 Φ H1 ---
-        H_eq = torch.bmm(H_2, torch.bmm(Phi, H_1))           # (B, Nr, Nt)
-        Upsilon = torch.bmm(F2, H_eq)
-        F1 = _airfc_update_F1_bisection(Upsilon, W, P_max, n_bisect=n_bisect)
-
-        # --- F2: Υ_bar = H2 Φ H1 F1 ---
-        Upsilon_bar = torch.bmm(H_eq, F1)
-        F2 = _airfc_update_F2_ridge(Upsilon_bar, W, sigma2_f)
-
-        # --- Φ: MM update ---
-        Omega_h, lam_max, varphi, _C, _D = _airfc_update_phi_mm(
-            F2, H_1, H_2, F1, W,
-        )
-        v = phi  # current phases as v^r
-        # (λ_max I − Ω) v − φ*
-        target = torch.bmm(
-            (lam_max * eye_m - Omega_h), v.unsqueeze(-1)
-        ).squeeze(-1) - torch.conj(varphi)
-        phi = torch.exp(1j * torch.angle(target))
-
-        # Track best by paper Eq. (8a): ||W_phys - W||_F^2 + σ^2 ||F2||_F^2
-        Phi = torch.diag_embed(phi)
-        H_eq = torch.bmm(H_2, torch.bmm(Phi, H_1))
-        W_phys = torch.bmm(F2, torch.bmm(H_eq, F1))
-        match = torch.linalg.norm(W_phys - W, dim=(-2, -1)) ** 2
-        # Same relative ridge as `_airfc_update_F2_ridge` (pathloss-safe).
-        Upsilon_bar = torch.bmm(H_eq, F1)
-        gram_pow = (
-            torch.diagonal(
-                torch.bmm(Upsilon_bar, Upsilon_bar.mH), dim1=-2, dim2=-1
-            ).real.mean(dim=-1).clamp_min(1e-12)
-        )
-        f2_pen = sigma2_f * gram_pow * (torch.linalg.norm(F2, dim=(-2, -1)) ** 2)
-        obj = (match + f2_pen).mean()
-        rel = _airfc_relative_residual(W_phys, W)
-        if obj < best["obj"]:
-            best = {
-                "obj": obj.detach(),
-                "rel": rel.detach(),
-                "phi": phi.detach(),
-                "F1": F1.detach(),
-                "F2": F2.detach(),
-            }
-
-    #     t = it + 1
-    #     if t in debug_checkpoints:
-    #         f1_pow = (torch.linalg.norm(F1, dim=(-2, -1)) ** 2).mean().item()
-    #         f2_fro = torch.linalg.norm(F2, dim=(-2, -1)).mean().item()
-    #         w_phys_fro = torch.linalg.norm(W_phys, dim=(-2, -1)).mean().item()
-    #         debug_rows.append(
-    #             (t, float(rel.item()), float(obj.item()), f1_pow, f2_fro, w_phys_fro)
-    #         )
-
-    # if debug:
-    #     w_fro = torch.linalg.norm(W, dim=(-2, -1)).mean().item()
-    #     h1_fro = torch.linalg.norm(H_1, dim=(-2, -1)).mean().item()
-    #     h2_fro = torch.linalg.norm(H_2, dim=(-2, -1)).mean().item()
-    #     print(
-    #         f"  [AirFC debug] B={B} Nt={n_t} Nr={n_r} Nm={n_m} iters={iters} "
-    #         f"P_max={'unconstrained' if P_max is None else f'{P_max:g}'} "
-    #         f"sigma2={sigma2_f:.3e}"
-    #     )
-    #     print(
-    #         f"  [AirFC debug] ||W||_F={w_fro:.4g} ||H1||_F={h1_fro:.4g} "
-    #         f"||H2||_F={h2_fro:.4g}"
-    #     )
-    #     print("  [AirFC debug] iter | relF | obj | ||F1||_F^2 | ||F2||_F | ||W_phys||_F")
-    #     for t, rel_v, obj_v, f1_pow, f2_fro, w_phys_fro in debug_rows:
-    #         print(
-    #             f"  [AirFC debug] {t:4d} | {rel_v:.4f} | {obj_v:.4g} | "
-    #             f"{f1_pow:.4g} | {f2_fro:.4g} | {w_phys_fro:.4g}"
-    #         )
-    #     best_f1 = (torch.linalg.norm(best["F1"], dim=(-2, -1)) ** 2).mean().item()
-    #     best_f2 = torch.linalg.norm(best["F2"], dim=(-2, -1)).mean().item()
-    #     print(
-    #         f"  [AirFC debug] best relF={float(best['rel'].item()):.4f} "
-    #         f"best_obj={float(best['obj'].item()):.4g} "
-    #         f"best||F1||_F^2={best_f1:.4g} best||F2||_F={best_f2:.4g}"
-    #     )
-
-    return best["phi"], best["F1"], best["F2"], float(best["rel"].item())
-
-
-def _optimize_airfc_cifar(W_target, H_1, H_2, n_t, n_r, n_m, iters=100, step_size=0.1,
-                          pinv_rtol=1e-4, phi_inner_steps=3):
-    """Figure_1 / CIFAR AirFC AO: closed-form P/U + PGD on phi.
+def _optimize_airfc(W_target, H_1, H_2, n_t, n_r, n_m, iters=100, step_size=0.1,
+                     pinv_rtol=1e-4, phi_inner_steps=3):
+    """AirFC AO: closed-form P/U + projected GD on unit-modulus phi.
 
     Fits ``U^H H_2 diag(phi) H_1 P ≈ W_target`` (Frobenius), independent of ``s``.
-    ``P`` and ``U`` use Moore–Penrose updates (no ``P_max``, no ridge on ``U``);
-    ``phi`` uses projected gradient descent onto the unit-modulus manifold.
+    ``P`` and ``U`` use Moore–Penrose updates; ``phi`` uses projected gradient
+    descent onto the unit-modulus manifold.
 
     Returns ``(phi, P, U)`` with shapes ``(B, Nm)``, ``(B, Nt, Nt)``, ``(B, Nr, Nr)``.
-    Used when ``--data cifar``. MNIST uses Algorithm 1 (``_optimize_airfc_offline``).
     """
     del n_t, n_r  # kept for call-site compatibility
     H_1 = H_1.detach()
@@ -1176,20 +935,15 @@ def _optimize_airfc_cifar(W_target, H_1, H_2, n_t, n_r, n_m, iters=100, step_siz
     P = torch.eye(H_1.size(-1), dtype=dtype, device=device).unsqueeze(0).expand(B, -1, -1).contiguous()
 
     for _ in range(int(iters)):
-        # --- A: closed-form P ---
-        # P = (U^H H_eq)^+ W
         Phi_diag = torch.diag_embed(phi)
         H_eq = torch.bmm(H_2, torch.bmm(Phi_diag, H_1))
         U_H_H_eq = torch.bmm(U.mH, H_eq)
         P = torch.bmm(torch.linalg.pinv(U_H_H_eq, rtol=pinv_rtol), W_target)
 
-        # --- B: closed-form U ---
-        # U^H = W (H_eq P)^+
         H_eq_P = torch.bmm(H_eq, P)
         U_H = torch.bmm(W_target, torch.linalg.pinv(H_eq_P, rtol=pinv_rtol))
         U = U_H.mH.contiguous()
 
-        # --- C: projected GD on unit-modulus phi ---
         C = torch.bmm(U.mH, H_2)
         D = torch.bmm(H_1, P)
         for _inner in range(int(phi_inner_steps)):
@@ -1199,7 +953,6 @@ def _optimize_airfc_cifar(W_target, H_1, H_2, n_t, n_r, n_m, iters=100, step_siz
             grad_matrix = torch.bmm(C.mH, torch.bmm(Error, D.mH))
             grad_phi = torch.diagonal(grad_matrix, dim1=-2, dim2=-1)
 
-            # Normalize per-sample gradient to keep step_size meaningful
             grad_norm = torch.linalg.norm(grad_phi, dim=-1, keepdim=True).clamp_min(1e-8)
             phi = phi - step_size * (grad_phi / grad_norm)
             phi = phi / (phi.abs() + 1e-8)
@@ -1207,17 +960,18 @@ def _optimize_airfc_cifar(W_target, H_1, H_2, n_t, n_r, n_m, iters=100, step_siz
     return phi.detach(), P.detach(), U.detach()
 
 
-# Back-compat alias.
-_optimize_airfc_gd_old = _optimize_airfc_cifar
+# Back-compat aliases.
+_optimize_airfc_cifar = _optimize_airfc
+_optimize_airfc_gd_old = _optimize_airfc
 
 
-# Back-compat alias used by older call sites / docs.
 def _optimize_airfc_gd(W_target, H_1, H_2, n_t, n_r, n_m, iters=100, step_size=0.1,
                        pinv_rtol=1e-4, phi_inner_steps=3, sigma2=1e-2, P_max=None):
-    """Deprecated name: redirects to Algorithm-1 offline solver (ignores GD knobs)."""
-    del step_size, pinv_rtol, phi_inner_steps
-    return _optimize_airfc_offline(
-        W_target, H_1, H_2, n_t, n_r, n_m, iters=iters, sigma2=sigma2, P_max=P_max,
+    """Deprecated name: redirects to AirFC P/Phi/U solver."""
+    del sigma2, P_max
+    return _optimize_airfc(
+        W_target, H_1, H_2, n_t, n_r, n_m, iters=iters, step_size=step_size,
+        pinv_rtol=pinv_rtol, phi_inner_steps=phi_inner_steps,
     )
 
 
@@ -1309,44 +1063,15 @@ def wireless_forward(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
     return model.decode(y_ris)                                   # (B, num_classes)
 
 
-def _precompute_airfc_cache(model, H_1_all, H_2_all, phi_iters, snr_db,
-                            debug=False):
-    """Run Algorithm 1 once per pool channel (W, H1, H2 only).
-
-    Ridge σ² is ``DEFAULT_AIRFC_RIDGE_SIGMA2`` (relative to Gram power), not
-    antenna SNR, so ``(phi, F1, F2)`` can be reused across images and SNR.
-    ``snr_db`` is unused by AO (kept for call-site compatibility).
-    ``P_max = N_t``. Per-sample AGC is applied later in ``airfc_forward``.
-
-    Returns dict with ``phi`` (Nch, Nm), ``F1`` (Nch, Nt, Nt),
-    ``F2`` (Nch, Nr, Nr), ``rel`` (raw AO ||W_phys-W||_F / ||W||_F).
-    """
-    del snr_db
-    n_m = H_1_all.size(-2)
-    W_target = _complex_W_from_linear(model)
-    sigma2 = float(DEFAULT_AIRFC_RIDGE_SIGMA2)
-    phi, F1, F2, rel = _optimize_airfc_offline(
-        W_target, H_1_all, H_2_all, model.n_t, model.n_r, n_m,
-        iters=int(phi_iters), sigma2=sigma2, P_max=float(model.n_t),
-        debug=bool(debug),
-    )
-    return {
-        "phi": phi.detach(),
-        "F1": F1.detach(),
-        "F2": F2.detach(),
-        "rel": float(rel),
-    }
-
-
-def _precompute_airfc_cifar_cache(model, H_1_all, H_2_all, phi_iters, debug=False):
-    """Run Figure_1 P/Phi/U AO once per pool channel (``--data cifar``).
+def _precompute_airfc_cache(model, H_1_all, H_2_all, phi_iters, debug=False):
+    """Run AirFC P/Phi/U AO once per pool channel.
 
     Stores ``phi``, ``F1=P``, ``F2=U^H`` so the cascade ``F2 @ y_rx`` matches
-    the old forward ``U^H y_rx``. ``rel`` is ``||U^H H2 Phi H1 P - W||_F/||W||_F``.
+    ``U^H y_rx``. ``rel`` is ``||U^H H2 Phi H1 P - W||_F / ||W||_F``.
     """
     n_m = H_1_all.size(-2)
     W_target = _complex_W_from_linear(model)
-    phi, P, U = _optimize_airfc_cifar(
+    phi, P, U = _optimize_airfc(
         W_target, H_1_all, H_2_all, model.n_t, model.n_r, n_m,
         iters=int(phi_iters),
     )
@@ -1361,7 +1086,7 @@ def _precompute_airfc_cifar_cache(model, H_1_all, H_2_all, phi_iters, debug=Fals
     rel = float(_airfc_relative_residual(W_phys, W).item())
     if debug:
         print(
-            f"  [AirFC-cifar debug] pool={H_1_all.size(0)} "
+            f"  [AirFC debug] pool={H_1_all.size(0)} "
             f"Nm={n_m} iters={int(phi_iters)} relF={rel:.4f}"
         )
     return {
@@ -1372,97 +1097,15 @@ def _precompute_airfc_cifar_cache(model, H_1_all, H_2_all, phi_iters, debug=Fals
     }
 
 
-def _precompute_airfc_cache_for_dataset(model, H_1_all, H_2_all, phi_iters, snr_db,
-                                        dataset, debug=False):
-    """Dispatch pool AO: cifar → P/Phi/U; mnist → Algorithm 1."""
-    if normalize_dataset(dataset) == "cifar":
-        return _precompute_airfc_cifar_cache(
-            model, H_1_all, H_2_all, phi_iters, debug=debug,
-        )
-    return _precompute_airfc_cache(
-        model, H_1_all, H_2_all, phi_iters, snr_db, debug=debug,
-    )
-
-
 def airfc_forward(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
                   H_1_b=None, H_2_b=None, phi=None, F1=None, F2=None,
                   return_residual=False, debug=False):
-    """AirFC path: physical cascade with Algorithm-1 (F1, Φ, F2).
+    """AirFC path: encoder -> P -> H1 -> diag(phi) -> H2 -> AWGN -> U^H -> BN.
 
-    Prefers precomputed batch ``phi`` / ``F1`` / ``F2`` (from
-    ``_precompute_airfc_cache``). If those are omitted, falls back to AO on
-    this batch's ``H1`` / ``H2``. Then::
-
-        y_rx = H2 diag(φ) H1 F1 s + n
-        y    = F2 y_rx
-        y    ← y * ||mid(s)|| / ||y||     # same per-sample AGC as wireless
-
-    ``mid(s)`` already includes BN when the teacher has it, so we do not
-    apply BN again after AGC. F1 uses ``P_max=N_t``; F2 ridge uses paper
-    ``σ²=1`` scaled by Gram power. Forward AWGN uses ``noise(y_rx, snr_db)``.
-    """
-    model.eval()
-    x = x.to(device)
-    B = x.size(0)
-
-    s = model.encode(x)                                           # (B, Nt)
-    y_learned = model.intermediate(s)
-
-    if H_1_b is None or H_2_b is None:
-        idx = torch.randint(0, H_1_all.size(0), (B,), device=device)
-        H_1_b = H_1_all[idx]
-        H_2_b = H_2_all[idx]
-        if phi is not None and F1 is not None and F2 is not None:
-            phi = phi[idx]
-            F1 = F1[idx]
-            F2 = F2[idx]
-    else:
-        H_1_b = H_1_b.to(device)
-        H_2_b = H_2_b.to(device)
-
-    rel_res = float("nan")
-    have_cache = phi is not None and F1 is not None and F2 is not None
-    if have_cache:
-        phi = phi.to(device)
-        F1 = F1.to(device)
-        F2 = F2.to(device)
-    else:
-        n_m = H_1_b.size(-2)
-        W_target = _complex_W_from_linear(model)
-        sigma2 = float(DEFAULT_AIRFC_RIDGE_SIGMA2)
-        phi, F1, F2, rel_res = _optimize_airfc_offline(
-            W_target, H_1_b, H_2_b, model.n_t, model.n_r, n_m,
-            iters=int(phi_iters), sigma2=sigma2, P_max=float(model.n_t),
-            debug=bool(debug),
-        )
-    if debug:
-        print(
-            f"  [AirFC debug] snr_db={float(snr_db):g} "
-            f"mid_bn={bool(getattr(model, 'mid_bn', False))} "
-            f"has_bn_module={getattr(getattr(model, 'mid', None), 'bn', None) is not None}"
-        )
-
-    # Physical TX: y_rx = H2 diag(phi) H1 F1 s + n  (SNR from |y_rx| power)
-    x_tx = torch.bmm(F1, s.unsqueeze(-1)).squeeze(-1)
-    H_1_x = torch.bmm(H_1_b, x_tx.unsqueeze(-1)).squeeze(-1)
-    y_rx = torch.bmm(H_2_b, (H_1_x * phi).unsqueeze(-1)).squeeze(-1)
-    y_rx = y_rx + noise(y_rx, snr_db)
-    y_airfc = torch.bmm(F2, y_rx.unsqueeze(-1)).squeeze(-1)
-    # y_airfc = _norm_match_to_target(y_airfc, y_learned)
-
-    logits = model.decode(y_airfc)
-    if return_residual:
-        return logits, rel_res
-    return logits
-
-
-def airfc_cifar_forward(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
-                        H_1_b=None, H_2_b=None, phi=None, F1=None, F2=None,
-                        return_residual=False, debug=False):
-    """Figure_1 AirFC: encoder -> P -> H1 -> diag(phi) -> H2 -> AWGN -> U^H -> BN.
-
-    ``F1`` is ``P``, ``F2`` is ``U^H``. No AGC (scale comes from the Frobenius
-    fit). If the teacher mid has BatchNorm, apply it digitally after ``U^H``.
+    Prefers precomputed batch ``phi`` / ``F1=P`` / ``F2=U^H`` (from
+    ``_precompute_airfc_cache``). If omitted, falls back to AO on this batch's
+    channels. No AGC (scale comes from the Frobenius fit). If the teacher mid
+    has BatchNorm, apply it digitally after ``U^H``.
     """
     model.eval()
     x = x.to(device)
@@ -1491,7 +1134,7 @@ def airfc_cifar_forward(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
     else:
         n_m = H_1_b.size(-2)
         W_target = _complex_W_from_linear(model)
-        phi, P, U = _optimize_airfc_cifar(
+        phi, P, U = _optimize_airfc(
             W_target, H_1_b, H_2_b, model.n_t, model.n_r, n_m,
             iters=int(phi_iters),
         )
@@ -1506,7 +1149,7 @@ def airfc_cifar_forward(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
         rel_res = float(_airfc_relative_residual(W_phys, W).item())
     if debug:
         print(
-            f"  [AirFC-cifar debug] snr_db={float(snr_db):g} "
+            f"  [AirFC debug] snr_db={float(snr_db):g} "
             f"mid_bn={bool(getattr(model, 'mid_bn', False))} "
             f"has_bn_module={getattr(getattr(model, 'mid', None), 'bn', None) is not None}"
         )
@@ -1517,7 +1160,6 @@ def airfc_cifar_forward(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
     y_rx = y_rx + noise(y_rx, snr_db)
     y_airfc = torch.bmm(F2, y_rx.unsqueeze(-1)).squeeze(-1)
 
-    # Match digital teacher mid: Linear then BatchNorm1d (Dropout off in eval).
     if hasattr(model, "mid") and hasattr(model.mid, "bn") and model.mid.bn is not None:
         y_flat = torch.view_as_real(y_airfc).reshape(B, -1)
         y_flat = model.mid.bn(y_flat)
@@ -1570,74 +1212,20 @@ def evaluate_wireless(model, x, y, H_1_all, H_2_all, snr_db, device, phi_iters,
 
 
 @torch.no_grad()
-def evaluate_airfc_cifar(model, x, y, H_1_all, H_2_all, snr_db, device, phi_iters,
-                         batch_size=500, channel_indices=None, return_residual=False,
-                         debug=False, airfc_cache=None):
-    """Test accuracy (%) of the Figure_1 P/Phi/U AirFC path (``--data cifar``)."""
-    model.eval()
-    y = y.to(device)
-    H_1_all = H_1_all.to(device)
-    H_2_all = H_2_all.to(device)
-    if channel_indices is not None:
-        channel_indices = channel_indices.to(device)
-        if channel_indices.numel() != x.size(0):
-            raise ValueError(
-                f"channel_indices length ({channel_indices.numel()}) must match "
-                f"number of samples ({x.size(0)})"
-            )
-    if airfc_cache is None:
-        airfc_cache = _precompute_airfc_cifar_cache(
-            model, H_1_all, H_2_all, phi_iters, debug=debug,
-        )
-    phi_all = airfc_cache["phi"].to(device)
-    F1_all = airfc_cache["F1"].to(device)
-    F2_all = airfc_cache["F2"].to(device)
-    pool_rel = float(airfc_cache["rel"])
-    correct, total = 0, 0
-    debug_once = bool(debug)
-    for start in range(0, x.size(0), batch_size):
-        xb = x[start:start + batch_size]
-        yb = y[start:start + batch_size]
-        do_debug = debug_once and start == 0
-        if channel_indices is None:
-            idx = torch.randint(0, H_1_all.size(0), (xb.size(0),), device=device)
-        else:
-            idx = channel_indices[start:start + batch_size]
-        logits = airfc_cifar_forward(
-            model, xb, H_1_all, H_2_all, snr_db, device, phi_iters,
-            H_1_b=H_1_all[idx], H_2_b=H_2_all[idx],
-            phi=phi_all[idx], F1=F1_all[idx], F2=F2_all[idx],
-            debug=do_debug,
-        )
-        correct += (logits.argmax(1) == yb).sum().item()
-        total += yb.size(0)
-    acc = 100.0 * correct / max(total, 1)
-    if return_residual:
-        return acc, pool_rel
-    return acc
-
-
-@torch.no_grad()
 def evaluate_airfc(model, x, y, H_1_all, H_2_all, snr_db, device, phi_iters,
                    batch_size=500, channel_indices=None, return_residual=False,
-                   debug=False, airfc_cache=None, dataset=DEFAULT_DATASET):
+                   debug=False, airfc_cache=None, dataset=None):
     """Test accuracy (%) of the AirFC path.
 
-    ``--data cifar`` → Figure_1 P/Phi/U (``evaluate_airfc_cifar``).
-    ``--data mnist`` → paper Algorithm 1 (F1, Phi, F2).
+    AO is solved once per pool channel (``airfc_cache``), then each test sample
+    indexes ``(phi, F1=P, F2=U^H)``. If ``airfc_cache`` is omitted it is built
+    here. If `channel_indices` has shape (N,) matching `x`, each test sample
+    uses that fixed pool index. When `return_residual`, also returns the
+    pool-mean raw AO residual ``||W_phys-W||_F/||W||_F``.
 
-    Algorithm 1 is solved once per pool channel (``airfc_cache``), then each
-    test sample indexes ``(phi, F1, F2)``. If ``airfc_cache`` is omitted it is
-    built here. If `channel_indices` has shape (N,) matching `x`, each test
-    sample uses that fixed pool index. When `return_residual`, also returns
-    the pool-mean raw AO residual ``||W_phys-W||_F/||W||_F``.
+    ``dataset`` is accepted for call-site compatibility and ignored.
     """
-    if normalize_dataset(dataset) == "cifar":
-        return evaluate_airfc_cifar(
-            model, x, y, H_1_all, H_2_all, snr_db, device, phi_iters,
-            batch_size=batch_size, channel_indices=channel_indices,
-            return_residual=return_residual, debug=debug, airfc_cache=airfc_cache,
-        )
+    del dataset
     model.eval()
     y = y.to(device)
     H_1_all = H_1_all.to(device)
@@ -1651,7 +1239,7 @@ def evaluate_airfc(model, x, y, H_1_all, H_2_all, snr_db, device, phi_iters,
             )
     if airfc_cache is None:
         airfc_cache = _precompute_airfc_cache(
-            model, H_1_all, H_2_all, phi_iters, snr_db, debug=debug,
+            model, H_1_all, H_2_all, phi_iters, debug=debug,
         )
     phi_all = airfc_cache["phi"].to(device)
     F1_all = airfc_cache["F1"].to(device)
@@ -2343,7 +1931,7 @@ def evaluate_kappa_sweep(model, x_te, y_te, teacher_acc, kappas, device,
 
     - teacher_acc: fixed digital bound (passed in).
     - wireless RIS: optional phi-GD path for the primary --inter teacher.
-    - AirFC: Algorithm 1 (mnist) or P/Phi/U (cifar); requires --inter linear.
+    - AirFC: P/Phi/U AO; requires --inter linear.
     - SimNet E2E: optional list of ``(label, CifarSimCNN)`` (each own channel pool).
 
     Returns list of
@@ -2527,7 +2115,7 @@ def evaluate_snr_sweep(model, x_te, y_te, snrs, device, channel_type, kappa,
     Wireless uses `n_m`; AirFC uses `airfc_n_m`. Channel indices are
     fixed across SNR for each method's pool. Wireless uses `phi_iters`; AirFC
     uses `airfc_phi_iters` (defaults to `phi_iters`).
-    AirFC AO is solved once on the pool (mnist: Algorithm 1; cifar: P/Phi/U)
+    AirFC AO is solved once on the pool (P/Phi/U)
     and reused at every SNR; only `noise(y_rx, snr_db)` changes.
     ``sim_models`` is an optional list of ``(label, CifarSimCNN)``.
 
@@ -2550,8 +2138,8 @@ def evaluate_snr_sweep(model, x_te, y_te, snrs, device, channel_type, kappa,
             channel_type, kappa, num_channels, x_te.size(0),
         )
         if do_airfc:
-            airfc_cache = _precompute_airfc_cache_for_dataset(
-                model, H_1_af, H_2_af, airfc_phi_iters, snrs[0], dataset,
+            airfc_cache = _precompute_airfc_cache(
+                model, H_1_af, H_2_af, airfc_phi_iters,
                 debug=False,
             )
     sim_pools = _sim_channel_pools_for_entries(
@@ -2884,7 +2472,7 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
     (ignored for thin; default 3).
     `n_m` is wireless / SimNet RIS size; `airfc_n_m` is AirFC RIS size (defaults
     to `n_m`). `phi_iters` is wireless RIS GD iters; `airfc_phi_iters` is AirFC
-    Algorithm-1 outer iters (defaults to `phi_iters`). `n_m_sweep`
+    AO outer iters (defaults to `phi_iters`). `n_m_sweep`
     evaluates both methods at each shared N_m.
     `num_channels` sizes the training RIS pool; `num_channels_test` sizes the
     eval / wireless / sweep pools (separate realizations).
@@ -3314,13 +2902,8 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
             wireless_acc = evaluate_wireless(
                 model, x_te, y_te, H_1_all, H_2_all, snr_db, device, phi_iters)
         if run_airfc:
-            solver = (
-                "P/Phi/U (cifar)"
-                if normalize_dataset(dataset) == "cifar"
-                else "paper Alg.1 (mnist)"
-            )
             print(
-                f"\n=== AirFC path | solver={solver} | n_t={model.n_t}, n_r={model.n_r}, "
+                f"\n=== AirFC path | n_t={model.n_t}, n_r={model.n_r}, "
                 f"n_m={airfc_n_m}, SNR={snr_db:g} dB, airfc_phi_iters={airfc_phi_iters}, "
                 f"channel={channel_settings_label(channel_type, kappa)} ==="
             )
@@ -3369,8 +2952,8 @@ def _evaluate_compare_sweep(kind, values, cnn_model, lin_model, sim_entries,
         sim_pools = _sim_channel_pools_for_entries(
             sim_entries, x_te, device, channel_type, kappa, num_channels,
         ) if sim_entries else []
-        airfc_cache = _precompute_airfc_cache_for_dataset(
-            lin_model, H1_af, H2_af, airfc_phi_iters, values[0], dataset,
+        airfc_cache = _precompute_airfc_cache(
+            lin_model, H1_af, H2_af, airfc_phi_iters,
             debug=False,
         )
         prev_cnn, prev_lin = cnn_model.snr_db, lin_model.snr_db
@@ -3976,11 +3559,6 @@ if __name__ == "__main__":
     print(f"AirFC path: {airfc}"
           + ("" if (not airfc or intermediate == "linear")
              else f" (skipped: needs --inter linear, got {intermediate})"))
-    if airfc and intermediate == "linear":
-        print(
-            "AirFC solver: "
-            + ("P/Phi/U (cifar)" if dataset == "cifar" else "paper Alg.1 (mnist)")
-        )
     print(f"AirFC debug log: {airfc_debug}")
     print(f"Compare teachers: {compare_teachers}"
           + (f" (E2E {'on' if (compare_e2e and simnet) else 'off'})"

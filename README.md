@@ -67,8 +67,8 @@ We solve for `phi` so the physical output matches the target the network wants:
 - target `y_learned = W_lin(s)` (what the trained linear layer would have output)
 - optimize `theta` by gradient descent (Adam) to **maximize cosine similarity**
   between `y_ris` and `y_learned` (loss = `1 - cos_sim`), i.e. match direction.
-- implemented in `_optimize_phi_gd(...)` (checkerboard file vendors a copy;
-  original in `teacher_experiments.py`).
+- implemented in `_optimize_phi_gd(...)` (checkerboard and framework scripts
+  vendor a copy; original in `distilallation/teacher_experiments.py`).
 
 At inference the received vector `y_ris` (after optional norm matching) is fed to
 the decoder in place of `W_lin(s)`.
@@ -134,29 +134,40 @@ python checkboard/wlin_necessity_checkerboard.py --wireless true \
 
 ### 5.2 Image classification (the real task)
 
-**Main script:** `teacher.py`
+**Main script:** `framework/cifar_minimal_dnn.py`
 
-- `MyTeacher`: `HeavyEncoder` (CNN, image → complex transmit vector `s ∈ C^{N_t}`)
-  → `linear` (`2N_t → 2N_r`, bias-free, the offloadable `W_lin`) →
-  `HeavyRxDecoder` (complex `y` → class logits). Trained on MNIST / CIFAR-10.
-- `ThinTeacher`: the minimal counterpart of the checkerboard model on real
-  images (`ThinEncoder = Linear+ReLU`, linear intermediate, `ThinDecoder =
-  ReLU+Linear`). Used to reproduce the *W_lin-necessity* ablation on real data
-  (`phase = "train_thin"`).
-- **Physical evaluation** `test_demo.test_physical(...)`: run the trained
-  encoder, compute `y_learned = linear(s)`, optimize `phi` to reproduce it
-  through `H_2 diag(phi) H_1`, then decode `y_ris`. Compares physical vs. digital
-  accuracy across SNR.
-- **Learned channel surrogate (GAN):** `ChannelGenerator` / `ChannelDiscriminator`
-  (+ `forward_gan`, `test_demo.test_physical_channel_gan`) learn a differentiable
-  model of the channel as an alternative to the analytic physical path.
-- **Physical stacked-RIS simulator:** `CODE_EXAMPLE/simnet.py` (`SimNet`,
-  `RisLayer`) models a multi-layer diffractive RIS; `_build_teacher_sim_net`
-  wires it to the teacher for a physics-grounded "sim" target.
+- Teachers: CNN (`--teacher cnn`) or thin Linear+ReLU (`--teacher thin`) on
+  CIFAR-10 or MNIST (`--data cifar|mnist`). Pipeline is encoder → bias-free
+  `W_lin` (`2N_t → 2N_r`) → decoder → class logits.
+- **Wireless RIS** (`--wireless true`): at inference, replace `W_lin` with
+  `H_2 diag(phi) H_1` and match `phi` to `y_learned = W_lin(s)` via GD.
+- **AirFC** (`--airfc true`): AO baseline fitting
+  `U^H H2 diag(phi) H1 P ≈ W` (see `framework/airfc.md`).
+- **SimNet** (`--simnet true`): end-to-end physical multi-layer RIS path
+  (controller + frozen SimNet geometry).
+- Sweeps: `--kappa_sweep`, `--snr_sweep`, `--n_m_sweep`; compare curves with
+  `--compare_teachers true`.
+- Batch sims: `framework/run_simulations_from_json.py` reads
+  `framework/plots/simulations_description.json`, dumps arrays under
+  `framework/plots_sim/arrays/`. Plot with root `sim_plot.py` (e.g.
+  `python sim_plot.py 2`).
 
-Entry points inside `teacher.py` are selected by the `phase` variable:
-`"train"` (train `MyTeacher.linear`), `"train_thin"` (W_lin ablation),
-`"test"` (physical-vs-synthetic accuracy vs SNR).
+```bash
+# train / eval teachers with wireless + AirFC + SimNet
+python framework/cifar_minimal_dnn.py --mode full --load true \
+    --compare_teachers true --wireless true --airfc true --simnet true \
+    --epochs 500 --kappa_sweep 1,2,3,5,10,20,33,50
+
+# dump sim arrays from JSON, then plot
+python framework/run_simulations_from_json.py
+python sim_plot.py 3
+```
+
+**Playground / older image path:** `GAN - playground/teacher.py`
+(`MyTeacher` / `ThinTeacher`, `phase = "train"|"train_thin"|"test"`), with
+helpers in `GAN - playground/teacher_train.py`, physical eval in
+`test_demo.py`, and GAN channel surrogate in `GAN - playground/gan.py`. Not
+the primary article pipeline anymore.
 
 ## 6. Channel model details
 
@@ -171,7 +182,7 @@ H_2_all)` pools of channels to sample per batch/sample.
   (`H_1`), and RIS-Rx (`H_2`) links.
 - `noise(y, snr_db)`: AWGN matched to signal power (real or complex).
 
-## 7. Key result / gotcha: rank matters (see `rank.md`)
+## 7. Key result / gotcha: rank matters
 
 The RIS can only mimic a full-rank `W_lin` if the cascaded channel is full rank.
 
@@ -193,15 +204,18 @@ carry a full-rank transformation.**
 | Path | Role |
 |------|------|
 | `checkboard/wlin_necessity_checkerboard.py` | **Main toy experiment**: W_lin-necessity + wireless RIS panel & sweeps |
-| `teacher.py` | **Main image experiment**: `MyTeacher`, `ThinTeacher`, GAN channel, sim-net wiring |
-| `test_demo.py` | Physical (`test_physical`) and GAN (`test_physical_channel_gan`) evaluation of the trained teacher |
-| `teacher_train.py` | Training loops (`train_teacher_linear`, `train_thin_teacher`) |
-| `teacher_experiments.py` | Original `_optimize_phi_gd` and related RIS experiments |
+| `framework/cifar_minimal_dnn.py` | **Main image experiment**: CNN/thin teachers, wireless RIS, AirFC, SimNet, sweeps |
+| `framework/run_simulations_from_json.py` | Batch-run sims from JSON → `plots_sim/arrays/*.npz` |
+| `framework/airfc.md` | AirFC P/Phi/U solver notes |
+| `sim_plot.py` | Plot saved sim arrays (wireless / AirFC / SimNet curves) |
+| `test_demo.py` | Physical (`test_physical`) and GAN eval helpers (older teacher path) |
 | `channels.py` | Channel generation (`generate_channel_tensors_by_type`, geometric Ricean/Rayleigh) |
-| `CODE_EXAMPLE/simnet.py` | Physical multi-layer RIS diffraction simulator (`SimNet`, `RisLayer`) |
-| `gan/gan.py` | GAN channel-surrogate utilities, `noise`, distribution plots |
-| `students.py`, `distilallation/` | Student models / knowledge-distillation side experiments |
-| `rank.md` | Analysis of rank-1 collapse and the multipath fix |
+| `GAN - playground/teacher.py` | Older `MyTeacher` / `ThinTeacher` playground |
+| `GAN - playground/teacher_train.py` | Training loops for the playground teacher |
+| `GAN - playground/gan.py` | GAN channel-surrogate utilities, `noise`, distribution plots |
+| `distilallation/` | Student models / KD / original `_optimize_phi_gd` |
+| `Digital System-playground/` | Simple digital transceiver sandbox |
+| `CODE_EXAMPLE/` | Upstream SimNet / MINN reference (local; gitignored) |
 
 ## 9. Key symbols
 
@@ -221,7 +235,7 @@ carry a full-rank transformation.**
 - Checkerboard `wireless_forward` is mid-refactor (`#TODO`s): `hidden`
   hardcoded to 2 in `make_ris_channel_pools`, and the RIS path currently routes
   the raw input `x` rather than the encoder activation `a = ReLU(enc(x))`.
-- Whether increasing `N_m` reliably improves accuracy (noted `#TODO` in
-  `teacher.py`) — tied to the rank discussion above.
+- Whether increasing `N_m` reliably improves accuracy — tied to the rank
+  discussion above.
 - Norm/gain matching between `y_ris` and `y_learned` (cosine loss vs. Frobenius)
   is still being tuned.

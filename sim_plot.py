@@ -4,11 +4,11 @@
 Usage
 -----
     python sim_plot.py 2
-    python sim_plot.py sim_3 --out cifar/plots_sim/sim3_custom.png
+    python sim_plot.py sim_3 --out framework/plots_sim/sim3_custom.png
     python sim_plot.py 4 --show
 
-Edit the STYLE / SERIES blocks below when you redesign plots; the data load
-path stays the same.
+    Edit the STYLE / SERIES blocks below when you redesign plots; the data load
+    path stays the same.
 """
 
 from __future__ import annotations
@@ -23,8 +23,8 @@ import numpy as np
 # Paths
 # ---------------------------------------------------------------------------
 _OTA_RIS = os.path.dirname(os.path.abspath(__file__))
-_DEFAULT_ARRAY_DIR = os.path.join(_OTA_RIS, "cifar", "plots_sim", "arrays")
-_DEFAULT_OUT_DIR = os.path.join(_OTA_RIS, "cifar", "plots_sim")
+_DEFAULT_ARRAY_DIR = os.path.join(_OTA_RIS, "framework", "plots_sim", "arrays")
+_DEFAULT_OUT_DIR = os.path.join(_OTA_RIS, "framework", "plots_sim")
 
 # ---------------------------------------------------------------------------
 # Design knobs — change these as you iterate on figure look
@@ -89,7 +89,7 @@ def load_sim(sim, array_dir=_DEFAULT_ARRAY_DIR):
     if not os.path.isfile(path):
         raise FileNotFoundError(
             f"missing arrays for {sim_id}: {path}\n"
-            f"Run cifar/run_simulations_from_json.py first."
+            f"Run framework/run_simulations_from_json.py first."
         )
     z = np.load(path, allow_pickle=True)
     data = {
@@ -198,7 +198,7 @@ def plot_sim(data, *, out_path=None, show=False):
 
 def main(argv=None):
     p = argparse.ArgumentParser(
-        description="Plot a saved sim from cifar/plots_sim/arrays/sim_N.npz",
+        description="Plot a saved sim from framework/plots_sim/arrays/sim_N.npz",
     )
     p.add_argument(
         "sim",
@@ -212,7 +212,7 @@ def main(argv=None):
     p.add_argument(
         "--out",
         default=None,
-        help="PNG path (default: cifar/plots_sim/<sim_id>.png)",
+        help="PNG path (default: framework/plots_sim/<sim_id>.png)",
     )
     p.add_argument(
         "--show",

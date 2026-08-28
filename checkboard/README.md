@@ -5,9 +5,10 @@ strictly-linear, bias-free intermediate layer `W_lin` (placed between two ReLU
 stages) is **genuinely necessary** on a task that requires depth — not merely
 helpful.
 
-The demo mirrors the `ThinTeacher` ReLU-boundary trick from `teacher.py`, but
-uses a 2D checkerboard instead of CIFAR so the depth gap is large and
-explainable (~35% vs ~2% on CIFAR).
+The demo mirrors the `ThinTeacher` ReLU-boundary trick (see
+`framework/cifar_minimal_dnn.py --teacher thin` and the older
+`GAN - playground/teacher.py`), but uses a 2D checkerboard instead of CIFAR so
+the depth gap is large and explainable (~35% vs ~2% on CIFAR).
 
 ---
 ## kappa for simulation: kappa=5, 10, 20, 33, 50, 70
@@ -87,7 +88,7 @@ Requirements for wireless:
 - **`H₁` and `H₂` must be full-rank** (effective `Rank(H₂ diag(φ) H₁) ≥ Nr`) so
   the RIS can mimic `W_lin`. Strong LoS (high Ricean κ) collapses the cascaded
   channel to rank-1 and produces a uniform decision boundary. Prefer Rayleigh or
-  very low κ. See `../rank.md` for the derivation.
+  very low κ. See root README §7 for the rank gotcha.
 - **φ optimization:** cosine similarity between flattened `y_learned` and
   `y_ris` during GD; **AGC** at decode scales `y_ris` to `‖y_target‖` from
   `W_lin(a)` (both are needed: cosine for direction, AGC for magnitude).
@@ -276,16 +277,17 @@ plots/checkerboard_g{grid_n}_h{hidden}_epochs{epochs}_snr{snr}_rayleigh_kappa*_w
 
 | Checkerboard component | OTA_RIS counterpart |
 |---|---|
-| `CheckerboardNet.enc` | `ThinEncoder` / `MyTeacher.encoder` |
-| `CheckerboardNet.linear` (`W_lin`) | `MyTeacher.linear` (learned channel layer) |
-| `CheckerboardNet.dec` | `ThinDecoder` / `MyTeacher.decoder` |
-| Wireless RIS path | `test_demo.test_physical()` |
-| `_optimize_phi_gd` | `teacher_experiments._optimize_phi_gd` (vendored) |
+| `CheckerboardNet.enc` | Thin encoder in `framework/cifar_minimal_dnn.py` / `GAN - playground/teacher.py` |
+| `CheckerboardNet.linear` (`W_lin`) | Teacher `linear` (learned channel layer) |
+| `CheckerboardNet.dec` | Thin / heavy decoder in the same teachers |
+| Wireless RIS path | `framework` wireless eval / `test_demo.test_physical()` |
+| `_optimize_phi_gd` | `distilallation/teacher_experiments._optimize_phi_gd` (vendored) |
 | Channel pools `H₁`, `H₂` | `channels.generate_channel_tensors_by_type` |
-| AWGN `noise` | `gan.gan.noise` (vendored) |
+| AWGN `noise` | `GAN - playground/gan.py` `noise` (vendored) |
 
-Conceptual sibling only (not imported for training): `ThinTeacher` in
-`teacher.py` and `train_thin_teacher` in `teacher_train.py`.
+Conceptual siblings (not imported for training): `--teacher thin` in
+`framework/cifar_minimal_dnn.py`, and `ThinTeacher` /
+`train_thin_teacher` under `GAN - playground/`.
 
 The core W_lin demo uses only torch/numpy/matplotlib. The wireless panel
 additionally imports `channels.py` (sionna-free). `_optimize_phi_gd` and
@@ -297,8 +299,7 @@ additionally imports `channels.py` (sionna-free). `_optimize_phi_gd` and
 
 **Root cause (fixed in script):** strong LoS Ricean channels made
 `H₂ diag(φ) H₁` effectively rank-1, so `y_ris` collapsed to a fixed direction
-regardless of input — a flat "pure blue" wireless panel. Full write-up:
-`../rank.md`.
+regardless of input — a flat "pure blue" wireless panel. See root README §7.
 
 **Current recipe in `wireless_forward`:**
 
@@ -311,7 +312,7 @@ regardless of input — a flat "pure blue" wireless panel. Full write-up:
 
 - Confirm end-to-end wireless accuracy vs with-`W_lin` (~95%) under the new defaults.
 - Wire AGC consistently with the cosine objective (TODO in code).
-- Port rank/SNR/cosine+AGC recipe to `test_demo.test_physical()`.
+- Port rank/SNR/cosine+AGC recipe to `test_demo.test_physical()` / framework wireless.
 
 Suggested command:
 
@@ -335,22 +336,23 @@ From recent work on the wireless panel (committed in `13c25da checkboard plot up
 - Added **`--channel_type`**, **`--kappa`**, **`--kappa_sweep`**, **`--include_rayleigh`**.
 - **Cosine φ loss** + **AGC** at decoder input in `wireless_forward`.
 - New **fading comparison plot** (Rayleigh vs Ricean κ sweep).
-- Added `../rank.md` (repo root) documenting the LoS collapse math.
+- Rank/LoS collapse notes live in the root README §7 (former `rank.md`).
 
 ## Next steps
 
 1. Re-run wireless eval with defaults above; record wireless accuracy vs ~95%.
 2. Finish AGC + cosine integration (see TODO in `wireless_forward`).
-3. Update `test_demo.py` / `teacher_experiments.py` with the same channel-rank,
-   SNR, and φ/AGC recipe.
+3. Keep framework / `test_demo.py` wireless paths aligned with the same
+   channel-rank, SNR, and φ/AGC recipe.
 
 ---
 
 ## Isolation note
 
-This folder is kept separate from `MyTeacher`, `train_teacher_linear`, the GAN
-path, and the physical/metasurface MNIST tests. The SLURM script
-`sbatch_gpu_checkerboard.io` does not touch `sbatch_gpu.io` or `teacher.py`.
+This folder is kept separate from `framework/cifar_minimal_dnn.py`, the
+`GAN - playground/` teacher/GAN path, and the physical/metasurface MNIST tests.
+The SLURM script `sbatch_gpu_checkerboard.io` does not touch `sbatch_gpu.io` or
+the framework image pipeline.
 
 The wireless panel reuses channel generation from `channels.py` but does not
 modify any production training flow. It exists to bridge the synthetic depth
