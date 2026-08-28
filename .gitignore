@@ -56,6 +56,10 @@ data/
 wandb/
 plots_for_meeting/
 checkboard/plots_old/
+checkboard/models/
+checkboard/plots/
+framework/models/
+framework/plots/
 
 # Local / run artifacts (not published)
 simulations/
