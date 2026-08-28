@@ -813,7 +813,7 @@ class CifarSimCNN(nn.Module):
 
 
 def noise(y, target_snr_db):
-    """AWGN matched to signal power (vendored from GAN - playground/gan.py; real + complex)."""
+    """AWGN matched to signal power (vendored from playground/GAN /gan.py; real + complex)."""
     p_signal = torch.mean(torch.abs(y) ** 2)
     sigma_sqr = p_signal / (10 ** (target_snr_db / 10.0))
     noise_std = torch.sqrt(sigma_sqr)

@@ -163,10 +163,10 @@ python framework/run_simulations_from_json.py
 python sim_plot.py 3
 ```
 
-**Playground / older image path:** `GAN - playground/teacher.py`
+**Playground / older image path:** `playground/GAN /teacher.py`
 (`MyTeacher` / `ThinTeacher`, `phase = "train"|"train_thin"|"test"`), with
-helpers in `GAN - playground/teacher_train.py`, physical eval in
-`test_demo.py`, and GAN channel surrogate in `GAN - playground/gan.py`. Not
+helpers in `playground/GAN /teacher_train.py`, physical eval in
+`test_demo.py`, and GAN channel surrogate in `playground/GAN /gan.py`. Not
 the primary article pipeline anymore.
 
 ## 6. Channel model details
@@ -210,11 +210,11 @@ carry a full-rank transformation.**
 | `sim_plot.py` | Plot saved sim arrays (wireless / AirFC / SimNet curves) |
 | `test_demo.py` | Physical (`test_physical`) and GAN eval helpers (older teacher path) |
 | `channels.py` | Channel generation (`generate_channel_tensors_by_type`, geometric Ricean/Rayleigh) |
-| `GAN - playground/teacher.py` | Older `MyTeacher` / `ThinTeacher` playground |
-| `GAN - playground/teacher_train.py` | Training loops for the playground teacher |
-| `GAN - playground/gan.py` | GAN channel-surrogate utilities, `noise`, distribution plots |
+| `playground/GAN /teacher.py` | Older `MyTeacher` / `ThinTeacher` playground |
+| `playground/GAN /teacher_train.py` | Training loops for the playground teacher |
+| `playground/GAN /gan.py` | GAN channel-surrogate utilities, `noise`, distribution plots |
 | `distilallation/` | Student models / KD / original `_optimize_phi_gd` |
-| `Digital System-playground/` | Simple digital transceiver sandbox |
+| `playground/Digital System/` | Simple digital transceiver sandbox |
 | `CODE_EXAMPLE/` | Upstream SimNet / MINN reference (local; gitignored) |
 
 ## 9. Key symbols
@@ -229,13 +229,3 @@ carry a full-rank transformation.**
 | `y_ris` | received vector after the RIS channel + noise |
 | `N_t, N_r, N_m` | # Tx antennas, # Rx antennas, # RIS elements |
 | K-factor (`kappa`) | Ricean LoS/NLoS ratio (controls channel rank) |
-
-## 10. Open threads / TODOs (from the code)
-
-- Checkerboard `wireless_forward` is mid-refactor (`#TODO`s): `hidden`
-  hardcoded to 2 in `make_ris_channel_pools`, and the RIS path currently routes
-  the raw input `x` rather than the encoder activation `a = ReLU(enc(x))`.
-- Whether increasing `N_m` reliably improves accuracy — tied to the rank
-  discussion above.
-- Norm/gain matching between `y_ris` and `y_learned` (cosine loss vs. Frobenius)
-  is still being tuned.

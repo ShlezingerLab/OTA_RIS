@@ -7,7 +7,7 @@ helpful.
 
 The demo mirrors the `ThinTeacher` ReLU-boundary trick (see
 `framework/cifar_minimal_dnn.py --teacher thin` and the older
-`GAN - playground/teacher.py`), but uses a 2D checkerboard instead of CIFAR so
+`playground/GAN /teacher.py`), but uses a 2D checkerboard instead of CIFAR so
 the depth gap is large and explainable (~35% vs ~2% on CIFAR).
 
 ---
@@ -277,17 +277,17 @@ plots/checkerboard_g{grid_n}_h{hidden}_epochs{epochs}_snr{snr}_rayleigh_kappa*_w
 
 | Checkerboard component | OTA_RIS counterpart |
 |---|---|
-| `CheckerboardNet.enc` | Thin encoder in `framework/cifar_minimal_dnn.py` / `GAN - playground/teacher.py` |
+| `CheckerboardNet.enc` | Thin encoder in `framework/cifar_minimal_dnn.py` / `playground/GAN /teacher.py` |
 | `CheckerboardNet.linear` (`W_lin`) | Teacher `linear` (learned channel layer) |
 | `CheckerboardNet.dec` | Thin / heavy decoder in the same teachers |
 | Wireless RIS path | `framework` wireless eval / `test_demo.test_physical()` |
 | `_optimize_phi_gd` | `distilallation/teacher_experiments._optimize_phi_gd` (vendored) |
 | Channel pools `H₁`, `H₂` | `channels.generate_channel_tensors_by_type` |
-| AWGN `noise` | `GAN - playground/gan.py` `noise` (vendored) |
+| AWGN `noise` | `playground/GAN /gan.py` `noise` (vendored) |
 
 Conceptual siblings (not imported for training): `--teacher thin` in
 `framework/cifar_minimal_dnn.py`, and `ThinTeacher` /
-`train_thin_teacher` under `GAN - playground/`.
+`train_thin_teacher` under `playground/GAN /`.
 
 The core W_lin demo uses only torch/numpy/matplotlib. The wireless panel
 additionally imports `channels.py` (sionna-free). `_optimize_phi_gd` and
@@ -350,7 +350,7 @@ From recent work on the wireless panel (committed in `13c25da checkboard plot up
 ## Isolation note
 
 This folder is kept separate from `framework/cifar_minimal_dnn.py`, the
-`GAN - playground/` teacher/GAN path, and the physical/metasurface MNIST tests.
+`playground/GAN /` teacher/GAN path, and the physical/metasurface MNIST tests.
 The SLURM script `sbatch_gpu_checkerboard.io` does not touch `sbatch_gpu.io` or
 the framework image pipeline.
 

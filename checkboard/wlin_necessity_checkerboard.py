@@ -5,7 +5,7 @@ Standalone, self-contained ablation showing that a strictly-linear, bias-free
 intermediate matrix `W_lin` (placed between two ReLU stages) is genuinely
 necessary -- not merely helpful -- on a task that requires depth.
 
-Mechanism (mirrors `ThinTeacher` in `GAN - playground/teacher.py`, but on
+Mechanism (mirrors `ThinTeacher` in `playground/GAN /teacher.py`, but on
 synthetic 2D data):
 
     x -> Linear(2, hidden) -> ReLU -> a (>= 0)
@@ -25,7 +25,7 @@ optional wireless-RIS panel (`--wireless true`) reuses the exact channel format
 from test_demo.py via `channels.generate_channel_tensors_by_type` (which is
 sionna-free). The phi optimizer (`_optimize_phi_gd`) and AWGN `noise` are
 vendored verbatim below from `distilallation/teacher_experiments.py` /
-`GAN - playground/gan.py`, so no sionna (and no heavy GAN/tk/sklearn imports)
+`playground/GAN /gan.py`, so no sionna (and no heavy GAN/tk/sklearn imports)
 are pulled in.
 """
 
@@ -170,7 +170,7 @@ def load_model(path, device):
 
 
 def noise(y, target_snr_db):
-    """AWGN matched to signal power (vendored from GAN - playground/gan.py; real + complex)."""
+    """AWGN matched to signal power (vendored from playground/GAN /gan.py; real + complex)."""
     p_signal = torch.mean(torch.abs(y) ** 2)
     sigma_sqr = p_signal / (10 ** (target_snr_db / 10.0))
     noise_std = torch.sqrt(sigma_sqr)
@@ -677,7 +677,7 @@ def run_once(grid_n, hidden, n_train, n_test, batch_size, epochs, lr, weight_dec
 
 if __name__ == "__main__":
     #################################################
-    # Tunable constants (edit here, GAN - playground/teacher.py style).
+    # Tunable constants (edit here, playground/GAN /teacher.py style).
     # Defaults validated on GPU to give with-W_lin ~95% vs bypass ~60% (gap ~35%).
     # gn=6 / hidden=24 is the separating sweet spot: the depth-1 bypass is
     # capacity-capped ~60% while the depth-2 with-W_lin model still has headroom,

@@ -8,67 +8,68 @@ globs: **/*.py
 
 ## Current Focus
 
-The active teacher architecture focus is in `teacher.py`: MNIST data -> `HeavyEncoder` -> learned `linear` channel layer -> `HeavyRxDecoder`, then physical/metasurface testing via `test_demo.test_physical()` and `_optimize_phi_gd()` from `teacher_experiments.py`.
+The **main image experiment** is `framework/cifar_minimal_dnn.py`: CIFAR-10 or
+MNIST (`--data`) → CNN or thin teacher → bias-free mid `W_lin` → decoder, with
+optional **wireless RIS**, **AirFC** (`U^H H2 diag(phi) H1 P ≈ W`), and
+**SimNet** paths plus kappa / SNR / `N_m` sweeps. Batch sims:
+`framework/run_simulations_from_json.py` → `framework/plots_sim/arrays/`; plot
+with root `sim_plot.py`. AirFC notes: `framework/airfc.md`.
 
-Wireless/RIS validation is actively exercised in `checkboard/wlin_necessity_checkerboard.py` (isolated checkerboard demo with an optional wireless panel). Treat findings there (channel rank, SNR, cosine φ + AGC) as the current best recipe for the physical path; see `.cursor/docs/architecture/wireless-ris-phi.md` and `rank.md`.
+Wireless / W_lin-necessity validation is also exercised in
+`checkboard/wlin_necessity_checkerboard.py` (isolated 2D checkerboard + optional
+wireless panel). Treat checkerboard findings (channel rank, SNR ≈ 60 dB, cosine
+φ + AGC) as the best recipe for the physical path; see root README §7 and
+`.cursor/docs/architecture/wireless-ris-phi.md`.
 
-Keep this rule centered on the ordinary teacher path. GAN classes also exist in `teacher.py`, but they are a separate channel-modeling path and should only be considered for GAN-specific tasks.
+Older `MyTeacher` / GAN / thin ablation live under `playground/GAN /` (note the
+trailing space in the folder name) and are **not** the primary pipeline.
 
 ## Key Files
 
 | File | Purpose |
 |---|---|
-| `teacher.py` | Current teacher focus: `MyTeacher`, encoder, learned linear channel, decoder, GAN helpers; also `ThinTeacher` ablation model |
-| `teacher_train.py` | Teacher training functions, including `train_teacher_linear()` and `train_thin_teacher()` |
-| `test_demo.py` | Physical/metasurface testing (`test_physical()`) plus the GAN-channel test (`test_physical_channel_gan()`); re-exports `noise()` from `gan.gan` |
-| `teacher_experiments.py` | Phase/metasurface optimization helpers (`_optimize_phi_gd()`, `get_channel_matching_loss()`, etc.) and alternate teachers |
-| `students.py` | Student model definitions |
-| `channels.py` | Channel generation (`generate_channel_tensors_by_type`; supports `geometric_rayleigh`, `geometric_ricean`, etc.) |
-| `checkboard/wlin_necessity_checkerboard.py` | Isolated W_lin necessity demo + optional wireless RIS panel (vendored φ opt, AGC, channel pools) |
+| `framework/cifar_minimal_dnn.py` | **Main image experiment**: CNN/thin teachers, wireless RIS, AirFC, SimNet, sweeps |
+| `framework/run_simulations_from_json.py` | Batch sims from JSON → `plots_sim/arrays/*.npz` |
+| `framework/airfc.md` | AirFC P/Phi/U solver notes |
+| `sim_plot.py` | Plot saved compare-teacher sim arrays |
+| `checkboard/wlin_necessity_checkerboard.py` | Isolated W_lin necessity demo + wireless RIS panel |
 | `checkboard/wlin_checker_maxgap_sweep.py` | Sweeps `(grid_n, hidden)` for max with-vs-bypass gap |
-| `rank.md` | Rank-deficiency analysis: strong LoS collapse vs Rayleigh / low-K fix |
-| `training.py` | All training functions |
-| `CLI_interface.py` | CLI entry point for all training phases |
-| `flow.py` | High-level training orchestration |
+| `channels.py` | Channel generation (`generate_channel_tensors_by_type`) |
+| `test_demo.py` | Physical / GAN eval helpers for the older teacher path |
+| `distilallation/teacher_experiments.py` | Original `_optimize_phi_gd` and related RIS helpers |
+| `playground/GAN /teacher.py` | Older `MyTeacher` / `ThinTeacher` playground |
+| `playground/GAN /teacher_train.py` | `train_teacher_linear`, `train_thin_teacher` |
+| `playground/GAN /gan.py` | GAN channel surrogate + `noise` |
+| `playground/Digital System/` | Simple digital transceiver sandbox |
+| `distilallation/` | Students / KD / training side experiments |
 
-## Current Teacher Pipeline (`teacher.py`)
+Local (gitignored) outputs: `checkboard/models/`, `checkboard/plots/`,
+`framework/models/`, `framework/plots/`, `simulations/`, `CODE_EXAMPLE/`.
 
-`MyTeacher` is the current ordinary teacher model:
+## Framework image pipeline
 
-- `MyTeacher(n_t, n_r, n_m, H_d_all, ...)`: receives `H_d_all` externally; channels are generated outside the model.
-- `HeavyEncoder`: maps MNIST images `(B, 1, H, W)` to a power-normalized complex transmit signal `s`.
-- `self.linear`: learned real-valued channel approximation `R^(2*Nt) -> R^(2*Nr)`.
-- `HeavyRxDecoder`: maps received complex signal `y` to class logits.
+Teachers under `framework/cifar_minimal_dnn.py`:
 
-Standard forward flow:
+- **CNN** (`--teacher cnn`): conv encoder → complex `s` ∈ ℂ^{N_t} → mid → decoder logits.
+- **Thin** (`--teacher thin`): flat Linear+ReLU encoder, Linear mid, ReLU+Linear decoder (W_lin-necessity style).
+- Mid kinds via `--inter {linear,relu,cnn,none,sim}`; AirFC requires `--inter linear`.
+- Prefer `--mid_bn false` (default) so mid is pure `y = W s` for fair AirFC.
 
-```python
-s = teacher.encoder(images)                         # complex, (B, 1, Nt) or (B, Nt)
-s = s.squeeze(1) if s.dim() == 3 else s             # (B, Nt)
-s_flat = torch.view_as_real(s).reshape(B, -1)       # (B, 2*Nt)
-y_flat = teacher.linear(s_flat)                     # (B, 2*Nr)
-y = torch.view_as_complex(y_flat.reshape(B, Nr, 2).contiguous())
-logits = teacher.decoder(y)
-```
-
-`teacher.forward()` currently samples `H_d_batch` from `H_d_all`, but the ordinary forward path does not use `H_d_batch` in the learned linear layer path.
+Wireless at inference: replace `W_lin(s)` with `H_2 diag(φ) H_1 s` after matching
+φ to `y_learned` via `_optimize_phi_gd` (vendored). AirFC fits channel-level
+`U^H H_eq P ≈ W` (no data vector `s` in AO); pathloss off for AirFC pools,
+on for wireless / SimNet.
 
 ## Data And Channel Pools
 
-Data and channels are created outside the model:
+- Image data: `data/cifar-10-batches-py`, `data/MNIST` (framework loaders; no torchvision required for the main script).
+- `generate_channel_tensors_by_type()` returns `H_d_all`, `H_1_all`, `H_2_all`.
+- Shapes in active RIS code: `H_1` as `(B, Nm, Nt)`, `H_2` as `(B, Nr, Nm)`.
 
-- MNIST data is loaded through torchvision datasets and dataloaders.
-- `generate_channel_tensors_by_type()` returns `H_d_all`, `H_1_all`, and `H_2_all`.
-- `H_d_all` is passed into `MyTeacher` and stored as `teacher.H_d_all`.
-- `H_1_all` and `H_2_all` are used during physical/metasurface tests.
-
-Current shape conventions in the active test code:
-
-- `H_d_all`: direct TX-to-RX channel pool, sampled as `(B, Nr, Nt)`.
-- `H_1_all`: TX-to-metasurface/RIS channel pool, sampled as `(B, Nm, Nt)` for `torch.bmm(H_1_batch, s.unsqueeze(-1))`.
-- `H_2_all`: metasurface/RIS-to-RX channel pool, sampled as `(B, Nr, Nm)`.
-
-For the RIS surrogate `y_ris = H₂ diag(φ) H₁ s` to mimic `W_lin`, the cascaded channel needs sufficient rank (typically `Rank(H_eq) ≥ Nr`). **Strong LoS (high Ricean K on H₁/H₂) causes rank-1 collapse**; prefer **`geometric_rayleigh`** or heavily suppressed LoS. Details in `rank.md`.
+For the RIS surrogate `y_ris = H₂ diag(φ) H₁ s` to mimic `W_lin`, the cascaded
+channel needs sufficient rank (typically `Rank(H_eq) ≥ Nr`). **Strong LoS (high
+Ricean K on H₁/H₂) causes rank-1 collapse**; prefer **`geometric_rayleigh`** or
+heavily suppressed LoS. Details in root README §7.
 
 ## Complex Tensor Convention
 
@@ -80,88 +81,48 @@ s_flat = s_real.reshape(B, 2*Nt)    # flatten: [Re, Im interleaved]
 y = torch.view_as_complex(y_flat.reshape(B, Nr, 2))  # real -> complex
 ```
 
-The encoder produces complex tensors, the learned linear layer operates on real flattened `[real, imag]` representation, and the decoder receives complex `y`.
+## Metasurface / phi recipe
 
-## Metasurface Physical Test
+**Phi optimization (current best practice):**
 
-`test_demo.test_physical()` compares two paths:
+- **Loss:** cosine similarity in flattened real space:
+  `loss = mean(1 - cosine_sim(y_target, y_ris))`.
+- **AGC:** scale `y_ris` so `‖y_ris‖ = ‖y_target‖` before decode (checkerboard
+  `wireless_forward`; framework wireless has its own matching).
+- **SNR:** checkerboard wireless defaults to **60 dB**.
+- **Channels:** full-rank scattering (Rayleigh / low K), not strong LoS on H₁/H₂.
 
-1. Learned/synthetic path: `teacher(images)` uses encoder -> linear -> decoder.
-2. Physical/metasurface path:
-   - Encode image to `s`.
-   - Build `y_learned` from `teacher.linear(s_flat)`.
-   - Optimize `phi` with `_optimize_phi_gd(teacher, s, y_learned, H_1_batch, H_2_batch, iters=10)`.
-   - Compute `y_ris = H_2 @ diag(phi) @ H_1 @ s`.
-   - Add AWGN via `noise(y_ris, target_snr_db)`.
-   - Decode with `teacher.decoder(y_ris)`.
+Older physical eval: `test_demo.test_physical()` +
+`distilallation/teacher_experiments._optimize_phi_gd`.
 
-**Phi optimization recipe (current best practice):**
+## Thin / W_lin necessity
 
-- **Loss:** cosine similarity in flattened real complex space:
-  `loss = mean(1 - cosine_sim(y_target, y_ris))`. Used in `teacher_experiments._optimize_phi_gd` and the checkerboard vendored copy.
-- **AGC:** scale `y_ris` so `‖y_ris‖ = ‖y_target‖` using the known learned intermediate norm before decode. Implemented in `checkboard/wlin_necessity_checkerboard.py::wireless_forward`; **not yet in `test_demo.test_physical()`**.
-- **SNR:** checkerboard wireless defaults to **60 dB** (`--snr 60`); lower SNR can swamp φ matching. Main `test_physical()` still uses the caller's `SNR` argument.
-- **Channels:** use full-rank scattering (Rayleigh / low K), not strong LoS on H₁/H₂.
+Depth-separation argument: encoder ends in ReLU (`a ≥ 0`), so bypassing a
+bias-free mid makes the decoder’s leading ReLU a no-op and collapses depth.
+Evidence:
 
-## Feature Extraction for Distillation
-
-```python
-features, logits = teacher.extract_features(images, preReLU=True)
-# Returns 8 features: 5 encoder + 1 linear layer + 2 decoder
-```
-
-The linear-layer feature is `y_flat`; it is the key intermediate representation when later aligning controller/metasurface behavior to the learned teacher channel.
-
-## Thin Teacher (Ablation)
-
-`teacher.py` also defines a minimal ablation stack (`ThinEncoder`, `ThinDecoder`, `ThinTeacher`) used to test whether the intermediate linear layer is necessary. It is separate from the ordinary `MyTeacher` path and is purely real-valued (no complex `s`/`y`, no power normalization, no channel pools).
-
-The design makes a strictly linear intermediate layer non-removable via ReLU boundaries:
-
-- `ThinEncoder`: a single `Linear(in_dim, 2*N_t)` followed by `ReLU`, mapping a flattened image to a nonnegative `a` of shape `(B, 2*N_t)`. It ends in ReLU. `in_dim` defaults to `3*32*32` (CIFAR-10).
-- `ThinDecoder`: starts with `ReLU` then a single `Linear(2*N_r, num_classes)`. There is no trainable linear layer before the ReLU, so it cannot absorb `self.linear`.
-- `ThinTeacher`: `ThinEncoder -> [optional self.linear] -> ThinDecoder`. `self.linear = nn.Linear(2*N_t, 2*N_r, bias=False)` is the strictly-linear layer under test (named `linear` to match `MyTeacher`). It asserts `N_t == N_r == N_m`.
-
-Forward with ablation toggle:
-
-```python
-# a = ReLU(Linear(x))                              # (B, 2*N_t), >= 0
-# use_intermediate=True : h = self.linear(a)       # (B, 2*N_r)
-# use_intermediate=False: h = a                    # bypass self.linear
-# logits = decoder(h) = Linear(ReLU(h))
-logits = thin_teacher(images, use_intermediate=...)
-```
-
-The bypass is valid because `2*N_t == 2*N_r`. Why the intermediate is necessary: with it, the network has two genuine nonlinear stages, `Linear(ReLU(W * ReLU(Linear(x))))`. Without it, the decoder's ReLU receives the already-nonnegative `a`, so `ReLU(a) = a` and the two ReLUs collapse into a single hidden layer (`Linear(ReLU(Linear(x)))`). With a thin width (`2*N_t`) and a dataset that needs nonlinearity (CIFAR-10), the collapsed bypass underfits while the with-intermediate path succeeds. That gap is the evidence the intermediate linear layer is necessary.
-
-Training (`teacher_train.py`):
-
-- `train_thin_teacher(teacher, train_loader, device, epochs, lr, weight_decay=0.0, use_intermediate=True, save_path=None)` is a minimal CrossEntropy loop. It has no `H_d`/`H_1`/`H_2` channel regularization and no GAN. It trains the encoder and decoder, and trains `self.linear` only when `use_intermediate=True` (when `False`, `self.linear` is bypassed and receives no gradient).
-
-Entry point: under `phase == "train_thin"`, the `teacher.py` `__main__` block trains CIFAR-10 (with a held-out test loader), instantiating a fresh `ThinTeacher` for each mode (`use_intermediate=True` and `False`) and printing the test accuracies and their gap.
+- Checkerboard (`checkboard/`): large with-vs-bypass gap (~95% vs ~60%).
+- Framework thin teacher / older `playground/GAN /` `ThinTeacher`.
 
 ## Checkerboard Demo (Isolated)
 
-`checkboard/` is a standalone depth-separation experiment on 2D checkerboard data. It mirrors the ThinTeacher ReLU-boundary mechanism but produces a much larger with-vs-bypass gap (~35% at default `grid_n=6`, `hidden=24`).
+`checkboard/` is standalone on 2D checkerboard data:
 
-- `CheckerboardNet`: `enc: Linear(2, hidden) -> ReLU` -> optional `linear: Linear(hidden, hidden, bias=False)` -> `dec: ReLU -> Linear(hidden, 2)`.
-- Trains separate with-`W_lin` and bypass models; optional **wireless panel** routes the with-`W_lin` model through `H₂ diag(φ) H₁` instead of `W_lin`.
-- Wireless mapping: real `a = ReLU(enc(x))` reshaped to complex `s`; target `y_learned = complex(W_lin(a))`; φ from vendored `_optimize_phi_gd`; AWGN; AGC to `‖y_target‖`; decode via `dec(ReLU(y_ris_real))`.
-- Entry: `checkboard/wlin_necessity_checkerboard.py` (`--wireless`, `--snr`, `--channel_type`, `--phi_iters`). Does not import or train `MyTeacher`.
-
-Conceptual mapping to main code:
-
-| Checkerboard | OTA_RIS |
-|---|---|
-| `CheckerboardNet.linear` | `MyTeacher.linear` |
-| Wireless RIS path | `test_demo.test_physical()` |
-| `_optimize_phi_gd` (vendored) | `teacher_experiments._optimize_phi_gd` |
+- `CheckerboardNet`: `enc Linear+ReLU` → optional `W_lin` → `dec ReLU+Linear`.
+- Optional wireless panel: `H₂ diag(φ) H₁` instead of `W_lin`.
+- Entry: `wlin_necessity_checkerboard.py` (`--wireless`, `--snr`, `--channel_type`, …).
+- Does not import or train the framework / playground teachers.
 
 ## Important Boundaries
 
-- Do not assume `get_channel_matching_loss()` is part of the active `teacher.py` ordinary forward path. The phi/channel-matching helpers in `teacher_experiments.py` (`_optimize_phi_gd`, `get_channel_matching_loss`, `_optimize_phi_analytical`, `_optimize_phi_manifold_gd`) are module-level functions whose first parameter is named `self` but are **not** bound to `MyTeacher`. They are called by passing a teacher instance explicitly, e.g. `_optimize_phi_gd(teacher, s, y_learned, H_1_batch, H_2_batch, iters=10)` in `test_demo.test_physical()`. `train_teacher_linear()`'s `use_channel_reg` path calls `teacher.get_channel_matching_loss(...)` as a bound method, which will fail unless it is explicitly attached to the teacher first.
-- Do not describe the current metasurface focus as closed-form phase optimization. The active physical test uses `_optimize_phi_gd()` with cosine-similarity loss.
-- Do not assume strong LoS Ricean channels are appropriate for RIS surrogate tests. High K on H₁/H₂ can collapse rank and break φ optimization (see `rank.md`).
-- Do not assume AGC is applied in `test_demo.test_physical()` just because checkerboard wireless uses it. Only the checkerboard path scales `y_ris` to `‖y_target‖` today.
-- Do not mix the GAN path (`ChannelGenerator`, `ChannelDiscriminator`, `HeavyRxDecoder_gan`, `forward_gan`) into ordinary teacher explanations unless the task explicitly mentions GAN training or GAN channel simulation.
-- Do not mix the `ThinTeacher` ablation stack or `checkboard/` demo into ordinary `MyTeacher` training flows. They are isolated experiments for intermediate-layer necessity and wireless surrogate validation.
+- Prefer `framework/cifar_minimal_dnn.py` for image experiments; do not treat
+  `playground/GAN /teacher.py` as the main entry unless the task is about that
+  playground.
+- Do not assume strong LoS Ricean channels are appropriate for RIS surrogate
+  tests (rank collapse).
+- Do not mix GAN classes into ordinary teacher explanations unless the task is
+  GAN-specific.
+- Do not mix `checkboard/` into framework training flows; it is an isolated demo.
+- Folder name `playground/GAN ` has a **trailing space**; quote paths carefully.
+- `models/` and `plots/` under `checkboard/` and `framework/` are gitignored
+  local artifacts.

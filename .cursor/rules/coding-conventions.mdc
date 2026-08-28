@@ -60,4 +60,5 @@ globs: **/*.py
 
 - When introducing a new method, approach, or configuration, prefer to add it alongside the existing one rather than replacing it.
 - Keep previously working options available — typically behind a flag or parameter — so we can switch back and directly compare old vs. new.
-- Example: in `teacher.py` the data pipeline supports BOTH MNIST and CIFAR-10 via a `dataset` flag, instead of replacing MNIST with CIFAR-10.
+- Example: in `framework/cifar_minimal_dnn.py` the data pipeline supports BOTH
+  CIFAR-10 and MNIST via `--data`, instead of replacing one with the other.
