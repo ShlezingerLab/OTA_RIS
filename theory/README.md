@@ -196,12 +196,12 @@ is `kappa >~ 4096 alpha^2 / ||P_perp y||^2`, i.e. roughly the top end of a sweep
 that stops at 50 dB. If you want the bound to be informative across the sweep,
 either reduce `n_m` or extend the range.
 
-**AirFC inherits a matching floor — by a different argument.** This is *not*
-covered by the theorems as written, because AirFC fits at the channel level with
-extra free matrices: `U^H H_2 diag(phi) H_1 P ≈ W`. But the rank argument still
-applies. Under pure LoS, `H_2 diag(phi) H_1 = c(phi) a_rx a_tx^H` is rank one for
-every `phi`, so `W_phys` is rank at most one *regardless of `P` and `U`*. By
-Eckart–Young the relative residual computed in `_airfc_relative_residual` obeys
+**AirFC inherits the same floor.** This is Corollary 4 of
+`ris_mse_lower_bound.md` (PDF Corollary 2). AirFC fits at the channel level,
+`U^H H_2 diag(phi) H_1 P ≈ W`, with extra free matrices. Under pure LoS,
+`H_2 diag(phi) H_1 = c(phi) a_rx a_tx^H` is rank one for every `phi`, so
+`W_phys` is rank at most one *regardless of `P` and `U`*. By Eckart–Young the
+relative residual computed in `_airfc_relative_residual` obeys
 
 ```
 ||W_phys - W||_F / ||W||_F  >=  sqrt( 1 - sigma_1(W)^2 / ||W||_F^2 )

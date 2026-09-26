@@ -18,8 +18,39 @@ The headline results are:
   the machinery the modal-SNR formula was reaching for, together with the precise
   condition under which that formula is a valid bound (it fails in the high-LoS
   regime; see the [Errata](#8-errata-relative-to-the-draft-derivation)).
+* **Corollary 4** — digital pre- and post-processing
+  ($\mathbf{U}^H\mathbf{H}_2\mathbf{\Phi}\mathbf{H}_1\mathbf{P}_{\mathrm{tx}}$) does not
+  escape the pure-LoS floor: the physical map stays rank one.
 
-Numerical verification: `theory/verify_mse_lower_bound.py`.
+The ICASSP draft this note corresponds to is
+`theory/DID_Over_the_Air_Edge_Inference_ICASSP_2027.pdf`. Numbering there is
+shifted, and the PDF's last two sections are the *draft* derivation that
+[§8](#8-errata-relative-to-the-draft-derivation) rejects. Use this table when
+quoting the PDF:
+
+| PDF | This note |
+|---|---|
+| Theorem 1 (range floor; pure-LoS exactness) | Theorem 2 |
+| Theorem 2 (finite $\kappa$) | Theorem 3 |
+| Corollary 1 (cosine / AGC) | Corollary 3 |
+| Corollary 2 (pre- and post-processing) | Corollary 4 |
+| §6 spectral route, (19)–(21); Remark 3 | Theorem 1, Corollary 1, Corollary 2, (6.2) |
+| §7 assembled result, (23)–(25) | §6, (6.1)–(6.3) |
+| §8 limitations | §7 |
+| §§9–10, headed "Gemini" | [Appendix](#11-appendix-draft-derivation-as-printed-in-the-pdf-sections-9-10); not a result |
+
+Sections 1–8 of the PDF are a shortened rendering of §§1–7 here (Lemmas 3–7 and
+the full KKT argument are only in this note). Sections 9–10 restate the model
+and then repeat the invalid derivation; they are reproduced in the Appendix so
+they can be quoted without opening the PDF.
+
+Numerical verification: `theory/verify_mse_lower_bound.py` (synthetic model).
+Experimental study on the trained CIFAR RIS pipeline is in
+[§12](#12-experimental-validation-against-the-cifar-ris-pipeline)
+(`framework/cifar_minimal_dnn.py --mse_sweep`). Its finding: at finite `kappa` the
+RIS *can* synthesize `W_lin s` exactly (the noiseless optimum is ~0), so the floor
+binds not unconditionally but through a **K-vs-SNR tradeoff** — the physical
+(noise-aware) error rises to `||P_perp y||^2` only once `kappa >~ SNR - 10 log10 N_r`.
 
 ---
 
@@ -326,7 +357,7 @@ $$
 \tag{4.2}
 $$
 
-with **equality** whenever $\dfrac{|\mathbf{a}_{\mathrm{rx}}^H\mathbf{y}|}{\sqrt{N_r}}\le M\alpha$.
+with **equality** whenever $\dfrac{|\mathbf{a}_{\mathrm{rx}}^H\mathbf{y}|}{N_r}\le M\alpha$.
 
 *Proof.* The first display is the definition of the distance from $\mathbf{y}$ to the subspace
 $\operatorname{range}(\mathbf{A})$, attained by orthogonal projection; the inequality holds because
@@ -359,10 +390,9 @@ $2\cos\omega\,e^{i\theta}$ per pair, so for even $M$ every modulus in $[0,M]$ is
 and for odd $M$ the same holds using $\lfloor M/2\rfloor$ pairs plus one free element,
 whose reachable set is $\{((M-1)\cos\omega+1)e^{i\theta}\}\supseteq[0,M]e^{i\theta}$.)
 The residual for the achievable set $\{z\,\mathbf{a}_{\mathrm{rx}}:|z|\le M\alpha\}$ is minimized
-by the orthogonal projection $z^\star=\mathbf{a}_{\mathrm{rx}}^H\mathbf{y}/N_r$, which is feasible iff
-$|\mathbf{a}_{\mathrm{rx}}^H\mathbf{y}|/N_r\le M\alpha$, i.e.
-$|\mathbf{a}_{\mathrm{rx}}^H\mathbf{y}|/\sqrt{N_r}\le M\alpha\sqrt{N_r}$ — implied by the stated
-condition. Then $\mathcal{E}(\mathbf{s})=\|\mathbf{P}^\perp\mathbf{y}\|_2^2$. $\blacksquare$
+by the orthogonal projection $z^\star=\mathbf{a}_{\mathrm{rx}}^H\mathbf{y}/N_r$, which is feasible
+exactly when $|\mathbf{a}_{\mathrm{rx}}^H\mathbf{y}|/N_r\le M\alpha$, the stated condition.
+Then $\mathcal{E}(\mathbf{s})=\|\mathbf{P}^\perp\mathbf{y}\|_2^2$. $\blacksquare$
 
 > **Interpretation.** Under pure LoS the RIS controls exactly **one complex scalar**: the
 > received vector is locked to the direction $\mathbf{a}_{\mathrm{rx}}$ no matter what
@@ -393,6 +423,36 @@ and the AGC-matched squared error $\min_{c>0}\|\mathbf{y}-c\,\mathbf{A}\boldsymb
 *Proof.* Cauchy–Schwarz applied to $\langle\mathbf{y},\mathbf{v}\rangle=\langle\mathbf{P}_{\mathbf{A}}\mathbf{y},\mathbf{v}\rangle$
 for any $\mathbf{v}\in\operatorname{range}(\mathbf{A})$; the scale-optimized residual identity is
 $\min_c\|\mathbf{y}-c\hat{\mathbf{v}}\|_2^2=\|\mathbf{y}\|_2^2-|\hat{\mathbf{v}}^H\mathbf{y}|^2$ for unit $\hat{\mathbf{v}}$. $\blacksquare$
+
+### Corollary 4 (digital pre- and post-processing does not escape the floor)
+
+Let
+$\mathbf{W}_{\mathrm{phys}}=\mathbf{U}^H\mathbf{H}_2\mathbf{\Phi}\mathbf{H}_1\mathbf{P}_{\mathrm{tx}}$
+for arbitrary $\mathbf{P}_{\mathrm{tx}}\in\mathbb{C}^{N_t\times N_t}$,
+$\mathbf{U}\in\mathbb{C}^{N_r\times N_r}$ and $\boldsymbol{\phi}\in\mathbb{T}^M$.
+At $\varepsilon=0$, $\operatorname{rank}(\mathbf{W}_{\mathrm{phys}})\le 1$, and therefore for any target
+$\mathbf{W}\in\mathbb{C}^{N_r\times N_t}$,
+
+$$
+\frac{\|\mathbf{W}_{\mathrm{phys}}-\mathbf{W}\|_F}{\|\mathbf{W}\|_F}
+\ \ge\
+\sqrt{1-\frac{\sigma_1(\mathbf{W})^2}{\|\mathbf{W}\|_F^2}},
+\tag{4.4}
+$$
+
+where $\sigma_1(\mathbf{W})$ is the largest singular value of $\mathbf{W}$.
+
+*Proof.* From (4.3),
+$\mathbf{H}_2\mathbf{\Phi}\mathbf{H}_1=c(\boldsymbol{\phi})\,\mathbf{a}_{\mathrm{rx}}\mathbf{a}_{\mathrm{tx}}^H$
+is rank one for every $\boldsymbol{\phi}\in\mathbb{T}^M$. Rank does not increase under left
+multiplication by $\mathbf{U}^H$ or right multiplication by $\mathbf{P}_{\mathrm{tx}}$, so
+$\operatorname{rank}(\mathbf{W}_{\mathrm{phys}})\le 1$. The displayed bound is the Eckart–Young–Mirsky
+theorem in the Frobenius norm: the distance from $\mathbf{W}$ to the set of rank-at-most-one
+matrices is $\sqrt{\|\mathbf{W}\|_F^2-\sigma_1(\mathbf{W})^2}$. $\blacksquare$
+
+> This is the AirFC fitting problem $\mathbf{U}^H\mathbf{H}_2\operatorname{diag}(\boldsymbol{\phi})\mathbf{H}_1\mathbf{P}\approx\mathbf{W}$
+> in the pure-LoS limit. Extra digital matrices $\mathbf{P}_{\mathrm{tx}}$ and $\mathbf{U}$ do not
+> restore the lost receive dimensions. (PDF Corollary 2.)
 
 ---
 
@@ -712,3 +772,251 @@ floor $\|\mathbf{P}^\perp\mathbf{y}\|_2^2=4.931$).
 | $\mathbf{P}^\perp=\mathbf{I}-\mathbf{a}_{\mathrm{rx}}\mathbf{a}_{\mathrm{rx}}^H/N_r$ | projector off the Rx beam direction |
 | $\mu^\star$, $h(\mu)$, $G(\mu)$, $D(\mu)$ | KKT multiplier, $\|\boldsymbol{\phi}^\star(\mu)\|^2$, primal-at-$\mu$, dual function |
 | $\mathcal{E}(\mathbf{s})$ | synthesis residual, $\mathrm{MSE}_{\min}=N_r\sigma^2+\mathcal{E}$ |
+| $\mathbf{W}_{\mathrm{phys}}=\mathbf{U}^H\mathbf{H}_2\mathbf{\Phi}\mathbf{H}_1\mathbf{P}_{\mathrm{tx}}$ | digitally pre-/post-processed physical map (Corollary 4; AirFC) |
+| $\sigma_1(\mathbf{W})$ | largest singular value of the target matrix $\mathbf{W}$ |
+
+---
+
+## 11. Appendix: draft derivation as printed in the PDF (sections 9-10)
+
+> **Not a result.** PDF §§9–10 are headed "Gemini: System Model and Problem
+> Formulation". They restate §1 and then give the derivation that
+> [§8](#8-errata-relative-to-the-draft-derivation) rejects. Kept here so the
+> draft can be quoted against the PDF equation numbers. Do not cite (A.6)–(A.8)
+> as bounds.
+
+**§9 restates the model.** Forward model (PDF (26)), linearization
+$\mathbf{y}_{\mathrm{synth}}=\mathbf{A}(\mathbf{s})\boldsymbol{\phi}+\mathbf{w}$ with
+$\mathbf{A}(\mathbf{s})=\mathbf{H}_2\operatorname{diag}(\mathbf{H}_1\mathbf{s})$ (PDF (27)–(29)),
+Rician factorization (PDF (30)–(32)), and $\mathrm{MSE}_{\min}$ (PDF (33)).
+These match §1 upon identifying $\sqrt{\kappa/(\kappa+1)}=\sqrt{1-\varepsilon}$ and
+$\sqrt{1/(\kappa+1)}=\sqrt{\varepsilon}$. Column formula (PDF (29)) is Lemma 2.
+
+**§10.1–10.2 are the relaxation, done correctly.** Noise separation (PDF (34))
+is Lemma 1. The torus sits inside the ball $\|\boldsymbol{\phi}\|_2^2\le M$ (PDF (35)–(36)),
+which is Lemma 3. The Lagrangian (PDF (38)), stationarity, and
+
+$$
+\boldsymbol{\phi}^\star(\mu)=\big(\mathbf{A}^H\mathbf{A}+\mu\mathbf{I}_M\big)^{-1}\mathbf{A}^H\mathbf{y},
+\qquad
+\mathbf{y}-\mathbf{A}\boldsymbol{\phi}^\star(\mu)=\mu\,(\mathbf{R}_{\mathrm{eq}}+\mu\mathbf{I})^{-1}\mathbf{y}
+\tag{A.1}
+$$
+
+are Theorem 1's stationary point (PDF (40), (43)). The Gram is
+$\mathbf{R}_{\mathrm{eq}}=\mathbf{H}_2\operatorname{diag}(|\mathbf{H}_1\mathbf{s}|^2)\mathbf{H}_2^H$
+(PDF (42)). The modal expansion of the *relaxed* residual at a chosen $\mu$ is
+
+$$
+\|\mathbf{y}-\mathbf{A}\boldsymbol{\phi}^\star(\mu)\|_2^2
+=\sum_{k=1}^{N_r}\left(\frac{\mu}{\lambda_k+\mu}\right)^2|\mathbf{u}_k^H\mathbf{y}|^2 .
+\tag{A.2}
+$$
+
+This is $G(\mu)$ from Corollary 1. It equals $\mathcal{E}_{\mathrm{rel}}$ only at
+$\mu=\mu^\star$ with $h(\mu^\star)=M$ (or $\mu^\star=0$); the draft never imposes that.
+
+**§10.3 is erratum E1.** The draft sets $\mu\propto\sigma^2$, defines
+$\mathrm{SNR}_k=\lambda_k/\sigma^2$, and claims (PDF (47)–(48))
+
+$$
+\|\mathbf{y}-\mathbf{A}(\mathbf{s})\boldsymbol{\phi}\|_2^2
+\ \ge\
+\sum_{k=1}^{N_r}\frac{|\mathbf{u}_k^H\mathbf{y}|^2}{(1+\mathrm{SNR}_k)^2}.
+\tag{A.3}
+$$
+
+(A.3) is $G(\sigma^2)$. By Corollary 2 it lower-bounds $\mathcal{E}(\mathbf{s})$ if and
+only if condition (C), $h(\sigma^2)\ge M$, which fails at both ends of the
+$\kappa$ range, including $\kappa\to\infty$. The legal unconditional substitute
+is $D(\mu)$ (Corollary 1(2), PDF (19) in the corrected half): exponent $1$ and a
+$-\mu M$ penalty, not (A.3).
+
+**§10.4 is erratum E2 (and E6).** The draft's dominant eigenvalue (PDF (56))
+
+$$
+\lambda_1\approx\Big(\frac{\kappa}{\kappa+1}\Big)^2 M N_r\,|\mathbf{a}_{\mathrm{tx}}^H\mathbf{s}|^2
+\tag{A.4}
+$$
+
+matches Proposition 8. The scattered eigenvalues do not. The draft prints
+(PDF (58))
+
+$$
+\lambda_k\approx\frac{c_k M}{(\kappa+1)^2},\qquad k\ge 2,
+\qquad c_k=\mathcal{O}(1),
+\tag{A.5}
+$$
+
+dropping both the transmit-side LoS factor $\kappa$ and $\alpha^2$. Proposition 8
+replaces (A.5) by $\lambda_k=c_k\,\kappa M\alpha^2/(\kappa+1)^2=\Theta(M\alpha^2/\kappa)$.
+The displayed split (PDF (55)) also writes the scattered term as
+$\tilde{\mathbf{R}}_{\mathrm{scat}}/(\kappa+1)^2$ and drops the rank-2
+LoS$\times$NLoS cross term (erratum E6; Lemma 7).
+
+**§10.5–10.6 are the draft's final claim (errata E2, E4).** Substituting (A.4)
+and (A.5) into (A.3) gives the draft bound (PDF (60))
+
+$$
+\mathrm{MSE}_{\min}(\mathbf{s})
+\ \ge\
+\frac{|\mathbf{u}_1^H\mathbf{y}|^2}
+{\Big(1+\big(\tfrac{\kappa}{\kappa+1}\big)^2 M N_r|\mathbf{a}_{\mathrm{tx}}^H\mathbf{s}|^2\cdot\mathrm{SNR}_0\Big)^2}
++\sum_{k=2}^{N_r}
+\frac{|\mathbf{u}_k^H\mathbf{y}|^2}
+{\Big(1+\dfrac{c_k M}{(\kappa+1)^2}\cdot\mathrm{SNR}_0\Big)^2},
+\tag{A.6}
+$$
+
+with $\mathrm{SNR}_0=1/\sigma^2$. Sending $\kappa\to\infty$ inside (A.6) produces
+(PDF (61))
+
+$$
+\lim_{\kappa\to\infty}\mathrm{MSE}_{\min}(\mathbf{s})
+\ \ge\
+\sum_{k=2}^{N_r}|\mathbf{u}_k^H\mathbf{y}|^2
++\frac{|\mathbf{u}_1^H\mathbf{y}|^2}{\big(1+M N_r|\mathbf{a}_{\mathrm{tx}}^H\mathbf{s}|^2\cdot\mathrm{SNR}_0\big)^2},
+\tag{A.7}
+$$
+
+and a further limit $\mathrm{SNR}_1\to\infty$ drops the second term, leaving
+(PDF (62))
+
+$$
+\lim_{\kappa\to\infty,\;\mathrm{SNR}_1\to\infty}\mathrm{MSE}_{\min}(\mathbf{s})
+\ \ge\
+\|\mathbf{y}\|_2^2-|\mathbf{u}_1^H\mathbf{y}|^2
+=\Big\|\Big(\mathbf{I}_{N_r}-\frac{\mathbf{a}_{\mathrm{rx}}\mathbf{a}_{\mathrm{rx}}^H}{\|\mathbf{a}_{\mathrm{rx}}\|_2^2}\Big)\mathbf{y}\Big\|_2^2 .
+\tag{A.8}
+$$
+
+(A.8) is the right geometric floor, reached by an invalid route and under a
+stronger hypothesis than necessary: it drops the additive $N_r\sigma^2$ from
+Lemma 1, and it invokes $\mathrm{SNR}_1\to\infty$. The corrected statement is
+(6.3), which needs only $\kappa\to\infty$ at fixed $M,N_r,\sigma^2$ and keeps
+$N_r\sigma^2$. The finite-$\kappa$ quantitative bound to cite is Theorem 3
+(PDF Theorem 2), rate $\mathcal{O}(M\alpha/\sqrt{\kappa})$, not (A.6).
+
+---
+## 12. Experimental validation against the CIFAR RIS pipeline
+
+`§9` verifies the theorems on the paper's own synthetic model. This section
+records what the trained **image pipeline** shows when the learned bias-free layer
+`W_lin` is synthesized over the geometric 28 GHz channel of `channels.py`, and — as
+important — corrects two subtle errors in an earlier version of this experiment
+that made a finite-K "floor" look fundamental when it is not.
+
+### 12.0 The correction (read this first)
+
+An earlier run plotted a "torus optimum" that saturated at the Theorem 2 floor
+`||P_perp y||^2` at every large K and concluded "no phi, no N_m, no SNR can beat
+the floor at finite K." **That is wrong.** Two independent solvers (a per-sample
+Levenberg–Marquardt feasibility solver, `_lm_feasible_phi`, and an external check)
+show the *free-scale* synthesis residual is `~1e-12` at every finite K:
+
+| K (dB) | Adam-from-random (old curve) | LM feasibility (true free optimum) |
+|---:|---:|---:|
+| 30 | 0.83–1.0 | 2.7e-12 |
+| 40 | 0.83 | 1.0e-12 |
+| 50–70 | 0.8–1.0 | ~1e-14 |
+
+The reason is structural: at any finite K, `A(s) = H_2 diag(H_1 s)` has full row
+rank `N_r`, and the unit-modulus system `A(s) phi = c y` is wildly
+underdetermined (`M = 64` phases for `2 N_r = 16` real equations), so it is
+generically **feasible** — a torus `phi` reproduces `y` exactly, and the free scale
+`c` absorbs the amplitude. The old curve was **Adam-from-random settling into the
+strong-LoS basin**, not the optimum. Theorem 2 (exact rank-1) holds only at
+`epsilon = 0` (`K = infinity`); Theorem 3 bounds the *fixed-scale* residual, not
+the free-scale one the pipeline (with AGC) actually realizes.
+
+### 12.1 What the finite-K floor really is: a K–SNR tradeoff
+
+The exact-synthesis solution is not free — it must **null the strong LoS beam** and
+route `y` through the weak scattered path, and that costs received power. Measured,
+the cost is clean:
+
+```
+received power of the beat-the-floor solution  ≈  −(K + 10 log10 N_r) dB   relative to the LoS beam
+```
+
+(measured −38.8, −49.8 dB at K = 30, 40 dB vs the predicted 39.0, 49.0 dB). So with
+an **absolute** noise floor and nominal SNR `S` dB, the effective SNR of the
+exact-synthesis solution is `S − K − 10 log10 N_r` dB. The physical problem the
+receiver actually solves is
+
+```
+min_{phi in T^M, g}  ||y - g A(s) phi||^2 + g^2 N_r sigma^2 ,
+```
+
+— Theorem 3 bounds the first term at each fixed `g`; the second term (receiver-gain
+noise) is what makes nulling worthless. The floor therefore **binds only once
+`K ≳ S − 10 log10 N_r`**: below that, exact synthesis is both feasible and
+noise-affordable (error → 0); above it, the only affordable `phi` is the LoS beam,
+whose residual is exactly `||P_perp y||^2` (Theorem 2). This K–SNR tradeoff, not an
+unconditional floor, is the finite-K result.
+
+### 12.2 What the sweep plots
+
+`framework/cifar_minimal_dnn.py --mse_sweep` (K in **dB**, see 12.4). All curves are
+NMSE `= sum||y_t - hat y||^2 / sum||y_t||^2`, on a shared image subset:
+
+| Curve | Definition | Meaning |
+|---|---|---|
+| achieved (AGC) | post-noise, norm-matched student (decoder input) | the cosine+AGC heuristic |
+| achieved (LS) | best complex scale for the pipeline's `phi` | heuristic, best-scaled |
+| free-scale optimum | `min_{|phi|=1,c} ||y_t - c A phi||^2` via `_lm_feasible_phi` + cosine candidate | best achievable, **noiseless**: ~0 at finite K |
+| physical optimum | `min_phi [ ||y_t||^2 - |<A phi,y_t>|^2 / (||A phi||^2 + N_r sigma^2) ]`, opt-in `--mse_abs_snr` | the K–SNR tradeoff floor |
+| Thm 2 floor | `||P_perp y_t||^2`, `P_perp = I - a_rx a_rx^H / N_r` | the `K → infinity` (rank-1) limit |
+
+`a_rx` is reconstructed from the fixed geometry by
+`channels.los_rx_steering_vector` (checked: `||P_perp H_2||/||H_2|| → 0` as K grows).
+The **free-scale optimum ≈ 0 at finite K** is the honest headline: the RIS *can*
+synthesize `W_lin s`; the earlier "it can't" was an optimizer artifact. What
+actually limits it is the K–SNR tradeoff, visible only with `--mse_abs_snr`, where
+the **physical optimum** rises to the Theorem 2 floor as `K` passes
+`S − 10 log10 N_r`.
+
+> The g-scaled "Theorem 3 curve" from the earlier version was **removed**: with `g`
+> taken from the optimizer's own `phi` it was circular (a LoS-nulling `phi` has huge
+> `g`, giving 0). Theorem 3 remains correct as a *fixed-scale* statement in §5; it is
+> just not what the free-scale pipeline realizes, so it is not plotted.
+
+### 12.3 What the classification-accuracy collapse actually is
+
+The kappa accuracy sweep shows accuracy falling (e.g. 43% → 20%) as K rises. Given
+12.0–12.1, this is **not** a fundamental channel floor at those K. Two causes:
+
+1. **`_optimize_phi_gd` is 100 Adam steps from `randn`**, which lands in the
+   LoS-aligned basin — the same failure the "torus optimum" had. A stronger phi
+   solver would recover much of the mid-K regime.
+2. **`noise()` is relative** (`sigma^2 = mean|y_ris|^2 / SNR`), so nulling the beam
+   costs nothing in-simulation — the sim cannot represent the K–SNR tradeoff at all.
+   The genuine degradation only appears under an absolute noise floor
+   (`--mse_abs_snr`), and even then only for `K ≳ SNR − 10 log10 N_r`.
+
+So the honest statement is: **the RIS is fundamentally floored only in the strong-LoS
+/ low-effective-SNR corner; elsewhere the observed degradation is the phi-optimizer
+and the relative-noise model, not the channel.**
+
+### 12.4 Modeling notes / gotchas
+
+1. **K is in dB.** `make_ris_channel_pools` passes the sweep value as
+   `k_factor_h{1,2}_db`, so `50` = 50 dB = linear `K = 1e5`; the wide default is
+   `0..70 dB`. Passing a large *linear* value overflows `10**(k_db/10)`.
+2. **Scale-resolution is mandatory.** `_optimize_phi_gd` uses a scale-invariant
+   cosine loss, so only the post-AGC (or LS-scaled) student can be compared to the
+   floor.
+3. **Absolute-noise reference.** `--mse_abs_snr` fixes `sigma^2` from the pipeline's
+   mean received power at the *lowest* K in the sweep (the rich-scattering operating
+   point) and holds it constant, so the K–SNR tradeoff is a fair comparison.
+4. **Path loss is commented out** in `channels.py` (`#TODO(pl)`); it also changes the
+   accuracy/AirFC/SimNet numbers, and makes `apply_pathloss` a dead flag repo-wide
+   until restored.
+5. `||P_perp y||^2 ≈ (N_r-1)/N_r` holds only in expectation over isotropic `y`.
+6. **The plotted optima are the best of two candidate `phi`** — the LM feasibility
+   solution and the pipeline's cosine `phi` (`_torus_optimum_nmse`) — not a global
+   search, so they are *achievable* values (upper bounds on the true optima). This is
+   tight enough for the argument: the feasibility candidate drives the free-scale
+   optimum to ~0, and the two candidates bracket the physical optimum's two regimes
+   (exact-synthesis at low K, LoS-beam at high K). At finite K the physical optimum can
+   sit slightly *below* `||P_perp y||^2` because that floor is the `K -> infinity` limit.

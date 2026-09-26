@@ -42,9 +42,18 @@ python sim_plot.py 3
 
 `checkboard/wlin_checker_maxgap_sweep.py` sweeps `(grid_n, hidden)` to find the
 max with-vs-bypass accuracy gap. `test_demo.py` (`test_physical()`) runs the
-physical/metasurface eval on the older `playground/GAN /teacher.py` path —
+physical/metasurface eval on the older `playground/GAN/teacher.py` path —
 there is no pytest suite; "tests" here means physical-channel evaluation
-scripts, not unit tests.
+scripts, not unit tests. Note `test_demo.py` does `from gan.gan import *` and
+`from teacher_experiments import ...`, neither of which resolves from repo root
+as-is (the modules are `playground/GAN/gan.py` and
+`distilallation/teacher_experiments.py`) — fix the imports / `PYTHONPATH`
+before expecting it to run.
+
+```bash
+# Numerical checks for the theory/ proofs (CPU, a few minutes, seed 0)
+python theory/verify_mse_lower_bound.py
+```
 
 `CLI_interface.py` at repo root is stale/orphaned: it shells out to
 `MY_code/training.py`, `MY_code/test.py`, and `MY_code/models_dict/`, none of
@@ -61,11 +70,13 @@ The two `.cursor/rules/*.mdc` files (`architecture.mdc`, `coding-conventions.mdc
 describe file locations from an earlier layout (`teacher.py`, `teacher_train.py`,
 `test_demo.py` at top level). **These files have since moved** — the classes
 they describe (`MyTeacher`, `HeavyEncoder`, `HeavyRxDecoder`, `ThinTeacher`,
-GAN channel surrogate) now live under `playground/GAN /` (note the trailing
-space in the directory name — this is the "older image path", not the primary
-pipeline per README §5.2). `test_demo.py` and `channels.py` remain at repo
+GAN channel surrogate) now live under `playground/GAN/` — the "older image
+path", not the primary pipeline per README §5.2. (The directory used to be
+`playground/GAN ` with a trailing space; it was renamed in 61a50a5. README.md
+still uses the old spelling, and a stale `playground/GAN /` holding only
+`__pycache__` may linger locally — ignore it.) `test_demo.py` and `channels.py` remain at repo
 root. When consulting those `.mdc` rule files, mentally remap top-level
-filenames to `playground/GAN /`. `distilallation/` holds a separate,
+filenames to `playground/GAN/`. `distilallation/` holds a separate,
 currently-inactive knowledge-distillation path (`teacher_experiments.py`
 there is the origin of `_optimize_phi_gd`, vendored/copied into the active
 scripts rather than imported).
@@ -73,10 +84,11 @@ scripts rather than imported).
 The two live experiment surfaces are:
 
 - `framework/cifar_minimal_dnn.py` — main image pipeline: CNN/thin teacher →
-  bias-free `W_lin` → decoder, with `--wireless` (RIS replaces `W_lin` at
-  inference), `--airfc` (alternating-optimization baseline fitting
-  `U^H H2 diag(phi) H1 P ≈ W`, see `framework/airfc.md`), and `--simnet`
-  (end-to-end physical multi-layer RIS path) modes.
+  bias-free `W_lin` → decoder, with `--wireless`, `--airfc`, and `--simnet`
+  physical-realization modes. **See `framework/CLAUDE.md`** (directory-scoped)
+  for the pipeline architecture, flag semantics, checkpoint scheme, and the
+  wireless-vs-AirFC gotchas; `framework/airfc.md` for the AirFC solver math.
+  Every flag is documented in that script's module docstring.
 - `checkboard/wlin_necessity_checkerboard.py` — isolated 2D checkerboard
   depth-separation demo with the same wireless RIS panel, used because the
   with-vs-bypass accuracy gap is much larger and easier to reason about than
@@ -89,6 +101,14 @@ Both scripts vendor their own copy of `_optimize_phi_gd` (cosine-similarity
 loss, AGC norm-matching) rather than importing a shared module — if you fix a
 bug in the phi-optimization or AGC logic in one, check whether the same bug
 exists in the other's vendored copy.
+
+`theory/` holds the formal result behind README §7: `ris_mse_lower_bound.md`
+(proof that under pure LoS the synthesis error is floored by
+`||P_perp y||^2`, since `A(s) = H_2 diag(H_1 s)` is rank-one), with
+`theory/README.md` mapping each symbol to repo code and listing testable
+predictions (e.g. the `relF` printed by `_precompute_airfc_cache` at high
+`kappa` should sit at or above the floor). `verify_mse_lower_bound.py`
+deliberately builds its own channels instead of importing `channels.py`.
 
 `channels.py::generate_channel_tensors_by_type` is the one shared, actually
 imported channel-generation module (`geometric_ricean`, `geometric_rayleigh`,

@@ -56,6 +56,22 @@ Gap ablation (lazy encoder + tight pipe + Conv2d mid)::
 
 The RIS channel pools reuse `channels.generate_channel_tensors_by_type`.
 
+``--mse_sweep`` runs a standalone synthesis-NMSE sweep (see
+``evaluate_mse_kappa_sweep``): for each Ricean K it measures
+``NMSE = sum||y_teacher - y_student||^2 / sum||y_teacher||^2`` between the trained
+target ``y_teacher = W_lin(s)`` and the RIS output, plus the best-achievable optimum
+(``_torus_optimum_nmse``, via the ``_lm_feasible_phi`` solver) and the Theorem 2 floor
+``||P_perp y||^2``. Key result (theory §12): at any *finite* K the free-scale optimum
+is ~0 (exact synthesis is achievable; the floor binds only as K->inf); what actually
+limits the RIS is a **K-vs-SNR tradeoff**, exposed by the opt-in absolute-noise model
+``--mse_abs_snr`` (the noise-aware "physical optimum" then rises to the floor once
+``K >~ SNR - 10log10(N_r)``). **Gotchas**: (1) K is a *dB* K-factor
+(``make_ris_channel_pools`` passes it as ``k_factor_*_db``), so the wide default is
+``0..70 dB`` == linear ``K 1..1e7``; (2) the floor only bounds the *scale-resolved*
+(post-AGC) student, since ``_optimize_phi_gd`` is scale-invariant; (3) the plain torus
+optimum via Adam-from-random is an artifact (it stalls in the LoS basin) -- use the LM
+feasibility solver. geometric_ricean only (``a_rx`` via ``channels.los_rx_steering_vector``).
+
 CIFAR-10 is read from the raw pickle batches under
 `OTA_RIS/data/cifar-10-batches-py`; MNIST from IDX files under
 `OTA_RIS/data/MNIST/raw` (no torchvision dependency).
@@ -1022,7 +1038,7 @@ def make_ris_channel_pools(n_t, n_r, n_m, device, channel_type, kappa,
 
 
 def wireless_forward(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
-                     H_1_b=None, H_2_b=None):
+                     H_1_b=None, H_2_b=None, return_parts=False, abs_sigma2=None):
     """RIS-channel logits: encoder -> H_2 diag(phi) H_1 (replaces `linear`) -> decoder.
 
     Mirrors test_demo.test_physical: the encoder output `s` is transmitted, phi
@@ -1037,6 +1053,12 @@ def wireless_forward(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
 
     If `H_1_b` / `H_2_b` are provided (batch channel tensors), they are used as-is;
     otherwise channels are sampled randomly from `H_1_all` / `H_2_all`.
+
+    If `return_parts`, returns ``(logits, y_teacher, y_student, s, H_1_b, H_2_b)``
+    where ``y_teacher = intermediate(s)`` is the target, ``y_student`` is the
+    post-noise, post-AGC RIS output (what the decoder consumes), and the channel
+    batches are the ones actually used. Used by ``evaluate_wireless_mse`` to measure
+    the synthesis MSE and its theoretical floor without re-running the forward.
     """
     model.eval()
     x = x.to(device)
@@ -1054,13 +1076,24 @@ def wireless_forward(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
     phi = _optimize_phi_gd(s, y_learned, H_1_b, H_2_b, n_m, iters=phi_iters)
 
     H_1_s = torch.bmm(H_1_b, s.unsqueeze(-1)).squeeze(-1)              # (B, Nm)
-    y_ris = torch.bmm(H_2_b, (H_1_s * phi).unsqueeze(-1)).squeeze(-1)  # (B, Nr)
-    y_ris = y_ris + noise(y_ris, snr_db)
+    y_ris_raw = torch.bmm(H_2_b, (H_1_s * phi).unsqueeze(-1)).squeeze(-1)  # (B, Nr) = A phi
+    if abs_sigma2 is None:
+        # Default: pipeline's relative-SNR noise (power referenced to the received signal).
+        y_ris = y_ris_raw + noise(y_ris_raw, snr_db)
+    else:
+        # Opt-in absolute noise: fixed variance, so beam-nulling actually costs SNR.
+        w = torch.randn_like(torch.view_as_real(y_ris_raw)) * math.sqrt(float(abs_sigma2) / 2.0)
+        y_ris = y_ris_raw + torch.view_as_complex(w)
 
     # Norm-match y_ris to the target (phi was cosine-optimized -> direction only).
     y_ris = _norm_match_to_target(y_ris, y_learned)
 
-    return model.decode(y_ris)                                   # (B, num_classes)
+    logits = model.decode(y_ris)                                 # (B, num_classes)
+    if return_parts:
+        # y_ris_raw is the pre-noise, pre-AGC synthesis A phi; the AGC gain the
+        # pipeline applies is ||y_learned|| / ||y_ris_raw|| per sample.
+        return logits, y_learned, y_ris, s, H_1_b, H_2_b, y_ris_raw
+    return logits
 
 
 def _precompute_airfc_cache(model, H_1_all, H_2_all, phi_iters, debug=False):
@@ -1209,6 +1242,269 @@ def evaluate_wireless(model, x, y, H_1_all, H_2_all, snr_db, device, phi_iters,
         correct += (logits.argmax(1) == yb).sum().item()
         total += yb.size(0)
     return 100.0 * correct / max(total, 1)
+
+
+def _rx_perp_projector(n_r, device, freq_hz=DEFAULT_CARRIER_FREQ_HZ,
+                       rx_position=(10.0, 16.0, 4.0),
+                       ris_position=(0.0, 0.0, 0.0)):
+    """Complex ``(n_r, n_r)`` projector ``P_perp = I - a_rx a_rx^H`` off the Rx beam.
+
+    ``a_rx`` is the unit-norm LoS receive steering vector of H_2, reconstructed from
+    the geometric-channel geometry (``channels.los_rx_steering_vector``). Only valid
+    for ``geometric_ricean``; the pure-LoS synthesis floor is ``||P_perp y||^2``
+    (theory/ris_mse_lower_bound.md, Theorem 2). Defaults mirror
+    ``generate_channel_tensors_geometric``.
+    """
+    from channels import los_rx_steering_vector
+    a_rx = los_rx_steering_vector(
+        int(n_r), freq_hz=float(freq_hz),
+        rx_position=tuple(rx_position), ris_position=tuple(ris_position),
+    )
+    a_rx = torch.as_tensor(a_rx, dtype=torch.complex64, device=device)
+    return torch.eye(int(n_r), dtype=torch.complex64, device=device) \
+        - torch.outer(a_rx, a_rx.conj())
+
+
+@torch.no_grad()
+def evaluate_wireless_mse(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
+                          p_perp, batch_size=500, channel_indices=None,
+                          abs_sigma2=None):
+    """Achieved synthesis NMSE of the wireless RIS pipeline, plus the Thm 2 floor.
+
+    For each sample, ``y_teacher = intermediate(s)`` (target) and ``y_student`` is
+    the post-noise, post-AGC RIS output (``wireless_forward(..., return_parts=True)``);
+    ``v_raw = A(s) phi_cos`` is the noiseless synthesis for the pipeline's cosine phi.
+    Accumulates per sample:
+
+    - AGC achieved:  ``||y_teacher - y_student||^2``   (what the decoder consumes)
+    - LS achieved:   ``||y_teacher||^2 - |<v_raw,y_teacher>|^2/||v_raw||^2``  (best
+      complex scale for the pipeline's phi; scale-invariant, tighter than AGC)
+    - Thm 2 floor:   ``||P_perp y_teacher||^2``  (pure-LoS, kappa->inf range floor)
+
+    Returns ``(nmse_agc, nmse_ls, floor_thm2)`` each divided by ``sum||y_teacher||^2``.
+    ``abs_sigma2`` (opt-in): if set, ``wireless_forward`` adds noise with this ABSOLUTE
+    variance to the raw synthesis instead of the pipeline's relative SNR model, so
+    beam-nulling actually costs SNR (see ``evaluate_mse_kappa_sweep``).
+
+    NOTE: the previous "Thm 3 term" curve was dropped. Theorem 3 bounds the
+    *fixed-scale* residual, but the pipeline is free-scale (AGC); a g-scaled version
+    was circular (``g`` came from the optimizer's own phi). The meaningful finite-K
+    quantity is the noise-aware physical optimum (``_torus_optimum_nmse`` with
+    ``sigma2>0``), reported separately. See theory/ris_mse_lower_bound.md §12.
+    """
+    model.eval()
+    H_1_all = H_1_all.to(device)
+    H_2_all = H_2_all.to(device)
+    p_perp = p_perp.to(device)
+    if channel_indices is not None:
+        channel_indices = channel_indices.to(device)
+        if channel_indices.numel() != x.size(0):
+            raise ValueError(
+                f"channel_indices length ({channel_indices.numel()}) must match "
+                f"number of samples ({x.size(0)})"
+            )
+    sum_agc = sum_ls = sum_y = sum_floor = 0.0
+    for start in range(0, x.size(0), batch_size):
+        xb = x[start:start + batch_size]
+        ch_b = None if channel_indices is None else channel_indices[start:start + batch_size]
+        h1b = None if ch_b is None else H_1_all[ch_b]
+        h2b = None if ch_b is None else H_2_all[ch_b]
+        _, y_teacher, y_student, s, H_1_b, H_2_b, v_raw = wireless_forward(
+            model, xb, H_1_all, H_2_all, snr_db, device, phi_iters,
+            H_1_b=h1b, H_2_b=h2b, return_parts=True, abs_sigma2=abs_sigma2)
+        y_sq = y_teacher.abs().pow(2).sum(-1)                      # (B,)
+        sum_y += y_sq.sum().item()
+        # AGC achieved (decoder input).
+        sum_agc += (y_teacher - y_student).abs().pow(2).sum().item()
+        # LS achieved: best complex scale for the pipeline's phi.
+        v_norm_sq = v_raw.abs().pow(2).sum(-1).clamp_min(1e-12)
+        inner = (v_raw.conj() * y_teacher).sum(-1).abs().pow(2)
+        sum_ls += (y_sq - inner / v_norm_sq).clamp_min(0.0).sum().item()
+        # Thm 2 floor: ||P_perp y||^2.
+        Py = torch.einsum("rc,bc->br", p_perp, y_teacher)
+        sum_floor += Py.abs().pow(2).sum().item()
+    denom = max(sum_y, 1e-12)
+    return sum_agc / denom, sum_ls / denom, sum_floor / denom
+
+
+def _lm_feasible_phi(A, y, restarts=6, iters=400, seed=0):
+    """Unit-modulus ``phi`` making ``A phi`` parallel to ``y`` (feasibility), batched.
+
+    Adaptive per-sample Levenberg-Marquardt on ``min_{|phi|=1, c} ||A phi - c y||^2``.
+    At any finite Ricean K the underdetermined constant-modulus system (M >> 2 N_r) is
+    generically feasible, so the free-scale synthesis residual is ~0 -- this solver
+    finds it where plain Adam-from-random stalls in the LoS-aligned basin (the reason
+    the earlier "torus optimum" curve was an artifact; see theory §12). Returns
+    ``phi`` (B, M) complex128 that minimizes the free-scale residual over the restarts.
+    """
+    B, N_r, M = A.shape
+    dev = A.device
+    gen = torch.Generator(device=dev).manual_seed(int(seed))
+    y_sq = (y.conj() * y).sum(-1).real.clamp_min(1e-30)
+    eye = torch.eye(M, device=dev, dtype=torch.float64)
+    best_res = torch.full((B,), float("inf"), device=dev, dtype=torch.float64)
+    best_phi = torch.ones(B, M, device=dev, dtype=torch.complex128)
+
+    def _free_resid(v):
+        inner = (v.conj() * y).sum(-1).abs().pow(2)
+        v_sq = (v.conj() * v).sum(-1).real.clamp_min(1e-30)
+        return (y_sq - inner / v_sq).clamp_min(0.0)
+
+    def _fit_cost(theta):
+        phi = torch.exp(1j * theta.to(torch.complex128))
+        v = torch.bmm(A, phi.unsqueeze(-1)).squeeze(-1)
+        c = (y.conj() * v).sum(-1) / y_sq                 # min ||v - c y||: c = <y,v>/||y||^2
+        res = v - c.unsqueeze(-1) * y
+        return (res.conj() * res).sum(-1).real, v, res, phi
+
+    for r in range(restarts):
+        theta = 2 * math.pi * torch.rand(B, M, generator=gen, device=dev,
+                                         dtype=torch.float64)
+        lam = torch.full((B,), 1e-2, device=dev, dtype=torch.float64)
+        cost, _, _, _ = _fit_cost(theta)
+        for _ in range(iters):
+            cost, v, res, phi = _fit_cost(theta)
+            J = 1j * A * phi.unsqueeze(1)                  # (B, N_r, M)
+            Jr = torch.cat([J.real, J.imag], dim=1)        # (B, 2N_r, M)
+            rr = torch.cat([res.real, res.imag], dim=1)    # (B, 2N_r)
+            H = torch.bmm(Jr.transpose(1, 2), Jr) + lam.view(B, 1, 1) * eye
+            grad = torch.bmm(Jr.transpose(1, 2), rr.unsqueeze(-1))
+            dth = torch.linalg.solve(H, grad).squeeze(-1)
+            theta_new = theta - dth
+            cost_new, _, _, _ = _fit_cost(theta_new)
+            better = cost_new < cost
+            theta = torch.where(better.unsqueeze(-1), theta_new, theta)
+            lam = torch.where(better, (lam * 0.5).clamp_min(1e-10),
+                              (lam * 3.0).clamp_max(1e6))
+        phi = torch.exp(1j * theta.to(torch.complex128))
+        v = torch.bmm(A, phi.unsqueeze(-1)).squeeze(-1)
+        res = _free_resid(v)
+        take = res < best_res
+        best_res = torch.where(take, res, best_res)
+        best_phi = torch.where(take.unsqueeze(-1), phi, best_phi)
+    return best_phi
+
+
+@torch.no_grad()
+def _torus_optimum_nmse(model, x, H_1_all, H_2_all, device, phi_iters,
+                        channel_indices, sigma2=0.0):
+    """Best-achievable synthesis NMSE over unit-modulus phi (per-image, subset).
+
+    Returns ``(free_opt, phys_opt)`` aggregate NMSE:
+
+    - ``free_opt`` = ``min_{|phi|=1} min_c ||y - c A phi||^2 / ||y||^2`` (free scale,
+      noiseless). At finite K this is ~0 (exact synthesis is achievable); it rises to
+      the Theorem 2 floor only as K->inf. Computed as the best over two candidate phi:
+      the LM feasibility solution (``_lm_feasible_phi``) and the pipeline's cosine phi
+      (``_optimize_phi_gd``, the LoS-beam basin) -- covering both regimes robustly so
+      the curve is not an optimizer artifact.
+    - ``phys_opt`` (only if ``sigma2>0``, else NaN) = the noise-aware optimum
+      ``min_phi [ ||y||^2 - |<A phi,y>|^2 / (||A phi||^2 + N_r sigma2) ] / ||y||^2``,
+      i.e. the best over phi with the optimal receiver (Wiener) gain folded in and an
+      ABSOLUTE noise variance ``sigma2``. This is the physically meaningful floor: at
+      high K the exact-synthesis phi must null the LoS beam, so ``||A phi||^2`` collapses
+      (cost ~ K + 10log10(N_r) dB) and noise dominates, driving ``phys_opt`` to the
+      Theorem 2 floor -- the K-vs-SNR tradeoff of theory §12. Same two candidate phi.
+    """
+    model.eval()
+    H_1_all = H_1_all.to(device)
+    H_2_all = H_2_all.to(device)
+    ch = channel_indices.to(device)
+    _, y_teacher, _, s, H_1_b, H_2_b, v_cos = wireless_forward(
+        model, x, H_1_all, H_2_all, 200.0, device, phi_iters,
+        H_1_b=H_1_all[ch], H_2_b=H_2_all[ch], return_parts=True)
+    y = y_teacher.detach().to(torch.complex128)                   # (B, Nr)
+    H_1_s = torch.bmm(H_1_b, s.unsqueeze(-1)).squeeze(-1)
+    A = (H_2_b * H_1_s.unsqueeze(1)).detach().to(torch.complex128)  # (B, Nr, Nm)
+    N_r = A.size(1)
+    y_sq = y.abs().pow(2).sum(-1)                                 # (B,)
+    # Candidate phi: LM feasibility (exact-synthesis basin) + pipeline cosine (beam).
+    phi_lm = _lm_feasible_phi(A, y)
+    v_lm = torch.bmm(A, phi_lm.unsqueeze(-1)).squeeze(-1)
+    v_cos = v_cos.detach().to(torch.complex128)
+    cands = [v_lm, v_cos]
+
+    def _resid(v, s2):
+        inner = (v.conj() * y).sum(-1).abs().pow(2)
+        denom = (v.conj() * v).sum(-1).real + N_r * float(s2)
+        return (y_sq - inner / denom.clamp_min(1e-30)).clamp_min(0.0)
+
+    free = torch.stack([_resid(v, 0.0) for v in cands], 0).min(0).values
+    free_opt = float(free.sum().item()) / float(y_sq.sum().clamp_min(1e-30).item())
+    phys_opt = float("nan")
+    if sigma2 and sigma2 > 0:
+        phys = torch.stack([_resid(v, sigma2) for v in cands], 0).min(0).values
+        phys_opt = float(phys.sum().item()) / float(y_sq.sum().clamp_min(1e-30).item())
+    return free_opt, phys_opt
+
+
+@torch.no_grad()
+def evaluate_mse_kappa_sweep(model, x_te, device, snr_db, phi_iters, num_channels,
+                             kappas, n_m, p_perp, opt_subset=16, inter_label="RIS",
+                             abs_snr=None):
+    """Synthesis-NMSE vs Ricean K (dB) for the wireless RIS path vs the theory floors.
+
+    Decoupled from the accuracy kappa sweep. For each K builds a geometric_ricean
+    wireless pool and reports ``(kappa, nmse_agc, nmse_ls, free_opt, phys_opt,
+    floor_thm2)`` (all NMSE). ``free_opt``/``phys_opt`` are per-image optima on
+    ``opt_subset`` images (NaN if ``opt_subset<=0``); ``phys_opt`` is NaN unless
+    ``abs_snr`` is set.
+
+    ``abs_snr`` (opt-in, dB): switches on the absolute-noise model. The reference
+    power is fixed once as the pipeline's mean received power at the LOWEST K in the
+    sweep (the rich-scattering operating point); ``sigma2 = P_ref / (N_r * 10^(abs_snr/10))``
+    is then held constant across K, so nulling the LoS beam at high K costs SNR and the
+    K-vs-SNR tradeoff (theory §12) becomes visible. Without it, the noise stays the
+    pipeline's relative-SNR model and ``phys_opt`` is not computed.
+    """
+    use_opt = bool(opt_subset) and int(opt_subset) > 0
+    if use_opt:
+        k = min(int(opt_subset), x_te.size(0))
+        x_eval = x_te[:k]
+        print(f"  (all curves evaluated on the same {k}-image subset)")
+    else:
+        x_eval = x_te
+    kappas = [float(kv) for kv in kappas]
+
+    # Absolute-noise reference: fix sigma2 from the received power at the lowest K.
+    abs_sigma2 = None
+    if abs_snr is not None:
+        k_ref = min(kappas)
+        H1r, H2r = make_ris_channel_pools(
+            model.n_t, model.n_r, n_m, device, "geometric_ricean", k_ref,
+            num_channels=num_channels, apply_pathloss=True)
+        ch_r = torch.randint(0, H1r.size(0), (x_eval.size(0),), device=device)
+        _, _, _, _, _, _, v_ref = wireless_forward(
+            model, x_eval, H1r, H2r, snr_db, device, phi_iters,
+            H_1_b=H1r[ch_r], H_2_b=H2r[ch_r], return_parts=True)
+        p_ref = float(v_ref.abs().pow(2).sum(-1).mean().item())     # mean ||A phi_cos||^2
+        abs_sigma2 = p_ref / (model.n_r * 10.0 ** (float(abs_snr) / 10.0))
+        print(f"  [abs-noise] ref K={k_ref:g} dB  P_ref={p_ref:.3e}  "
+              f"sigma^2={abs_sigma2:.3e}  (abs_snr={abs_snr:g} dB)")
+
+    results = []
+    for kappa in kappas:
+        print(f"\n=== MSE sweep | kappa={kappa:g} (dB) | channel=geometric_ricean | "
+              f"N_m={n_m}{' | abs-noise' if abs_sigma2 else ''} ===")
+        H_1_all, H_2_all = make_ris_channel_pools(
+            model.n_t, model.n_r, n_m, device, "geometric_ricean", kappa,
+            num_channels=num_channels, apply_pathloss=True,
+        )
+        ch = torch.randint(0, H_1_all.size(0), (x_eval.size(0),), device=device)
+        agc, ls, t2 = evaluate_wireless_mse(
+            model, x_eval, H_1_all, H_2_all, snr_db, device, phi_iters, p_perp,
+            channel_indices=ch, abs_sigma2=abs_sigma2)
+        free_opt = phys_opt = float("nan")
+        if use_opt:
+            free_opt, phys_opt = _torus_optimum_nmse(
+                model, x_eval, H_1_all, H_2_all, device, phi_iters, ch,
+                sigma2=(abs_sigma2 or 0.0))
+        def _f(v):
+            return f"{v:.3e}" if not math.isnan(v) else "n/a"
+        print(f"  NMSE(AGC)={agc:.3e} | NMSE(LS)={ls:.3e} | free_opt={_f(free_opt)} | "
+              f"phys_opt={_f(phys_opt)} | floorT2={t2:.3e}")
+        results.append((kappa, agc, ls, free_opt, phys_opt, t2))
+    return results
 
 
 @torch.no_grad()
@@ -2061,6 +2357,68 @@ def plot_simnet_kappa_sweep(kappas, simnet_accs, path=None, snr_db=None):
     _show_or_close_plot(plt, fig, path)
 
 
+def plot_kappa_sweep_mse(kappas, nmse_agc, nmse_ls, free_opt, phys_opt, floor_thm2,
+                         path=None, snr_db=None, inter_label="RIS", abs_snr=None):
+    """Plot synthesis NMSE vs Ricean K (dB) against the theory floor.
+
+    Curves (all NMSE, normalized by ``sum||y||^2``, log-y):
+      - achieved AGC / LS (the cosine+AGC pipeline heuristic),
+      - physical optimum (green; only with absolute noise ``--mse_abs_snr``): the
+        noise-aware best, which rises to the floor because beam-nulling costs SNR --
+        the K-vs-SNR tradeoff (theory §12),
+      - Theorem 2 pure-LoS floor ``||P_perp y||^2`` (the K->inf / rank-1 limit).
+
+    The free-scale (noiseless) optimum is ~0 at every finite K, so it is kept in the
+    table/npz but NOT plotted (a flat low line adds nothing). x-axis is the K-factor in
+    dB (already log in linear K; increasing LoS to the right).
+    """
+    plt = _matplotlib_pyplot()
+    x_values = np.asarray(kappas, dtype=np.float64)   # kappa is a dB K-factor here
+    order = np.argsort(x_values)
+    x_values = x_values[order]
+
+    def _o(a):
+        return np.asarray(a, dtype=np.float64)[order]
+
+    nmse_agc = _o(nmse_agc)
+    nmse_ls = _o(nmse_ls)
+    free_opt = _o(free_opt)
+    phys_opt = _o(phys_opt)
+    floor_thm2 = _o(floor_thm2)
+    _FLOOR = 1e-13  # display clamp for the log axis
+
+    fig, ax = plt.subplots(figsize=(7.5, 4.5))
+    ax.plot(x_values, nmse_agc, marker="o", color="C0",
+            label=f"{inter_label} achieved (AGC)")
+    ax.plot(x_values, nmse_ls, marker="s", color="C1",
+            label=f"{inter_label} achieved (LS scale)")
+    # The free-scale (noiseless) optimum is ~0 at every finite K; it is recorded in
+    # the table/npz but not plotted (a flat low line is uninformative). The plotted
+    # optimum is the physical, noise-aware one (the K-vs-SNR tradeoff), in green.
+    if np.isfinite(phys_opt).any():
+        m = np.isfinite(phys_opt)
+        lbl = "physical optimum" + (f" (abs SNR={abs_snr:g} dB)" if abs_snr is not None else "")
+        ax.plot(x_values[m], np.clip(phys_opt[m], _FLOOR, None), marker="^",
+                color="C2", label=lbl)
+    ax.plot(x_values, floor_thm2, color="k", linestyle="--",
+            label=r"Thm 2 floor $\|P^\perp y\|^2$ ($K\to\infty$)")
+    ax.set_yscale("log")
+    ax.set_xlabel(r"Ricean $K$-factor $\kappa$ (dB)  (more LoS $\rightarrow$)")
+    ax.set_ylabel(r"NMSE $= \sum\|y_{\rm t}-\hat y\|^2 / \sum\|y_{\rm t}\|^2$")
+    title = "RIS synthesis NMSE vs theoretical floor"
+    if snr_db is not None:
+        title += rf" (SNR={snr_db:g} dB)"
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3, which="both")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    if path is not None:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fig.savefig(path, dpi=120, bbox_inches="tight")
+        print(f"  saved kappa-sweep NMSE plot to: {path}")
+    _show_or_close_plot(plt, fig, path)
+
+
 def plot_kappa_sweep(kappas, teacher_acc, ris_accs=None, path=None,
                      simnet_accs=None, airfc_accs=None, snr_db=None,
                      inter_label="RIS", simnet_series=None):
@@ -2449,7 +2807,8 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
              mid_bn=DEFAULT_MID_BN,
              dataset=DEFAULT_DATASET,
              data_dir=None,
-             airfc_debug=False):
+             airfc_debug=False, mse_sweep=None, mse_opt_subset=16,
+             mse_abs_snr=None):
     """Train (or load) the teacher net and return (test_acc, wireless_acc, simnet_acc).
 
     When `load_only=True`, skip training and load a saved checkpoint from
@@ -2788,6 +3147,61 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
                 airfc_accs=airfc_accs, snr_db=snr_db, inter_label=inter_name,
                 simnet_series=simnet_series,
             )
+
+    if mse_sweep is not None and wireless:
+        # Standalone synthesis-NMSE sweep (decoupled kappa range from --kappa_sweep):
+        # the theory floor only binds at high kappa, so this uses its own wide list.
+        inter_name = {
+            "linear": "Linear", "cnn": "CNN", "relu": "ReLU", "none": "None",
+        }.get(intermediate, intermediate)
+        p_perp = _rx_perp_projector(model.n_r, device, freq_hz=carrier_freq_hz)
+        print(
+            f"\n=== MSE sweep ({inter_name} RIS) | N_m={n_m} | "
+            f"opt_subset={mse_opt_subset}"
+            f"{f' | abs_snr={mse_abs_snr:g}dB' if mse_abs_snr is not None else ''} ==="
+        )
+        mse_results = evaluate_mse_kappa_sweep(
+            model, x_te, device, snr_db, phi_iters, num_channels_test,
+            mse_sweep, n_m, p_perp, opt_subset=mse_opt_subset,
+            inter_label=inter_name, abs_snr=mse_abs_snr,
+        )
+        print("\n   " + " | ".join(
+            f"{h:>11}" for h in
+            ["kappa", "NMSE(AGC)", "NMSE(LS)", "free_opt", "phys_opt", "floorT2"]))
+        for kv, agc, ls, fo, po, t2 in mse_results:
+            def _c(v):
+                return f"{v:11.3e}" if not math.isnan(v) else f"{'n/a':>11}"
+            print("   " + " | ".join([
+                f"{kv:11g}", f"{agc:11.3e}", f"{ls:11.3e}", _c(fo), _c(po),
+                f"{t2:11.3e}"]))
+        if make_plots:
+            mse_kappas = [r[0] for r in mse_results]
+            mse_plot_path = (
+                os.path.join(
+                    plot_dir,
+                    f"cifar_wl_nt{n_t}_nr{n_r}_epochs{n_epochs}_kappa_sweep_mse.png",
+                )
+                if save_plot_files else None
+            )
+            plot_kappa_sweep_mse(
+                mse_kappas,
+                [r[1] for r in mse_results], [r[2] for r in mse_results],
+                [r[3] for r in mse_results], [r[4] for r in mse_results],
+                [r[5] for r in mse_results], path=mse_plot_path,
+                snr_db=snr_db, inter_label=inter_name, abs_snr=mse_abs_snr,
+            )
+            if mse_plot_path is not None:
+                npz_path = mse_plot_path[:-len(".png")] + ".npz"
+                np.savez(
+                    npz_path,
+                    kappa=np.asarray(mse_kappas, dtype=np.float64),
+                    nmse_agc=np.asarray([r[1] for r in mse_results]),
+                    nmse_ls=np.asarray([r[2] for r in mse_results]),
+                    free_opt=np.asarray([r[3] for r in mse_results]),
+                    phys_opt=np.asarray([r[4] for r in mse_results]),
+                    floor_thm2=np.asarray([r[5] for r in mse_results]),
+                )
+                print(f"  saved MSE-sweep arrays to: {npz_path}")
 
     if snr_sweep is not None:
         do_wireless_sweep = bool(wireless)
@@ -3367,6 +3781,25 @@ if __name__ == "__main__":
                         choices=["true", "false"],
                         help="Print one-batch AirFC AO fit diagnostics "
                              "(relF over iters, norms; default true)")
+    parser.add_argument("--mse_sweep", type=str, nargs="?", const="auto",
+                        default=None,
+                        help="With --wireless, run a standalone synthesis-NMSE vs "
+                             "kappa sweep: achieved (AGC + LS scale), the free-scale "
+                             "optimum (LM feasibility; ~0 at finite K), and the Thm 2 "
+                             "floor ||P_perp y||^2 (K->inf). Add --mse_abs_snr for the "
+                             "physical-optimum K-vs-SNR curve. kappa is a dB K-factor; "
+                             "pass a comma list (dB) or bare/'auto' for a wide default "
+                             "(0..70 dB == linear K 1..1e7). geometric_ricean only; "
+                             "most meaningful with --inter linear (default off)")
+    parser.add_argument("--mse_opt_subset", type=int, default=16,
+                        help="Images used for the per-image optimum curves in "
+                             "--mse_sweep (0 disables them; default 16)")
+    parser.add_argument("--mse_abs_snr", type=float, default=None,
+                        help="Opt-in absolute-noise model for --mse_sweep (dB). Fixes "
+                             "sigma^2 from the received power at the lowest K, so "
+                             "nulling the LoS beam costs SNR and the physical-optimum "
+                             "curve (K-vs-SNR tradeoff) appears. Omitted => the "
+                             "pipeline's relative-SNR noise, no physical-optimum curve.")
     parser.add_argument("--compare_teachers", type=str, default="false",
                         choices=["true", "false"],
                         help="Load the cnn + linear teachers and compare clean / "
@@ -3459,6 +3892,17 @@ if __name__ == "__main__":
     wireless = args.wireless == "true"
     airfc = args.airfc == "true"
     airfc_debug = args.airfc_debug == "true"
+    _mse_arg = args.mse_sweep
+    if isinstance(_mse_arg, str) and _mse_arg.strip().lower() in ("true", "yes", "on"):
+        _mse_arg = "auto"          # accept `--mse_sweep true` as the wide default
+    elif isinstance(_mse_arg, str) and _mse_arg.strip().lower() in ("false", "off", "no"):
+        _mse_arg = None
+    # kappa is a dB K-factor here (see make_ris_channel_pools), so the wide default
+    # spans 0..70 dB == linear K 1..1e7 (the theory floor binds at the high-dB end).
+    mse_sweep = parse_sweep_values(
+        _mse_arg, float,
+        auto_values=(0.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 40.0, 50.0, 60.0, 70.0),
+    )
     compare_teachers = args.compare_teachers == "true"
     compare_e2e = args.compare_e2e == "true"
     intermediate = normalize_intermediate(args.inter)
@@ -3618,7 +4062,8 @@ if __name__ == "__main__":
             encoder_depth=encoder_depth,
             mid_bn=mid_bn,
             dataset=dataset,
-            airfc_debug=airfc_debug,
+            airfc_debug=airfc_debug, mse_sweep=mse_sweep,
+            mse_opt_subset=args.mse_opt_subset, mse_abs_snr=args.mse_abs_snr,
         )
         if wireless_acc is not None:
             print(f"wireless acc : {wireless_acc:.2f}%")

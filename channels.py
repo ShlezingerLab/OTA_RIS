@@ -178,9 +178,16 @@ def _mimo_geometric_channel(
     else:
         raise ValueError(f"Unexpected rx_antenna_type '{rx_antenna_type}'")
 
-    dist = float(np.linalg.norm(np.asarray(tx_position, dtype=float) - np.asarray(rx_position, dtype=float)))
-    pl = _pathloss_power_linear(dist, wavelength, pathloss_exponent, extra_attenuation_db, pathloss_gain_db)
-    scale = math.sqrt(pl) if apply_pathloss else 1.0
+    #TODO(pl): path loss temporarily commented out so the channel stays O(1)-scaled
+    # (matches the theory model; keeps ||P_perp A|| meaningful for the MSE-bound
+    # experiment). This is the ONE non-orthogonal change vs the old pipeline: it also
+    # shifts the accuracy/AirFC/SimNet numbers. Restore the three lines below (and
+    # delete `scale = 1.0`) to re-enable path loss. Decide how PL should interact
+    # with the digital target scale before restoring.
+    # dist = float(np.linalg.norm(np.asarray(tx_position, dtype=float) - np.asarray(rx_position, dtype=float)))
+    # pl = _pathloss_power_linear(dist, wavelength, pathloss_exponent, extra_attenuation_db, pathloss_gain_db)
+    # scale = math.sqrt(pl) if apply_pathloss else 1.0
+    scale = 1.0  #TODO(pl): remove when the three lines above are restored
 
     fading = str(fading).lower()
     nlos = _complex_standard_normal((int(n_tx_antennas), int(n_rx_antennas)), rng)
@@ -349,6 +356,34 @@ def generate_channel_tensors_by_type(
             apply_pathloss=bool(apply_pathloss),
         )
     raise ValueError(f"Unsupported channel_type '{channel_type}'")
+
+def los_rx_steering_vector(
+    N_r: int,
+    *,
+    freq_hz: float = 28e9,
+    rx_position: tuple[float, float, float] = (10.0, 16.0, 4.0),
+    ris_position: tuple[float, float, float] = (0.0, 0.0, 0.0),
+) -> np.ndarray:
+    """Unit-norm LoS receive steering vector ``a_rx`` of the RIS->Rx channel H_2.
+
+    For ``geometric_ricean``, the LoS part of H_2 is
+    ``sqrt(K/(K+1)) * scale * sqrt(N_m N_r) * outer(rx_sv, tx_sv.conj())``
+    (see ``_mimo_geometric_channel``), so H_2's receive-side column space is
+    ``span{rx_sv}``. This returns that ``rx_sv`` — the ULA response at the Rx for
+    the RIS->Rx ray — normalized to unit norm, matching how ``_mimo_geometric_channel``
+    builds it (same geometry, ``elem_spacing = lam/2``, ``lam = c / freq_hz``).
+
+    The theory's ``a_rx`` has ``||a_rx||^2 = N_r``; with the unit-norm vector here,
+    ``P_perp = I - a_rx a_rx^H / N_r`` reduces exactly to ``I - rx_sv rx_sv^H``.
+    Only meaningful for the geometric Ricean model (the synthetic model uses an
+    all-ones LoS, not a steering vector).
+    """
+    lam = float(_C_LIGHT / float(freq_hz))
+    elem_spacing = lam / 2.0
+    rx_pos = np.asarray(rx_position, dtype=float)
+    ris_pos = np.asarray(ris_position, dtype=float)
+    # Matches the H_2 call: rx_resp(rx_position, tx_position=ris_position, ...).
+    return _ULA_steering_vector(rx_pos, ris_pos, int(N_r), elem_spacing, lam, True)
 
 # --- Original channels.py classes ---
 
