@@ -1,0 +1,151 @@
+% Requires: amsmath, amssymb, booktabs. Compiles standalone inside any article-class document.
+% Symbols follow theory/ris_mse_lower_bound.md and theory/experiment_section.tex;
+% code references are to framework/cifar_minimal_dnn.py.
+% Numerical table reproduced by theory/verify_nm_synthesis_bound.py (seed 0).
+
+\section{An achievability bound: synthesis NMSE decays as $N_r/N_m$ in rich scattering}
+\label{sec:nm-bound}
+
+\subsection{Setting and claim}
+
+We keep the model of \eqref{eq:model}: for a fixed image the RIS realizes
+$\mathbf{v}=\mathbf{A}(\mathbf{s})\boldsymbol{\phi}=\mathbf{H}_2\operatorname{diag}(\mathbf{H}_1\mathbf{s})\boldsymbol{\phi}
+=\sum_{m=1}^{N_m} a_m e^{j\theta_m}\mathbf{u}_m$,
+where $\mathbf{u}_m\triangleq(\mathbf{H}_2)_{:,m}\in\mathbb{C}^{N_r}$ is the $m$-th RIS--Rx column,
+$a_m\triangleq|(\mathbf{H}_1\mathbf{s})_m|\ge0$ its fixed magnitude, and $\theta_m$ the free phase
+($|\phi_m|=1$). The target $\mathbf{y}=\mathbf{W}_{\mathrm{lin}}\mathbf{s}$ is the digital latent, and is
+\emph{independent} of the physical RIS--Rx channel $\mathbf{H}_2$. As in
+\eqref{eq:wiener}--\eqref{eq:phys} the receiver applies the optimal complex gain, so the noiseless
+($\sigma^2=0$) free-scale synthesis error of a given $\boldsymbol{\phi}$ is the squared sine of the
+angle between $\mathbf{y}$ and $\mathbf{v}$:
+\begin{equation}
+  \mathrm{NMSE}(\boldsymbol{\phi})
+  =\min_{g\in\mathbb{C}}\frac{\|\mathbf{y}-g\mathbf{v}\|_2^2}{\|\mathbf{y}\|_2^2}
+  =1-\frac{|\langle\mathbf{y},\mathbf{v}\rangle|^2}{\|\mathbf{y}\|_2^2\,\|\mathbf{v}\|_2^2}
+  =\frac{E_\perp}{\|\mathbf{v}\|_2^2},
+  \label{eq:nmse-angle}
+\end{equation}
+with $P\triangleq\langle\mathbf{y},\mathbf{v}\rangle/\|\mathbf{y}\|_2$ the component of $\mathbf{v}$ along
+$\mathbf{y}$ and $E_\perp\triangleq\|\mathbf{v}\|_2^2-P^2$ the energy orthogonal to $\mathbf{y}$. This is
+the free-scale optimum \texttt{free\_opt} of \texttt{\_torus\_optimum\_nmse}.
+
+Section~\ref{sec:phys-opt} showed that as $K\to\infty$ this floors at
+\eqref{eq:floor} regardless of $N_m$ (Theorem~2, rank-one collapse). The
+result below is the \emph{complementary} regime: away from strong LoS
+(Rayleigh / low or negative Rician $K$, where $\mathbf{A}(\mathbf{s})$ is well conditioned)
+the error is not floored --- it decays with the number of RIS elements.
+
+\medskip
+\noindent\textbf{Proposition 1 (rich-scattering achievability).}
+\emph{Model the RIS--Rx columns as i.i.d.\ $\mathbf{u}_m\sim\mathcal{CN}(\mathbf{0},\tau^2\mathbf{I}_{N_r})$
+and the magnitudes $a_m$ as i.i.d.\ with mean $\alpha_1=\mathbb{E}[a_m]$ and second moment
+$\alpha_2=\mathbb{E}[a_m^2]$, independent of $\mathbf{y}$. Then the optimal free-scale synthesis error
+obeys, with high probability,}
+\begin{equation}
+  \boxed{\;
+  \min_{|\phi_m|=1}\mathrm{NMSE}(\boldsymbol{\phi})
+  \;\le\;\mathrm{NMSE}_{\mathrm{matched}}
+  \;\xrightarrow[N_m\to\infty]{}\;
+  \frac{1}{N_m}\left(\frac{4\alpha_2}{\pi\alpha_1^2}\,N_r-1\right)+o\!\left(\tfrac1{N_m}\right).
+  \;}
+  \label{eq:prop}
+\end{equation}
+\emph{In the Rayleigh case $h_m=(\mathbf{H}_1\mathbf{s})_m\sim\mathcal{CN}(0,\beta^2)$ one has
+$\alpha_1^2=\beta^2\pi/4$, $\alpha_2=\beta^2$, so $4\alpha_2/(\pi\alpha_1^2)=16/\pi^2\approx1.62$ and}
+\begin{equation}
+  \min_{|\phi_m|=1}\mathrm{NMSE}(\boldsymbol{\phi})\;\lesssim\;\frac{1.62\,N_r-1}{N_m}.
+  \label{eq:rayleigh}
+\end{equation}
+\emph{Consequently, for any $\varepsilon>0$ it suffices to take
+$N_m\gtrsim (4\alpha_2/\pi\alpha_1^2)N_r/\varepsilon$ to guarantee synthesis NMSE $\le\varepsilon$.}
+
+\subsection{Proof}
+
+The optimum over the torus is upper-bounded by any feasible $\boldsymbol{\phi}$; take the
+matched (maximum-ratio) phases $e^{j\theta_m}=\overline{\mathbf{y}^{H}\mathbf{u}_m}/|\mathbf{y}^{H}\mathbf{u}_m|$,
+which make every term add coherently along $\mathbf{y}$. Write
+$\mathbf{X}_m\triangleq a_m e^{j\theta_m}\mathbf{u}_m$; the $\mathbf{X}_m$ are independent across $m$.
+
+\paragraph{Signal component.} With $\mathbf{y}^{H}\mathbf{u}_m\sim\mathcal{CN}(0,\|\mathbf{y}\|^2\tau^2)$
+its modulus is Rayleigh with $\mathbb{E}|\mathbf{y}^{H}\mathbf{u}_m|=\|\mathbf{y}\|\tau\sqrt{\pi}/2$, so
+\begin{equation}
+  \mathbb{E}[P]=\frac{1}{\|\mathbf{y}\|}\sum_{m}\mathbb{E}[a_m]\,\mathbb{E}|\mathbf{y}^{H}\mathbf{u}_m|
+  =N_m\,\alpha_1\tau\frac{\sqrt{\pi}}{2},
+  \qquad (\mathbb{E}P)^2=N_m^2\,\alpha_1^2\tau^2\frac{\pi}{4}.
+  \label{eq:signal}
+\end{equation}
+By symmetry the phase alignment only affects the $\mathbf{y}$-direction, so
+$\mathbb{E}[\mathbf{X}_m]=\boldsymbol{\mu}=(\alpha_1\tau\sqrt{\pi}/2)\,\hat{\mathbf{y}}$
+with $\hat{\mathbf{y}}=\mathbf{y}/\|\mathbf{y}\|$, and $\|\boldsymbol{\mu}\|^2=\alpha_1^2\tau^2\pi/4$.
+
+\paragraph{Orthogonal component.} Using
+$\mathbb{E}\|\sum_m\mathbf{X}_m\|^2=\|\sum_m\mathbb{E}\mathbf{X}_m\|^2+\sum_m(\mathbb{E}\|\mathbf{X}_m\|^2-\|\mathbb{E}\mathbf{X}_m\|^2)$
+and $\mathbb{E}\|\mathbf{X}_m\|^2=\mathbb{E}[a_m^2]\,\mathbb{E}\|\mathbf{u}_m\|^2=\alpha_2 N_r\tau^2$,
+\begin{equation}
+  \mathbb{E}\|\mathbf{v}\|^2=\underbrace{N_m^2\alpha_1^2\tau^2\tfrac{\pi}{4}}_{(\mathbb{E}P)^2}
+  +\;N_m\big(\alpha_2 N_r\tau^2-\alpha_1^2\tau^2\tfrac{\pi}{4}\big),
+  \qquad
+  \mathbb{E}[E_\perp]=N_m\tau^2\big(\alpha_2 N_r-\alpha_1^2\tfrac{\pi}{4}\big).
+  \label{eq:eperp}
+\end{equation}
+The orthogonal energy grows as $\Theta(N_m N_r)$ because the components of the $\mathbf{X}_m$
+transverse to $\mathbf{y}$ have unaligned phases and add \emph{incoherently}, whereas the signal grows
+as $\Theta(N_m^2)$ because it adds \emph{coherently}. Both $P$ and $E_\perp$ are sums of $N_m$
+independent terms with sub-exponential tails, so they concentrate about their means with relative
+fluctuation $O(1/\sqrt{N_m})$ (Bernstein). Substituting \eqref{eq:signal}--\eqref{eq:eperp} into
+\eqref{eq:nmse-angle},
+\begin{equation}
+  \mathrm{NMSE}_{\mathrm{matched}}=\frac{E_\perp}{\|\mathbf{v}\|^2}
+  \approx\frac{N_m\tau^2(\alpha_2 N_r-\alpha_1^2\pi/4)}
+  {N_m^2\alpha_1^2\tau^2\pi/4+N_m\tau^2(\alpha_2 N_r-\alpha_1^2\pi/4)}
+  =\frac{4\alpha_2 N_r/(\pi\alpha_1^2)-1}{N_m+4\alpha_2 N_r/(\pi\alpha_1^2)-1},
+  \label{eq:exact-frac}
+\end{equation}
+which gives \eqref{eq:prop} for $N_m\gg N_r$. \hfill$\square$
+
+\paragraph{Remarks.}
+\begin{enumerate}
+  \item \textbf{This is only an envelope.} Matched phases align $\mathbf{v}$ with $\mathbf{y}$ but do not
+    suppress $E_\perp$; the true optimum decays \emph{faster}. Once $N_m\gtrsim 2N_r$ the constant-modulus
+    system $\mathbf{A}(\mathbf{s})\boldsymbol{\phi}=c\,\mathbf{y}$ ($N_m$ phases against $2N_r$ real equations)
+    is generically feasible, so $\min_{\boldsymbol{\phi}}\mathrm{NMSE}\to0$ down to numerical precision ---
+    the $\sim\!10^{-12}$ \texttt{free\_opt} reported by \texttt{\_torus\_optimum\_nmse}. Equation
+    \eqref{eq:rayleigh} is the always-valid $O(N_r/N_m)$ upper bound, not a tight rate.
+  \item \textbf{Regime.} The bound needs $\mathbf{A}(\mathbf{s})$ well conditioned, i.e.\ Rayleigh or
+    low/negative Rician $K$ (\texttt{geometric\_rayleigh}, or small \texttt{--kappa}). Under strong LoS
+    it is superseded by the rank-one floor \eqref{eq:floor}: increasing $N_m$ cannot beat Theorem~2.
+    The two results bracket the behaviour --- decay in $N_m$ at finite $K$ (this note), a floor
+    independent of $N_m$ as $K\to\infty$ (Section~\ref{sec:phys-opt}).
+  \item \textbf{Noise.} \eqref{eq:rayleigh} bounds the noiseless free-scale error. Under an absolute noise
+    floor $\sigma^2$ the extra $N_r\sigma^2$ term of \eqref{eq:wiener} and the $K$--SNR tradeoff of
+    Section~\ref{sec:phys-opt} cap the improvement; the $N_m$ array gain still helps but does not remove
+    the floor.
+\end{enumerate}
+
+\subsection{Numerical check}
+
+Table~\ref{tab:nm} evaluates the matched-phase NMSE \eqref{eq:nmse-angle} against the prediction
+\eqref{eq:rayleigh} in the Rayleigh model ($N_r=8$, $400$ Monte-Carlo trials, seed $0$;
+\texttt{theory/verify\_nm\_synthesis\_bound.py}). The empirical error halves for every doubling of
+$N_m$ --- the $1/N_m$ law --- and stays below the closed-form curve (ratio $<1$), as required of an
+upper bound; the $\approx\!10\%$ gap is the finite-$N_m$ correction $\mathbb{E}[P^2]$ vs.\ $(\mathbb{E}P)^2$
+dropped in \eqref{eq:exact-frac}.
+
+\begin{table}[t]
+  \centering
+  \caption{Matched-phase synthesis NMSE vs.\ the prediction $(1.62\,N_r-1)/N_m$, Rayleigh model, $N_r=8$.}
+  \label{tab:nm}
+  \begin{tabular}{rccc}
+    \toprule
+    $N_m$ & empirical NMSE & predicted $(1.62N_r-1)/N_m$ & ratio \\
+    \midrule
+    16   & $4.04\times10^{-1}$ & $7.48\times10^{-1}$ & $0.54$ \\
+    32   & $2.65\times10^{-1}$ & $3.74\times10^{-1}$ & $0.71$ \\
+    64   & $1.53\times10^{-1}$ & $1.87\times10^{-1}$ & $0.82$ \\
+    128  & $8.13\times10^{-2}$ & $9.35\times10^{-2}$ & $0.87$ \\
+    256  & $4.35\times10^{-2}$ & $4.68\times10^{-2}$ & $0.93$ \\
+    512  & $2.18\times10^{-2}$ & $2.34\times10^{-2}$ & $0.93$ \\
+    1024 & $1.07\times10^{-2}$ & $1.17\times10^{-2}$ & $0.92$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}

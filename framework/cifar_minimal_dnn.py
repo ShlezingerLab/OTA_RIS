@@ -56,21 +56,22 @@ Gap ablation (lazy encoder + tight pipe + Conv2d mid)::
 
 The RIS channel pools reuse `channels.generate_channel_tensors_by_type`.
 
-``--mse_sweep`` runs a standalone synthesis-NMSE sweep (see
-``evaluate_mse_kappa_sweep``): for each Ricean K it measures
-``NMSE = sum||y_teacher - y_student||^2 / sum||y_teacher||^2`` between the trained
-target ``y_teacher = W_lin(s)`` and the RIS output, plus the best-achievable optimum
-(``_torus_optimum_nmse``, via the ``_lm_feasible_phi`` solver) and the Theorem 2 floor
-``||P_perp y||^2``. Key result (theory §12): at any *finite* K the free-scale optimum
-is ~0 (exact synthesis is achievable; the floor binds only as K->inf); what actually
-limits the RIS is a **K-vs-SNR tradeoff**, exposed by the opt-in absolute-noise model
-``--mse_abs_snr`` (the noise-aware "physical optimum" then rises to the floor once
-``K >~ SNR - 10log10(N_r)``). **Gotchas**: (1) K is a *dB* K-factor
-(``make_ris_channel_pools`` passes it as ``k_factor_*_db``), so the wide default is
-``0..70 dB`` == linear ``K 1..1e7``; (2) the floor only bounds the *scale-resolved*
-(post-AGC) student, since ``_optimize_phi_gd`` is scale-invariant; (3) the plain torus
-optimum via Adam-from-random is an artifact (it stalls in the LoS basin) -- use the LM
-feasibility solver. geometric_ricean only (``a_rx`` via ``channels.los_rx_steering_vector``).
+``--kappa_sweep ... --mse`` or ``--n_m_sweep ... --mse`` switches that sweep from
+accuracy to synthesis-NMSE (see ``evaluate_mse_kappa_sweep`` /
+``evaluate_mse_n_m_sweep``): noiseless AGC NMSE
+``||y_t - alpha v||^2 / ||y_t||^2`` with ``alpha = ||y_t||/||v||``
+(``v = A phi``) against the Theorem 2 floor ``||P_perp y||^2``. Add ``--ls`` to
+also report LS scale, free-scale optimum (``_torus_optimum_nmse`` / LM), and the
+noise-aware physical optimum (absolute ``sigma^2`` from ``--snr``, default 60 dB).
+Key result (theory §12): at any *finite* K the free-scale optimum is ~0; what
+limits the RIS is a **K-vs-SNR tradeoff** (physical optimum rises to the floor
+once ``K >~ SNR - 10log10(N_r)``). Versus ``N_m`` at fixed K, rich scattering
+decays ~1/N_m while strong LoS floors independent of N_m. **Gotchas**: (1) K is
+a *dB* K-factor (``make_ris_channel_pools`` passes it as ``k_factor_*_db``);
+(2) AGC / cosine phi GD is scale-invariant; (3) plain Adam torus optima stall
+in the LoS basin -- use the LM feasibility solver. Kappa MSE is geometric_ricean
+only; N_m MSE honors ``--channel_type`` / ``--kappa``.
+``--mse`` without ``--kappa_sweep`` or ``--n_m_sweep`` is a no-op with a clear message.
 
 CIFAR-10 is read from the raw pickle batches under
 `OTA_RIS/data/cifar-10-batches-py`; MNIST from IDX files under
@@ -872,6 +873,38 @@ def _optimize_phi_gd(s, y, H_1, H_2, n_m, iters=100, step_size=0.1):
     return torch.exp(1j * theta).detach()
 
 
+def _optimize_phi_agc_mse(s, y, H_1, H_2, n_m, iters=100, step_size=0.1):
+    """Match RIS phases by real-AGC MSE (same optimum as real cosine, different loss).
+
+    Minimizes
+    ``||y_teacher - (||y_teacher|| / ||A phi||) A phi||^2``
+    with Adam on ``theta``, ``phi = exp(i theta)``. Same receive path as cosine
+    (noise then real AGC); only the phi objective differs.
+    """
+    s = s.detach()
+    y = y.detach()
+    H_1 = H_1.detach()
+    H_2 = H_2.detach()
+    batch_size = s.size(0)
+    theta = torch.randn((batch_size, n_m), device=s.device, requires_grad=True)
+    optimizer = torch.optim.Adam([theta], lr=step_size)
+    H_1_s = torch.bmm(H_1, s.unsqueeze(-1)).squeeze(-1)
+    y_norm = torch.linalg.norm(torch.view_as_real(y).reshape(batch_size, -1), dim=1)
+
+    with torch.enable_grad():
+        for _ in range(iters):
+            phi = torch.exp(1j * theta)
+            v = torch.bmm(H_2, (H_1_s * phi).unsqueeze(-1)).squeeze(-1)
+            v_flat = torch.view_as_real(v).reshape(batch_size, -1)
+            v_norm = torch.linalg.norm(v_flat, dim=1).clamp_min(1e-8)
+            v_agc = v * (y_norm / v_norm).unsqueeze(-1)
+            optimizer.zero_grad()
+            loss = (y - v_agc).abs().pow(2).sum(-1).mean()
+            loss.backward()
+            optimizer.step()
+
+    return torch.exp(1j * theta).detach()
+
 def _complex_W_from_linear(model):
     """Return the complex (N_r x N_t) mid weight for AirFC matching.
 
@@ -1038,27 +1071,20 @@ def make_ris_channel_pools(n_t, n_r, n_m, device, channel_type, kappa,
 
 
 def wireless_forward(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
-                     H_1_b=None, H_2_b=None, return_parts=False, abs_sigma2=None):
+                     H_1_b=None, H_2_b=None, return_parts=False, abs_sigma2=None,
+                     phi_cosine=False):
     """RIS-channel logits: encoder -> H_2 diag(phi) H_1 (replaces `linear`) -> decoder.
 
-    Mirrors test_demo.test_physical: the encoder output `s` is transmitted, phi
-    is matched to the learned target `y = linear(s)` via `_optimize_phi_gd`, and
-    the noisy RIS output is decoded by the (unchanged) decoder.
-
-    Because `_optimize_phi_gd` uses a scale-invariant cosine objective, phi only
-    aligns the RIS output's direction to the target; its magnitude is arbitrary.
-    We therefore rescale `y_ris` to the target's per-sample norm before decoding
-    (the `rx_gain` step ported from the checkerboard `wireless_forward`), so the
-    scale matches what the decoder was trained on.
+    Default phi solver is real-AGC MSE (``_optimize_phi_agc_mse``). Pass
+    ``phi_cosine=True`` for the older cosine-similarity Adam path. Noise and
+    real AGC are the same in both cases; only phi differs.
 
     If `H_1_b` / `H_2_b` are provided (batch channel tensors), they are used as-is;
     otherwise channels are sampled randomly from `H_1_all` / `H_2_all`.
 
-    If `return_parts`, returns ``(logits, y_teacher, y_student, s, H_1_b, H_2_b)``
-    where ``y_teacher = intermediate(s)`` is the target, ``y_student`` is the
-    post-noise, post-AGC RIS output (what the decoder consumes), and the channel
-    batches are the ones actually used. Used by ``evaluate_wireless_mse`` to measure
-    the synthesis MSE and its theoretical floor without re-running the forward.
+    If `return_parts`, returns ``(logits, y_teacher, y_student, s, H_1_b, H_2_b,
+    y_ris_raw)`` where ``y_teacher = intermediate(s)``, ``y_student`` is the
+    post-noise post-AGC RIS output, and ``y_ris_raw = A phi``.
     """
     model.eval()
     x = x.to(device)
@@ -1073,8 +1099,10 @@ def wireless_forward(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
         H_1_b = H_1_b.to(device)
         H_2_b = H_2_b.to(device)
     n_m = H_1_b.size(-2)
-    phi = _optimize_phi_gd(s, y_learned, H_1_b, H_2_b, n_m, iters=phi_iters)
-
+    if phi_cosine:
+        phi = _optimize_phi_gd(s, y_learned, H_1_b, H_2_b, n_m, iters=phi_iters)
+    else:
+        phi = _optimize_phi_agc_mse(s, y_learned, H_1_b, H_2_b, n_m, iters=phi_iters)
     H_1_s = torch.bmm(H_1_b, s.unsqueeze(-1)).squeeze(-1)              # (B, Nm)
     y_ris_raw = torch.bmm(H_2_b, (H_1_s * phi).unsqueeze(-1)).squeeze(-1)  # (B, Nr) = A phi
     if abs_sigma2 is None:
@@ -1085,13 +1113,11 @@ def wireless_forward(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
         w = torch.randn_like(torch.view_as_real(y_ris_raw)) * math.sqrt(float(abs_sigma2) / 2.0)
         y_ris = y_ris_raw + torch.view_as_complex(w)
 
-    # Norm-match y_ris to the target (phi was cosine-optimized -> direction only).
+    # Real positive AGC (same for AGC-MSE and cosine phi).
     y_ris = _norm_match_to_target(y_ris, y_learned)
 
     logits = model.decode(y_ris)                                 # (B, num_classes)
     if return_parts:
-        # y_ris_raw is the pre-noise, pre-AGC synthesis A phi; the AGC gain the
-        # pipeline applies is ||y_learned|| / ||y_ris_raw|| per sample.
         return logits, y_learned, y_ris, s, H_1_b, H_2_b, y_ris_raw
     return logits
 
@@ -1208,12 +1234,14 @@ def airfc_forward(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
 
 @torch.no_grad()
 def evaluate_wireless(model, x, y, H_1_all, H_2_all, snr_db, device, phi_iters,
-                      batch_size=500, channel_indices=None):
+                      batch_size=500, channel_indices=None, phi_cosine=False):
     """Test accuracy (%) of the wireless RIS path.
 
     If `channel_indices` has shape (N,) matching `x`, each test sample uses that
     fixed pool index (for paired comparison with SimNet). Otherwise channels are
     re-sampled randomly per batch.
+
+    Default phi is AGC-MSE. ``phi_cosine=True`` uses cosine GD instead.
     """
     model.eval()
     y = y.to(device)
@@ -1232,12 +1260,13 @@ def evaluate_wireless(model, x, y, H_1_all, H_2_all, snr_db, device, phi_iters,
         yb = y[start:start + batch_size]
         if channel_indices is None:
             logits = wireless_forward(
-                model, xb, H_1_all, H_2_all, snr_db, device, phi_iters)
+                model, xb, H_1_all, H_2_all, snr_db, device, phi_iters,
+                phi_cosine=phi_cosine)
         else:
             ch = channel_indices[start:start + batch_size]
             logits = wireless_forward(
                 model, xb, H_1_all, H_2_all, snr_db, device, phi_iters,
-                H_1_b=H_1_all[ch], H_2_b=H_2_all[ch],
+                H_1_b=H_1_all[ch], H_2_b=H_2_all[ch], phi_cosine=phi_cosine,
             )
         correct += (logits.argmax(1) == yb).sum().item()
         total += yb.size(0)
@@ -1266,36 +1295,43 @@ def _rx_perp_projector(n_r, device, freq_hz=DEFAULT_CARRIER_FREQ_HZ,
 
 
 @torch.no_grad()
+def _mrt_v_from_A(A, y):
+    """Matched-phase (MRT) synthesis ``v = A phi`` with ``|phi_m|=1``.
+
+    ``phi_m = conj(y^H a_m) / |y^H a_m| = (a_m^H y) / |a_m^H y|`` so that
+    ``y^H a_m phi_m = |y^H a_m| >= 0`` (terms add coherently along y; same rule as
+    ``theory/verify_nm_synthesis_bound.py``).
+    ``A`` is ``(B, Nr, Nm)``, ``y`` is ``(B, Nr)``; returns ``v`` ``(B, Nr)``.
+    """
+    # proj[b,m] = a_m^H y = sum_r conj(A[b,r,m]) * y[b,r]  = conj(y^H a_m)
+    proj = (A.conj() * y.unsqueeze(-1)).sum(dim=1)          # (B, Nm)
+    phi = proj / proj.abs().clamp_min(1e-30)                # = conj(y^H a_m)/|.|
+    return torch.bmm(A, phi.unsqueeze(-1)).squeeze(-1)
+
+
+@torch.no_grad()
 def evaluate_wireless_mse(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
                           p_perp, batch_size=500, channel_indices=None,
-                          abs_sigma2=None):
-    """Achieved synthesis NMSE of the wireless RIS pipeline, plus the Thm 2 floor.
+                          compute_ls=False, compute_floor=True, compute_mrt=False):
+    """Achieved synthesis NMSE of the wireless RIS pipeline, plus optional refs.
 
-    For each sample, ``y_teacher = intermediate(s)`` (target) and ``y_student`` is
-    the post-noise, post-AGC RIS output (``wireless_forward(..., return_parts=True)``);
-    ``v_raw = A(s) phi_cos`` is the noiseless synthesis for the pipeline's cosine phi.
-    Accumulates per sample:
+    For each sample, ``y_teacher = intermediate(s)`` and ``v_raw = A(s) phi`` is the
+    noiseless RIS synthesis for the pipeline's phi. Accumulates per sample:
 
-    - AGC achieved:  ``||y_teacher - y_student||^2``   (what the decoder consumes)
-    - LS achieved:   ``||y_teacher||^2 - |<v_raw,y_teacher>|^2/||v_raw||^2``  (best
-      complex scale for the pipeline's phi; scale-invariant, tighter than AGC)
-    - Thm 2 floor:   ``||P_perp y_teacher||^2``  (pure-LoS, kappa->inf range floor)
+    - AGC achieved:  ``||y_teacher - alpha v_raw||^2`` with real
+      ``alpha = ||y_teacher|| / ||v_raw||`` (noiseless; no AWGN in the gain)
+    - LS achieved (if ``compute_ls``): best complex scale for the same phi
+    - Thm 2 floor (if ``compute_floor``): ``||P_perp y_teacher||^2``
+    - MRT AGC (if ``compute_mrt``): same real-AGC NMSE for matched-phase ``phi``
 
-    Returns ``(nmse_agc, nmse_ls, floor_thm2)`` each divided by ``sum||y_teacher||^2``.
-    ``abs_sigma2`` (opt-in): if set, ``wireless_forward`` adds noise with this ABSOLUTE
-    variance to the raw synthesis instead of the pipeline's relative SNR model, so
-    beam-nulling actually costs SNR (see ``evaluate_mse_kappa_sweep``).
-
-    NOTE: the previous "Thm 3 term" curve was dropped. Theorem 3 bounds the
-    *fixed-scale* residual, but the pipeline is free-scale (AGC); a g-scaled version
-    was circular (``g`` came from the optimizer's own phi). The meaningful finite-K
-    quantity is the noise-aware physical optimum (``_torus_optimum_nmse`` with
-    ``sigma2>0``), reported separately. See theory/ris_mse_lower_bound.md §12.
+    Returns ``(nmse_agc, nmse_ls, floor_thm2, nmse_mrt)`` each divided by
+    ``sum||y_teacher||^2``. Unused metrics are NaN.
     """
     model.eval()
     H_1_all = H_1_all.to(device)
     H_2_all = H_2_all.to(device)
-    p_perp = p_perp.to(device)
+    if compute_floor:
+        p_perp = p_perp.to(device)
     if channel_indices is not None:
         channel_indices = channel_indices.to(device)
         if channel_indices.numel() != x.size(0):
@@ -1303,28 +1339,38 @@ def evaluate_wireless_mse(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
                 f"channel_indices length ({channel_indices.numel()}) must match "
                 f"number of samples ({x.size(0)})"
             )
-    sum_agc = sum_ls = sum_y = sum_floor = 0.0
+    sum_agc = sum_ls = sum_y = sum_floor = sum_mrt = 0.0
     for start in range(0, x.size(0), batch_size):
         xb = x[start:start + batch_size]
         ch_b = None if channel_indices is None else channel_indices[start:start + batch_size]
         h1b = None if ch_b is None else H_1_all[ch_b]
         h2b = None if ch_b is None else H_2_all[ch_b]
-        _, y_teacher, y_student, s, H_1_b, H_2_b, v_raw = wireless_forward(
+        _, y_teacher, _, s, H_1_b, H_2_b, v_raw = wireless_forward(
             model, xb, H_1_all, H_2_all, snr_db, device, phi_iters,
-            H_1_b=h1b, H_2_b=h2b, return_parts=True, abs_sigma2=abs_sigma2)
+            H_1_b=h1b, H_2_b=h2b, return_parts=True)
         y_sq = y_teacher.abs().pow(2).sum(-1)                      # (B,)
         sum_y += y_sq.sum().item()
-        # AGC achieved (decoder input).
-        sum_agc += (y_teacher - y_student).abs().pow(2).sum().item()
-        # LS achieved: best complex scale for the pipeline's phi.
-        v_norm_sq = v_raw.abs().pow(2).sum(-1).clamp_min(1e-12)
-        inner = (v_raw.conj() * y_teacher).sum(-1).abs().pow(2)
-        sum_ls += (y_sq - inner / v_norm_sq).clamp_min(0.0).sum().item()
-        # Thm 2 floor: ||P_perp y||^2.
-        Py = torch.einsum("rc,bc->br", p_perp, y_teacher)
-        sum_floor += Py.abs().pow(2).sum().item()
+        # Noiseless real AGC: alpha = ||y_t|| / ||v||, residual vs alpha * v.
+        y_agc = _norm_match_to_target(v_raw, y_teacher)
+        sum_agc += (y_teacher - y_agc).abs().pow(2).sum().item()
+        if compute_ls:
+            v_norm_sq = v_raw.abs().pow(2).sum(-1).clamp_min(1e-12)
+            inner = (v_raw.conj() * y_teacher).sum(-1).abs().pow(2)
+            sum_ls += (y_sq - inner / v_norm_sq).clamp_min(0.0).sum().item()
+        if compute_floor:
+            Py = torch.einsum("rc,bc->br", p_perp, y_teacher)
+            sum_floor += Py.abs().pow(2).sum().item()
+        if compute_mrt:
+            H_1_s = torch.bmm(H_1_b, s.unsqueeze(-1)).squeeze(-1)   # (B, Nm)
+            A = H_2_b * H_1_s.unsqueeze(1)                          # (B, Nr, Nm)
+            v_mrt = _mrt_v_from_A(A, y_teacher)
+            y_mrt = _norm_match_to_target(v_mrt, y_teacher)
+            sum_mrt += (y_teacher - y_mrt).abs().pow(2).sum().item()
     denom = max(sum_y, 1e-12)
-    return sum_agc / denom, sum_ls / denom, sum_floor / denom
+    nmse_ls = (sum_ls / denom) if compute_ls else float("nan")
+    floor = (sum_floor / denom) if compute_floor else float("nan")
+    nmse_mrt = (sum_mrt / denom) if compute_mrt else float("nan")
+    return sum_agc / denom, nmse_ls, floor, nmse_mrt
 
 
 def _lm_feasible_phi(A, y, restarts=6, iters=400, seed=0):
@@ -1441,34 +1487,32 @@ def _torus_optimum_nmse(model, x, H_1_all, H_2_all, device, phi_iters,
 @torch.no_grad()
 def evaluate_mse_kappa_sweep(model, x_te, device, snr_db, phi_iters, num_channels,
                              kappas, n_m, p_perp, opt_subset=16, inter_label="RIS",
-                             abs_snr=None):
+                             abs_snr=None, ls=False):
     """Synthesis-NMSE vs Ricean K (dB) for the wireless RIS path vs the theory floors.
 
-    Decoupled from the accuracy kappa sweep. For each K builds a geometric_ricean
-    wireless pool and reports ``(kappa, nmse_agc, nmse_ls, free_opt, phys_opt,
-    floor_thm2)`` (all NMSE). ``free_opt``/``phys_opt`` are per-image optima on
-    ``opt_subset`` images (NaN if ``opt_subset<=0``); ``phys_opt`` is NaN unless
-    ``abs_snr`` is set.
+    For each K builds a geometric_ricean wireless pool and reports
+    ``(kappa, nmse_agc, nmse_ls, free_opt, phys_opt, floor_thm2)`` (all NMSE).
+    Default (``ls=False``): only AGC + Thm 2 floor are meaningful; LS / free_opt /
+    phys_opt are NaN and the expensive LM torus solve is skipped.
 
-    ``abs_snr`` (opt-in, dB): switches on the absolute-noise model. The reference
-    power is fixed once as the pipeline's mean received power at the LOWEST K in the
-    sweep (the rich-scattering operating point); ``sigma2 = P_ref / (N_r * 10^(abs_snr/10))``
-    is then held constant across K, so nulling the LoS beam at high K costs SNR and the
-    K-vs-SNR tradeoff (theory §12) becomes visible. Without it, the noise stays the
-    pipeline's relative-SNR model and ``phys_opt`` is not computed.
+    With ``ls=True``: also computes LS, free_opt, and phys_opt on ``opt_subset``
+    images (NaN if ``opt_subset<=0``). ``phys_opt`` needs ``abs_snr`` (dB, from
+    ``--snr``): absolute-noise model with
+    ``sigma2 = P_ref / (N_r * 10^(abs_snr/10))`` fixed from the lowest-K received
+    power so the K-vs-SNR tradeoff (theory §12) appears.
     """
-    use_opt = bool(opt_subset) and int(opt_subset) > 0
+    use_opt = bool(ls) and bool(opt_subset) and int(opt_subset) > 0
     if use_opt:
         k = min(int(opt_subset), x_te.size(0))
         x_eval = x_te[:k]
-        print(f"  (all curves evaluated on the same {k}-image subset)")
+        print(f"  (LS / optima evaluated on the same {k}-image subset)")
     else:
         x_eval = x_te
     kappas = [float(kv) for kv in kappas]
 
-    # Absolute-noise reference: fix sigma2 from the received power at the lowest K.
+    # Absolute-noise reference only when phys_opt will be computed (--ls).
     abs_sigma2 = None
-    if abs_snr is not None:
+    if ls and abs_snr is not None:
         k_ref = min(kappas)
         H1r, H2r = make_ris_channel_pools(
             model.n_t, model.n_r, n_m, device, "geometric_ricean", k_ref,
@@ -1477,7 +1521,7 @@ def evaluate_mse_kappa_sweep(model, x_te, device, snr_db, phi_iters, num_channel
         _, _, _, _, _, _, v_ref = wireless_forward(
             model, x_eval, H1r, H2r, snr_db, device, phi_iters,
             H_1_b=H1r[ch_r], H_2_b=H2r[ch_r], return_parts=True)
-        p_ref = float(v_ref.abs().pow(2).sum(-1).mean().item())     # mean ||A phi_cos||^2
+        p_ref = float(v_ref.abs().pow(2).sum(-1).mean().item())     # mean ||A phi||^2
         abs_sigma2 = p_ref / (model.n_r * 10.0 ** (float(abs_snr) / 10.0))
         print(f"  [abs-noise] ref K={k_ref:g} dB  P_ref={p_ref:.3e}  "
               f"sigma^2={abs_sigma2:.3e}  (abs_snr={abs_snr:g} dB)")
@@ -1491,9 +1535,9 @@ def evaluate_mse_kappa_sweep(model, x_te, device, snr_db, phi_iters, num_channel
             num_channels=num_channels, apply_pathloss=True,
         )
         ch = torch.randint(0, H_1_all.size(0), (x_eval.size(0),), device=device)
-        agc, ls, t2 = evaluate_wireless_mse(
+        agc, nmse_ls, t2, _mrt = evaluate_wireless_mse(
             model, x_eval, H_1_all, H_2_all, snr_db, device, phi_iters, p_perp,
-            channel_indices=ch, abs_sigma2=abs_sigma2)
+            channel_indices=ch, compute_ls=ls)
         free_opt = phys_opt = float("nan")
         if use_opt:
             free_opt, phys_opt = _torus_optimum_nmse(
@@ -1501,9 +1545,94 @@ def evaluate_mse_kappa_sweep(model, x_te, device, snr_db, phi_iters, num_channel
                 sigma2=(abs_sigma2 or 0.0))
         def _f(v):
             return f"{v:.3e}" if not math.isnan(v) else "n/a"
-        print(f"  NMSE(AGC)={agc:.3e} | NMSE(LS)={ls:.3e} | free_opt={_f(free_opt)} | "
-              f"phys_opt={_f(phys_opt)} | floorT2={t2:.3e}")
-        results.append((kappa, agc, ls, free_opt, phys_opt, t2))
+        if ls:
+            print(f"  NMSE(AGC)={agc:.3e} | NMSE(LS)={_f(nmse_ls)} | "
+                  f"free_opt={_f(free_opt)} | phys_opt={_f(phys_opt)} | "
+                  f"floorT2={t2:.3e}")
+        else:
+            print(f"  NMSE(AGC)={agc:.3e} | floorT2={t2:.3e}")
+        results.append((kappa, agc, nmse_ls, free_opt, phys_opt, t2))
+    return results
+
+
+def _rayleigh_matched_nmse_bound(n_r, n_m):
+    """Proposition 1 closed form (Rayleigh matched-phase upper bound).
+
+    ``(16/pi^2 * N_r - 1) / N_m`` ≈ ``(1.62 N_r - 1) / N_m``.
+    See ``theory/nm_synthesis_bound.tex`` / ``theory/verify_nm_synthesis_bound.py``.
+    """
+    return ((16.0 / math.pi ** 2) * float(n_r) - 1.0) / float(n_m)
+
+
+@torch.no_grad()
+def evaluate_mse_n_m_sweep(model, x_te, device, snr_db, phi_iters, num_channels,
+                           n_ms, kappa, p_perp, channel_type="geometric_ricean",
+                           opt_subset=16, inter_label="RIS", abs_snr=None,
+                           ls=False):
+    """Synthesis-NMSE vs N_m at fixed Ricean K (or Rayleigh) for the wireless RIS.
+
+    Default (``ls=False``): AGC-Adam, MRT (matched-phase) AGC, and Prop.\ 1
+    bound ``(16/pi^2 N_r-1)/N_m``. With ``ls=True``: also LS, free_opt, phys_opt
+    (absolute noise from ``abs_snr``, referenced at the smallest N_m). Returns
+    ``(n_m, nmse_agc, nmse_mrt, nmse_ls, free_opt, phys_opt, prop1_bound)``.
+    ``p_perp`` is unused (kept for call-site symmetry with the kappa MSE sweep).
+    """
+    del p_perp
+    use_opt = bool(ls) and bool(opt_subset) and int(opt_subset) > 0
+    if use_opt:
+        k = min(int(opt_subset), x_te.size(0))
+        x_eval = x_te[:k]
+        print(f"  (LS / optima evaluated on the same {k}-image subset)")
+    else:
+        x_eval = x_te
+    n_ms = [int(nm) for nm in n_ms]
+
+    abs_sigma2 = None
+    if ls and abs_snr is not None:
+        n_m_ref = min(n_ms)
+        H1r, H2r = make_ris_channel_pools(
+            model.n_t, model.n_r, n_m_ref, device, channel_type, kappa,
+            num_channels=num_channels, apply_pathloss=True)
+        ch_r = torch.randint(0, H1r.size(0), (x_eval.size(0),), device=device)
+        _, _, _, _, _, _, v_ref = wireless_forward(
+            model, x_eval, H1r, H2r, snr_db, device, phi_iters,
+            H_1_b=H1r[ch_r], H_2_b=H2r[ch_r], return_parts=True)
+        p_ref = float(v_ref.abs().pow(2).sum(-1).mean().item())
+        abs_sigma2 = p_ref / (model.n_r * 10.0 ** (float(abs_snr) / 10.0))
+        print(f"  [abs-noise] ref N_m={n_m_ref}  P_ref={p_ref:.3e}  "
+              f"sigma^2={abs_sigma2:.3e}  (abs_snr={abs_snr:g} dB)")
+
+    results = []
+    for n_m in n_ms:
+        print(f"\n=== MSE sweep | N_m={n_m} | "
+              f"channel={channel_settings_label(channel_type, kappa)}"
+              f"{' | abs-noise' if abs_sigma2 else ''} ===")
+        H_1_all, H_2_all = make_ris_channel_pools(
+            model.n_t, model.n_r, n_m, device, channel_type, kappa,
+            num_channels=num_channels, apply_pathloss=True,
+        )
+        ch = torch.randint(0, H_1_all.size(0), (x_eval.size(0),), device=device)
+        agc, nmse_ls, _, nmse_mrt = evaluate_wireless_mse(
+            model, x_eval, H_1_all, H_2_all, snr_db, device, phi_iters, None,
+            channel_indices=ch, compute_ls=ls, compute_floor=False,
+            compute_mrt=True)
+        prop1 = _rayleigh_matched_nmse_bound(model.n_r, n_m)
+        free_opt = phys_opt = float("nan")
+        if use_opt:
+            free_opt, phys_opt = _torus_optimum_nmse(
+                model, x_eval, H_1_all, H_2_all, device, phi_iters, ch,
+                sigma2=(abs_sigma2 or 0.0))
+        def _f(v):
+            return f"{v:.3e}" if not math.isnan(v) else "n/a"
+        if ls:
+            print(f"  NMSE(AGC)={agc:.3e} | NMSE(MRT)={nmse_mrt:.3e} | "
+                  f"NMSE(LS)={_f(nmse_ls)} | free_opt={_f(free_opt)} | "
+                  f"phys_opt={_f(phys_opt)} | prop1={prop1:.3e}")
+        else:
+            print(f"  NMSE(AGC)={agc:.3e} | NMSE(MRT)={nmse_mrt:.3e} | "
+                  f"prop1={prop1:.3e}")
+        results.append(
+            (float(n_m), agc, nmse_mrt, nmse_ls, free_opt, phys_opt, prop1))
     return results
 
 
@@ -2222,28 +2351,33 @@ def evaluate_kappa_sweep(model, x_te, y_te, teacher_acc, kappas, device,
                          n_m=None, inter_label="RIS",
                          do_wireless=True, do_airfc=False,
                          airfc_n_m=None, airfc_phi_iters=None,
-                         dataset=DEFAULT_DATASET):
+                         dataset=DEFAULT_DATASET, phi_cosine=False):
     """Sweep a single teacher's wireless RIS / AirFC across Ricean kappa.
 
     - teacher_acc: fixed digital bound (passed in).
-    - wireless RIS: optional phi-GD path for the primary --inter teacher.
+    - wireless RIS: default AGC-MSE phi for the primary --inter teacher.
     - AirFC: P/Phi/U AO; requires --inter linear.
     - SimNet E2E: optional list of ``(label, CifarSimCNN)`` (each own channel pool).
+    - ``phi_cosine``: also evaluate Linear RIS with cosine GD on the same channels.
 
     Returns list of
-    ``(kappa, teacher_acc, ris_acc_or_nan, sim_accs_tuple, airfc_acc_or_nan)``.
+    ``(kappa, teacher_acc, ris_acc_or_nan, sim_accs_tuple, airfc_acc_or_nan,
+    ris_cosine_acc_or_nan)``.
     """
     n_m = int(model.n_m if n_m is None else n_m)
     airfc_n_m = int(n_m if airfc_n_m is None else airfc_n_m)
     airfc_phi_iters = int(phi_iters if airfc_phi_iters is None else airfc_phi_iters)
     sim_models = list(sim_models or [])
+    do_phi_cosine = bool(phi_cosine) and bool(do_wireless)
     results = []
     for kappa in kappas:
         print(
             f"\n=== Kappa sweep | kappa={kappa:g} | channel=geometric_ricean | "
-            f"N_m(wl)={n_m} | N_m(AirFC)={airfc_n_m} ==="
+            f"N_m(wl)={n_m} | N_m(AirFC)={airfc_n_m}"
+            f"{' | phi_cosine' if do_phi_cosine else ''} ==="
         )
         ris = float("nan")
+        ris_cosine = float("nan")
         airfc_acc = float("nan")
         airfc_res = float("nan")
         if do_wireless or do_airfc:
@@ -2256,6 +2390,11 @@ def evaluate_kappa_sweep(model, x_te, y_te, teacher_acc, kappas, device,
                     model, x_te, y_te, H_1_wl, H_2_wl, snr_db, device, phi_iters,
                     channel_indices=ch_wl,
                 )
+                if do_phi_cosine:
+                    ris_cosine = evaluate_wireless(
+                        model, x_te, y_te, H_1_wl, H_2_wl, snr_db, device, phi_iters,
+                        channel_indices=ch_wl, phi_cosine=True,
+                    )
             if do_airfc:
                 airfc_acc, airfc_res = evaluate_airfc(
                     model, x_te, y_te, H_1_af, H_2_af, snr_db, device,
@@ -2276,6 +2415,8 @@ def evaluate_kappa_sweep(model, x_te, y_te, teacher_acc, kappas, device,
         parts = []
         if do_wireless:
             parts.append(f"{inter_label} RIS={ris:.2f}%")
+        if do_phi_cosine:
+            parts.append(f"RIS cosine={ris_cosine:.2f}%")
         if do_airfc:
             parts.append(f"AirFC={airfc_acc:.2f}% (relF={airfc_res:.3f})")
         for (label, _m), acc in zip(sim_models, sim_accs):
@@ -2289,6 +2430,7 @@ def evaluate_kappa_sweep(model, x_te, y_te, teacher_acc, kappas, device,
                 float(ris),
                 sim_accs,
                 float(airfc_acc),
+                float(ris_cosine),
             )
         )
     return results
@@ -2358,19 +2500,13 @@ def plot_simnet_kappa_sweep(kappas, simnet_accs, path=None, snr_db=None):
 
 
 def plot_kappa_sweep_mse(kappas, nmse_agc, nmse_ls, free_opt, phys_opt, floor_thm2,
-                         path=None, snr_db=None, inter_label="RIS", abs_snr=None):
+                         path=None, snr_db=None, inter_label="RIS", abs_snr=None,
+                         show_ls=False):
     """Plot synthesis NMSE vs Ricean K (dB) against the theory floor.
 
-    Curves (all NMSE, normalized by ``sum||y||^2``, log-y):
-      - achieved AGC / LS (the cosine+AGC pipeline heuristic),
-      - physical optimum (green; only with absolute noise ``--mse_abs_snr``): the
-        noise-aware best, which rises to the floor because beam-nulling costs SNR --
-        the K-vs-SNR tradeoff (theory §12),
-      - Theorem 2 pure-LoS floor ``||P_perp y||^2`` (the K->inf / rank-1 limit).
-
-    The free-scale (noiseless) optimum is ~0 at every finite K, so it is kept in the
-    table/npz but NOT plotted (a flat low line adds nothing). x-axis is the K-factor in
-    dB (already log in linear K; increasing LoS to the right).
+    Default curves (``show_ls=False``): achieved AGC + Theorem 2 floor.
+    With ``show_ls=True`` (``--ls``): also LS scale and physical optimum (green;
+    absolute noise from ``--snr``). Free-scale optimum stays table/npz only.
     """
     plt = _matplotlib_pyplot()
     x_values = np.asarray(kappas, dtype=np.float64)   # kappa is a dB K-factor here
@@ -2382,24 +2518,25 @@ def plot_kappa_sweep_mse(kappas, nmse_agc, nmse_ls, free_opt, phys_opt, floor_th
 
     nmse_agc = _o(nmse_agc)
     nmse_ls = _o(nmse_ls)
-    free_opt = _o(free_opt)
     phys_opt = _o(phys_opt)
     floor_thm2 = _o(floor_thm2)
+    _ = free_opt  # table/npz only; not plotted
     _FLOOR = 1e-13  # display clamp for the log axis
 
     fig, ax = plt.subplots(figsize=(7.5, 4.5))
     ax.plot(x_values, nmse_agc, marker="o", color="C0",
             label=f"{inter_label} achieved (AGC)")
-    ax.plot(x_values, nmse_ls, marker="s", color="C1",
-            label=f"{inter_label} achieved (LS scale)")
-    # The free-scale (noiseless) optimum is ~0 at every finite K; it is recorded in
-    # the table/npz but not plotted (a flat low line is uninformative). The plotted
-    # optimum is the physical, noise-aware one (the K-vs-SNR tradeoff), in green.
-    if np.isfinite(phys_opt).any():
-        m = np.isfinite(phys_opt)
-        lbl = "physical optimum" + (f" (abs SNR={abs_snr:g} dB)" if abs_snr is not None else "")
-        ax.plot(x_values[m], np.clip(phys_opt[m], _FLOOR, None), marker="^",
-                color="C2", label=lbl)
+    if show_ls:
+        if np.isfinite(nmse_ls).any():
+            m = np.isfinite(nmse_ls)
+            ax.plot(x_values[m], nmse_ls[m], marker="s", color="C1",
+                    label=f"{inter_label} achieved (LS scale)")
+        if np.isfinite(phys_opt).any():
+            m = np.isfinite(phys_opt)
+            lbl = "physical optimum" + (
+                f" (abs SNR={abs_snr:g} dB)" if abs_snr is not None else "")
+            ax.plot(x_values[m], np.clip(phys_opt[m], _FLOOR, None), marker="^",
+                    color="C2", label=lbl)
     ax.plot(x_values, floor_thm2, color="k", linestyle="--",
             label=r"Thm 2 floor $\|P^\perp y\|^2$ ($K\to\infty$)")
     ax.set_yscale("log")
@@ -2419,13 +2556,87 @@ def plot_kappa_sweep_mse(kappas, nmse_agc, nmse_ls, free_opt, phys_opt, floor_th
     _show_or_close_plot(plt, fig, path)
 
 
+def plot_n_m_sweep_mse(n_ms, nmse_agc, nmse_mrt, nmse_ls, free_opt, phys_opt,
+                       prop1_bound, path=None, snr_db=None, inter_label="RIS",
+                       abs_snr=None, show_ls=False, kappa=None,
+                       channel_type=None, n_r=None):
+    """Plot synthesis NMSE vs N_m at fixed channel settings.
+
+    Default: AGC-Adam, MRT (matched-phase) AGC, and Prop.\ 1 bound.
+    With ``show_ls``: also LS and physical optimum.
+    """
+    plt = _matplotlib_pyplot()
+    x_values = np.asarray(n_ms, dtype=np.float64)
+    order = np.argsort(x_values)
+    x_values = x_values[order]
+
+    def _o(a):
+        return np.asarray(a, dtype=np.float64)[order]
+
+    nmse_agc = _o(nmse_agc)
+    nmse_mrt = _o(nmse_mrt)
+    nmse_ls = _o(nmse_ls)
+    phys_opt = _o(phys_opt)
+    prop1_bound = _o(prop1_bound)
+    _ = free_opt
+    _FLOOR = 1e-13
+
+    fig, ax = plt.subplots(figsize=(7.5, 4.5))
+    ax.plot(x_values, nmse_agc, marker="o", color="C0",
+            label=f"{inter_label} AGC-Adam")
+    ax.plot(x_values, nmse_mrt, marker="D", color="C3",
+            label=f"{inter_label} MRT (matched phi)")
+    if show_ls:
+        if np.isfinite(nmse_ls).any():
+            m = np.isfinite(nmse_ls)
+            ax.plot(x_values[m], nmse_ls[m], marker="s", color="C1",
+                    label=f"{inter_label} achieved (LS scale)")
+        if np.isfinite(phys_opt).any():
+            m = np.isfinite(phys_opt)
+            lbl = "physical optimum" + (
+                f" (abs SNR={abs_snr:g} dB)" if abs_snr is not None else "")
+            ax.plot(x_values[m], np.clip(phys_opt[m], _FLOOR, None), marker="^",
+                    color="C2", label=lbl)
+    if n_r is not None:
+        prop1_curve = np.array(
+            [_rayleigh_matched_nmse_bound(n_r, nm) for nm in x_values],
+            dtype=np.float64,
+        )
+    else:
+        prop1_curve = prop1_bound
+    ax.plot(x_values, prop1_curve, color="k", linestyle="--",
+            label=r"$(16/\pi^2 N_r-1)/N_m\approx(1.62 N_r-1)/N_m$")
+    ax.set_yscale("log")
+    ax.set_xlabel(r"$N_m$ (RIS elements)")
+    ax.set_ylabel(r"NMSE $= \sum\|y_{\rm t}-\hat y\|^2 / \sum\|y_{\rm t}\|^2$")
+    title = "RIS synthesis NMSE vs $N_m$"
+    extras = []
+    if snr_db is not None:
+        extras.append(rf"SNR={snr_db:g} dB")
+    if channel_type is not None or kappa is not None:
+        extras.append(channel_settings_label(
+            channel_type or DEFAULT_CHANNEL_TYPE, kappa))
+    if extras:
+        title += " (" + ", ".join(extras) + ")"
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3, which="both")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    if path is not None:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fig.savefig(path, dpi=120, bbox_inches="tight")
+        print(f"  saved N_m-sweep NMSE plot to: {path}")
+    _show_or_close_plot(plt, fig, path)
+
+
 def plot_kappa_sweep(kappas, teacher_acc, ris_accs=None, path=None,
                      simnet_accs=None, airfc_accs=None, snr_db=None,
-                     inter_label="RIS", simnet_series=None):
+                     inter_label="RIS", simnet_series=None, ris_cosine_accs=None):
     """Plot teacher bound + optional wireless RIS / AirFC / SimNet vs log10(1/kappa).
 
     ``simnet_series`` is ``[(label, accs), ...]``. A single 1-D ``simnet_accs``
-    is treated as one curve labeled ``E2E``.
+    is treated as one curve labeled ``E2E``. ``ris_cosine_accs`` is the optional
+    cosine-phi Linear RIS curve (``--phi_cosine``). Default ``ris_accs`` is AGC-MSE.
     """
     plt = _matplotlib_pyplot()
     inv_kappa = 1.0 / np.asarray(kappas, dtype=np.float64)
@@ -2442,6 +2653,11 @@ def plot_kappa_sweep(kappas, teacher_acc, ris_accs=None, path=None,
         ris_accs = np.asarray(ris_accs, dtype=np.float64)[order]
         if np.isfinite(ris_accs).any():
             ax.plot(x_values, ris_accs, marker="o", color="C0", label="RIS")
+    if ris_cosine_accs is not None:
+        ris_cosine_accs = np.asarray(ris_cosine_accs, dtype=np.float64)[order]
+        if np.isfinite(ris_cosine_accs).any():
+            ax.plot(x_values, ris_cosine_accs, marker="^", color="C4",
+                    label="RIS cosine")
     if airfc_accs is not None:
         airfc_accs = np.asarray(airfc_accs, dtype=np.float64)[order]
         if np.isfinite(airfc_accs).any():
@@ -2807,8 +3023,8 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
              mid_bn=DEFAULT_MID_BN,
              dataset=DEFAULT_DATASET,
              data_dir=None,
-             airfc_debug=False, mse_sweep=None, mse_opt_subset=16,
-             mse_abs_snr=None):
+             airfc_debug=False, mse=False, mse_opt_subset=16,
+             phi_cosine=False, ls=False):
     """Train (or load) the teacher net and return (test_acc, wireless_acc, simnet_acc).
 
     When `load_only=True`, skip training and load a saved checkpoint from
@@ -3076,7 +3292,73 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
     wireless_acc = None
     airfc_acc = None
     sim_labels = [label for label, _m in sim_entries]
-    if kappa_sweep is not None:
+    if kappa_sweep is not None and mse:
+        if not wireless:
+            print("  --mse: requires --wireless true (skipped)")
+        else:
+            # Synthesis-NMSE vs kappa (skips accuracy kappa sweep for this run).
+            # Absolute noise for the physical-optimum curve comes from --snr.
+            inter_name = {
+                "linear": "Linear", "cnn": "CNN", "relu": "ReLU", "none": "None",
+            }.get(intermediate, intermediate)
+            p_perp = _rx_perp_projector(model.n_r, device, freq_hz=carrier_freq_hz)
+            print(
+                f"\n=== MSE kappa sweep ({inter_name} RIS) | N_m={n_m}"
+                + (f" | opt_subset={mse_opt_subset} | abs_snr={snr_db:g}dB | --ls"
+                   if ls else "")
+                + " ==="
+            )
+            mse_results = evaluate_mse_kappa_sweep(
+                model, x_te, device, snr_db, phi_iters, num_channels_test,
+                kappa_sweep, n_m, p_perp, opt_subset=mse_opt_subset,
+                inter_label=inter_name, abs_snr=(snr_db if ls else None), ls=ls,
+            )
+            if ls:
+                headers = ["kappa", "NMSE(AGC)", "NMSE(LS)", "free_opt",
+                           "phys_opt", "floorT2"]
+            else:
+                headers = ["kappa", "NMSE(AGC)", "floorT2"]
+            print("\n   " + " | ".join(f"{h:>11}" for h in headers))
+            for kv, agc, nmse_ls, fo, po, t2 in mse_results:
+                def _c(v):
+                    return f"{v:11.3e}" if not math.isnan(v) else f"{'n/a':>11}"
+                if ls:
+                    print("   " + " | ".join([
+                        f"{kv:11g}", f"{agc:11.3e}", _c(nmse_ls), _c(fo), _c(po),
+                        f"{t2:11.3e}"]))
+                else:
+                    print("   " + " | ".join([
+                        f"{kv:11g}", f"{agc:11.3e}", f"{t2:11.3e}"]))
+            if make_plots:
+                mse_kappas = [r[0] for r in mse_results]
+                mse_plot_path = (
+                    os.path.join(
+                        plot_dir,
+                        f"cifar_wl_nt{n_t}_nr{n_r}_epochs{n_epochs}_kappa_sweep_mse.png",
+                    )
+                    if save_plot_files else None
+                )
+                plot_kappa_sweep_mse(
+                    mse_kappas,
+                    [r[1] for r in mse_results], [r[2] for r in mse_results],
+                    [r[3] for r in mse_results], [r[4] for r in mse_results],
+                    [r[5] for r in mse_results], path=mse_plot_path,
+                    snr_db=snr_db, inter_label=inter_name,
+                    abs_snr=(snr_db if ls else None), show_ls=ls,
+                )
+                if mse_plot_path is not None:
+                    npz_path = mse_plot_path[:-len(".png")] + ".npz"
+                    np.savez(
+                        npz_path,
+                        kappa=np.asarray(mse_kappas, dtype=np.float64),
+                        nmse_agc=np.asarray([r[1] for r in mse_results]),
+                        nmse_ls=np.asarray([r[2] for r in mse_results]),
+                        free_opt=np.asarray([r[3] for r in mse_results]),
+                        phys_opt=np.asarray([r[4] for r in mse_results]),
+                        floor_thm2=np.asarray([r[5] for r in mse_results]),
+                    )
+                    print(f"  saved MSE-sweep arrays to: {npz_path}")
+    elif kappa_sweep is not None:
         # Single-teacher sweep: primary --inter wireless RIS (always) + AirFC when
         # --airfc true and --inter linear. SimNet only when --simnet true.
         inter_name = {
@@ -3091,6 +3373,8 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
         extras = []
         if do_wireless_sweep:
             extras.append(f"{inter_name} RIS")
+        if do_wireless_sweep and phi_cosine:
+            extras.append("RIS cosine")
         if do_airfc_sweep:
             extras.append("AirFC")
         extras.extend(sim_labels)
@@ -3105,23 +3389,27 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
             inter_label=inter_name,
             do_wireless=do_wireless_sweep, do_airfc=do_airfc_sweep,
             airfc_n_m=airfc_n_m, airfc_phi_iters=airfc_phi_iters,
-            dataset=dataset,
+            dataset=dataset, phi_cosine=phi_cosine,
         )
         print(f"{inter_name} teacher : {acc:.2f}%")
         headers = ["kappa", "1/kappa"]
         if do_wireless_sweep:
             headers.append(f"{inter_name} RIS")
+        if do_wireless_sweep and phi_cosine:
+            headers.append("RIS cosine")
         if do_airfc_sweep:
             headers.append("AirFC")
         headers.extend(sim_labels)
         print("\n   " + " | ".join(f"{h:>10}" for h in headers))
-        for kappa_value, _, ris, sweep_sim_accs, sweep_airfc_acc in sweep_results:
+        for kappa_value, _, ris, sweep_sim_accs, sweep_airfc_acc, sweep_cos in sweep_results:
             cols = [
                 f"{kappa_value:10g}",
                 f"{1.0 / kappa_value:10.4f}",
             ]
             if do_wireless_sweep:
                 cols.append(f"{ris:9.2f}%")
+            if do_wireless_sweep and phi_cosine:
+                cols.append(f"{sweep_cos:9.2f}%")
             if do_airfc_sweep:
                 cols.append(f"{sweep_airfc_acc:9.2f}%")
             for acc_i in sweep_sim_accs:
@@ -3135,6 +3423,10 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
                 for i, lab in enumerate(sim_labels)
             ] if has_sim else None
             airfc_accs = [row[4] for row in sweep_results] if do_airfc_sweep else None
+            ris_cosine_accs = (
+                [row[5] for row in sweep_results]
+                if (do_wireless_sweep and phi_cosine) else None
+            )
             sweep_plot_path = (
                 os.path.join(
                     plot_dir,
@@ -3145,63 +3437,8 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
             plot_kappa_sweep(
                 kappas, acc, ris_accs=ris_accs, path=sweep_plot_path,
                 airfc_accs=airfc_accs, snr_db=snr_db, inter_label=inter_name,
-                simnet_series=simnet_series,
+                simnet_series=simnet_series, ris_cosine_accs=ris_cosine_accs,
             )
-
-    if mse_sweep is not None and wireless:
-        # Standalone synthesis-NMSE sweep (decoupled kappa range from --kappa_sweep):
-        # the theory floor only binds at high kappa, so this uses its own wide list.
-        inter_name = {
-            "linear": "Linear", "cnn": "CNN", "relu": "ReLU", "none": "None",
-        }.get(intermediate, intermediate)
-        p_perp = _rx_perp_projector(model.n_r, device, freq_hz=carrier_freq_hz)
-        print(
-            f"\n=== MSE sweep ({inter_name} RIS) | N_m={n_m} | "
-            f"opt_subset={mse_opt_subset}"
-            f"{f' | abs_snr={mse_abs_snr:g}dB' if mse_abs_snr is not None else ''} ==="
-        )
-        mse_results = evaluate_mse_kappa_sweep(
-            model, x_te, device, snr_db, phi_iters, num_channels_test,
-            mse_sweep, n_m, p_perp, opt_subset=mse_opt_subset,
-            inter_label=inter_name, abs_snr=mse_abs_snr,
-        )
-        print("\n   " + " | ".join(
-            f"{h:>11}" for h in
-            ["kappa", "NMSE(AGC)", "NMSE(LS)", "free_opt", "phys_opt", "floorT2"]))
-        for kv, agc, ls, fo, po, t2 in mse_results:
-            def _c(v):
-                return f"{v:11.3e}" if not math.isnan(v) else f"{'n/a':>11}"
-            print("   " + " | ".join([
-                f"{kv:11g}", f"{agc:11.3e}", f"{ls:11.3e}", _c(fo), _c(po),
-                f"{t2:11.3e}"]))
-        if make_plots:
-            mse_kappas = [r[0] for r in mse_results]
-            mse_plot_path = (
-                os.path.join(
-                    plot_dir,
-                    f"cifar_wl_nt{n_t}_nr{n_r}_epochs{n_epochs}_kappa_sweep_mse.png",
-                )
-                if save_plot_files else None
-            )
-            plot_kappa_sweep_mse(
-                mse_kappas,
-                [r[1] for r in mse_results], [r[2] for r in mse_results],
-                [r[3] for r in mse_results], [r[4] for r in mse_results],
-                [r[5] for r in mse_results], path=mse_plot_path,
-                snr_db=snr_db, inter_label=inter_name, abs_snr=mse_abs_snr,
-            )
-            if mse_plot_path is not None:
-                npz_path = mse_plot_path[:-len(".png")] + ".npz"
-                np.savez(
-                    npz_path,
-                    kappa=np.asarray(mse_kappas, dtype=np.float64),
-                    nmse_agc=np.asarray([r[1] for r in mse_results]),
-                    nmse_ls=np.asarray([r[2] for r in mse_results]),
-                    free_opt=np.asarray([r[3] for r in mse_results]),
-                    phys_opt=np.asarray([r[4] for r in mse_results]),
-                    floor_thm2=np.asarray([r[5] for r in mse_results]),
-                )
-                print(f"  saved MSE-sweep arrays to: {npz_path}")
 
     if snr_sweep is not None:
         do_wireless_sweep = bool(wireless)
@@ -3266,7 +3503,79 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
                 simnet_series=simnet_series,
             )
 
-    if n_m_sweep is not None:
+    if n_m_sweep is not None and mse:
+        if not wireless:
+            print("  --mse: requires --wireless true (skipped)")
+        else:
+            inter_name = {
+                "linear": "Linear", "cnn": "CNN", "relu": "ReLU", "none": "None",
+            }.get(intermediate, intermediate)
+            print(
+                f"\n=== MSE N_m sweep ({inter_name} RIS) | "
+                f"{channel_settings_label(channel_type, kappa)}"
+                + (f" | opt_subset={mse_opt_subset} | abs_snr={snr_db:g}dB | --ls"
+                   if ls else "")
+                + " ==="
+            )
+            mse_nm_results = evaluate_mse_n_m_sweep(
+                model, x_te, device, snr_db, phi_iters, num_channels_test,
+                n_m_sweep, kappa, p_perp=None, channel_type=channel_type,
+                opt_subset=mse_opt_subset, inter_label=inter_name,
+                abs_snr=(snr_db if ls else None), ls=ls,
+            )
+            if ls:
+                headers = ["N_m", "NMSE(AGC)", "NMSE(MRT)", "NMSE(LS)",
+                           "free_opt", "phys_opt", "prop1"]
+            else:
+                headers = ["N_m", "NMSE(AGC)", "NMSE(MRT)", "prop1"]
+            print("\n   " + " | ".join(f"{h:>11}" for h in headers))
+            for nm, agc, mrt, nmse_ls, fo, po, prop1 in mse_nm_results:
+                def _c(v):
+                    return f"{v:11.3e}" if not math.isnan(v) else f"{'n/a':>11}"
+                if ls:
+                    print("   " + " | ".join([
+                        f"{nm:11g}", f"{agc:11.3e}", f"{mrt:11.3e}",
+                        _c(nmse_ls), _c(fo), _c(po), f"{prop1:11.3e}"]))
+                else:
+                    print("   " + " | ".join([
+                        f"{nm:11g}", f"{agc:11.3e}", f"{mrt:11.3e}",
+                        f"{prop1:11.3e}"]))
+            if make_plots:
+                mse_nms = [r[0] for r in mse_nm_results]
+                mse_nm_plot_path = (
+                    os.path.join(
+                        plot_dir,
+                        f"cifar_wl_nt{n_t}_nr{n_r}_epochs{n_epochs}_nm_sweep_mse.png",
+                    )
+                    if save_plot_files else None
+                )
+                plot_n_m_sweep_mse(
+                    mse_nms,
+                    [r[1] for r in mse_nm_results],
+                    [r[2] for r in mse_nm_results],
+                    [r[3] for r in mse_nm_results],
+                    [r[4] for r in mse_nm_results],
+                    [r[5] for r in mse_nm_results],
+                    [r[6] for r in mse_nm_results],
+                    path=mse_nm_plot_path,
+                    snr_db=snr_db, inter_label=inter_name,
+                    abs_snr=(snr_db if ls else None), show_ls=ls,
+                    kappa=kappa, channel_type=channel_type, n_r=n_r,
+                )
+                if mse_nm_plot_path is not None:
+                    npz_path = mse_nm_plot_path[:-len(".png")] + ".npz"
+                    np.savez(
+                        npz_path,
+                        n_m=np.asarray(mse_nms, dtype=np.float64),
+                        nmse_agc=np.asarray([r[1] for r in mse_nm_results]),
+                        nmse_mrt=np.asarray([r[2] for r in mse_nm_results]),
+                        nmse_ls=np.asarray([r[3] for r in mse_nm_results]),
+                        free_opt=np.asarray([r[4] for r in mse_nm_results]),
+                        phys_opt=np.asarray([r[5] for r in mse_nm_results]),
+                        prop1_bound=np.asarray([r[6] for r in mse_nm_results]),
+                    )
+                    print(f"  saved MSE N_m-sweep arrays to: {npz_path}")
+    elif n_m_sweep is not None:
         print("\n=== N_m sweep (wireless RIS / AirFC vs N_m) ===")
         sweep_results = evaluate_n_m_sweep(
             model, x_te, y_te, acc, n_m_sweep, device, snr_db,
@@ -3748,7 +4057,7 @@ if __name__ == "__main__":
                         help="Run mode: demo is quick; full trains longer")
     parser.add_argument("--make_plots", type=str, default="true", choices=["true", "false"],
                         help="Show sample-prediction plots (Interactive Window): true or false")
-    parser.add_argument("--save_plots", type=str, default="true", choices=["true", "false"],
+    parser.add_argument("--save_plots", type=str, default="false", choices=["true", "false"],
                         help="Also write plot PNGs under plots/: true or false (default false)")
     parser.add_argument("--save", type=str, default="true", choices=["true", "false"],
                         help="Save trained model before loading it for evaluation: true or false")
@@ -3774,32 +4083,28 @@ if __name__ == "__main__":
     parser.add_argument("--wireless", type=str, default="true", choices=["true", "false"],
                         help="Evaluate wireless RIS (single-point, kappa_sweep, snr_sweep; "
                              "default true)")
-    parser.add_argument("--airfc", type=str, default="true", choices=["true", "false"],
+    parser.add_argument("--airfc", type=str, default="false", choices=["true", "false"],
                         help="Evaluate AirFC P/Phi/U when --inter linear "
-                             "(single-point, kappa_sweep, snr_sweep; default true)")
+                             "(single-point, kappa_sweep, snr_sweep; default false)")
     parser.add_argument("--airfc_debug", type=str, default="true",
                         choices=["true", "false"],
                         help="Print one-batch AirFC AO fit diagnostics "
                              "(relF over iters, norms; default true)")
-    parser.add_argument("--mse_sweep", type=str, nargs="?", const="auto",
-                        default=None,
-                        help="With --wireless, run a standalone synthesis-NMSE vs "
-                             "kappa sweep: achieved (AGC + LS scale), the free-scale "
-                             "optimum (LM feasibility; ~0 at finite K), and the Thm 2 "
-                             "floor ||P_perp y||^2 (K->inf). Add --mse_abs_snr for the "
-                             "physical-optimum K-vs-SNR curve. kappa is a dB K-factor; "
-                             "pass a comma list (dB) or bare/'auto' for a wide default "
-                             "(0..70 dB == linear K 1..1e7). geometric_ricean only; "
-                             "most meaningful with --inter linear (default off)")
+    parser.add_argument("--mse", type=str, nargs="?", const="true",
+                        default="false", choices=["true", "false"],
+                        help="With --kappa_sweep or --n_m_sweep (and --wireless), "
+                             "switch that sweep from accuracy to synthesis-NMSE "
+                             "(noiseless AGC + Thm 2 floor). Add --ls for LS scale + "
+                             "physical optimum (absolute noise from --snr). Bare "
+                             "--mse means true. Without a sweep this is a no-op.")
+    parser.add_argument("--ls", type=str, nargs="?", const="true",
+                        default="false", choices=["true", "false"],
+                        help="With --mse, also compute/plot LS scale and physical "
+                             "optimum (and free_opt in the table). Bare --ls means "
+                             "true. Ignored without --mse.")
     parser.add_argument("--mse_opt_subset", type=int, default=16,
-                        help="Images used for the per-image optimum curves in "
-                             "--mse_sweep (0 disables them; default 16)")
-    parser.add_argument("--mse_abs_snr", type=float, default=None,
-                        help="Opt-in absolute-noise model for --mse_sweep (dB). Fixes "
-                             "sigma^2 from the received power at the lowest K, so "
-                             "nulling the LoS beam costs SNR and the physical-optimum "
-                             "curve (K-vs-SNR tradeoff) appears. Omitted => the "
-                             "pipeline's relative-SNR noise, no physical-optimum curve.")
+                        help="Images used for the per-image optimum curves when "
+                             "--mse --ls (0 disables them; default 16)")
     parser.add_argument("--compare_teachers", type=str, default="false",
                         choices=["true", "false"],
                         help="Load the cnn + linear teachers and compare clean / "
@@ -3852,6 +4157,12 @@ if __name__ == "__main__":
                              f"(default {DEFAULT_CARRIER_FREQ_HZ:g})")
     parser.add_argument("--phi_iters", type=int, default=None,
                         help=f"Wireless RIS phi GD iters (default {DEFAULT_PHI_ITERS})")
+    parser.add_argument("--phi_cosine", type=str, nargs="?", const="true",
+                        default="false", choices=["true", "false"],
+                        help="With --kappa_sweep and --wireless, also plot a second "
+                             "Linear RIS curve using cosine-similarity phi GD. "
+                             "Default wireless phi is AGC-MSE. Bare --phi_cosine "
+                             "means true.")
     parser.add_argument("--airfc_phi_iters", type=int, default=None,
                         help="AirFC P/Phi/U GD iters (default: same as --phi_iters)")
     parser.add_argument("--channel_type", type=str, default=None,
@@ -3867,15 +4178,21 @@ if __name__ == "__main__":
                              f"(default {DEFAULT_NUM_CHANNELS_TEST})")
     parser.add_argument("--kappa_sweep", type=str, nargs="?", const="auto", default=None,
                         help="Sweep the primary --inter teacher's wireless RIS vs "
-                             "log10(1/kappa). With --airfc true (default) and "
-                             "--inter linear, also plots AirFC. Add --simnet true for "
-                             "the E2E curve. Pass no value/auto for 7 log-spaced "
-                             "kappa=1..100, or comma-separated values.")
+                             "log10(1/kappa). Default RIS phi is AGC-MSE. With "
+                             "--airfc true and --inter linear, also plots AirFC. "
+                             "Add --simnet true for E2E, or --phi_cosine for the "
+                             "old cosine-phi curve beside default RIS. With --mse, "
+                             "switches to synthesis-NMSE vs kappa (AGC + Thm 2 floor; "
+                             "add --ls for LS + physical optimum; skips accuracy). "
+                             "Pass no value/auto for 7 log-spaced kappa=1..100, or "
+                             "comma-separated values.")
     parser.add_argument("--snr_sweep", type=str, nargs="?", const="auto", default=None,
                         help="SNR sweep in dB at fixed --kappa. Pass no value/auto for "
                              "0..60 step 5, or comma-separated values.")
     parser.add_argument("--n_m_sweep", type=str, nargs="?", const="auto", default=None,
                         help="N_m sweep for wireless and AirFC (same N_m each point). "
+                             "With --mse, switches to synthesis-NMSE vs N_m at fixed "
+                             "--kappa / --channel_type (skips accuracy). "
                              "Pass no value/auto for 16,32,64,128, or comma-separated ints.")
     parser.add_argument("--model", type=str, default=None,
                         help="Explicit path to a checkpoint (overrides model_dir default)")
@@ -3892,17 +4209,9 @@ if __name__ == "__main__":
     wireless = args.wireless == "true"
     airfc = args.airfc == "true"
     airfc_debug = args.airfc_debug == "true"
-    _mse_arg = args.mse_sweep
-    if isinstance(_mse_arg, str) and _mse_arg.strip().lower() in ("true", "yes", "on"):
-        _mse_arg = "auto"          # accept `--mse_sweep true` as the wide default
-    elif isinstance(_mse_arg, str) and _mse_arg.strip().lower() in ("false", "off", "no"):
-        _mse_arg = None
-    # kappa is a dB K-factor here (see make_ris_channel_pools), so the wide default
-    # spans 0..70 dB == linear K 1..1e7 (the theory floor binds at the high-dB end).
-    mse_sweep = parse_sweep_values(
-        _mse_arg, float,
-        auto_values=(0.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 40.0, 50.0, 60.0, 70.0),
-    )
+    phi_cosine = args.phi_cosine == "true"
+    mse = args.mse == "true"
+    ls = args.ls == "true"
     compare_teachers = args.compare_teachers == "true"
     compare_e2e = args.compare_e2e == "true"
     intermediate = normalize_intermediate(args.inter)
@@ -3921,6 +4230,12 @@ if __name__ == "__main__":
     n_m_sweep = parse_sweep_values(
         args.n_m_sweep, int, auto_values=(16, 32, 64, 128),
     )
+    if mse and kappa_sweep is None and n_m_sweep is None:
+        print("--mse requires --kappa_sweep or --n_m_sweep (no-op)")
+        mse = False
+    if ls and not mse:
+        print("--ls requires --mse (ignored)")
+        ls = False
     channel_type = DEFAULT_CHANNEL_TYPE if args.channel_type is None else args.channel_type
     # Rayleigh has no K-factor; Ricean uses DEFAULT_KAPPA when --kappa omitted.
     if channel_type == "geometric_rayleigh":
@@ -4000,6 +4315,7 @@ if __name__ == "__main__":
     print(f"Intermediate: {intermediate} ({intermediate_label(intermediate)})")
     print(f"Mid BN+Dropout: {mid_bn}")
     print(f"Wireless RIS path: {wireless}")
+    print(f"MSE kappa sweep: {mse}" + (f" (ls={ls})" if mse else ""))
     print(f"AirFC path: {airfc}"
           + ("" if (not airfc or intermediate == "linear")
              else f" (skipped: needs --inter linear, got {intermediate})"))
@@ -4062,8 +4378,9 @@ if __name__ == "__main__":
             encoder_depth=encoder_depth,
             mid_bn=mid_bn,
             dataset=dataset,
-            airfc_debug=airfc_debug, mse_sweep=mse_sweep,
-            mse_opt_subset=args.mse_opt_subset, mse_abs_snr=args.mse_abs_snr,
+            airfc_debug=airfc_debug, mse=mse,
+            mse_opt_subset=args.mse_opt_subset,
+            phi_cosine=phi_cosine, ls=ls,
         )
         if wireless_acc is not None:
             print(f"wireless acc : {wireless_acc:.2f}%")
