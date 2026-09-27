@@ -1,0 +1,67 @@
+---
+description: How to format mathematical notation in chat responses
+alwaysApply: true
+---
+
+# Math Formatting
+
+Inline math does not render readably for this user. It shows up as mangled
+half-broken symbols in the middle of a sentence.
+
+## Rules
+
+- **Never put math inline in a sentence.** No `$...$`, no `\(...\)`.
+- **Always put math on its own line** in a display block, using `$$ ... $$`.
+- **Prose must be readable with the math removed.** Refer to quantities in
+  words ("the Rician factor", "the number of RIS elements", "the receive
+  steering vector"), not as inline symbols.
+- **Define symbols after the display block**, either in words or on a second
+  display line.
+- For a quick scalar or a variable name that appears in code, use backticks
+  (`n_m`, `kappa`, `snr_db`) rather than math mode.
+
+## Examples
+
+❌ BAD — inline symbols inside prose:
+
+```
+The bound holds when $\mu^\star \ge \sigma^2$, and since $\lambda_{k\ge2} =
+\Theta(M\alpha^2/\kappa)$ the condition fails as $\kappa \to \infty$.
+```
+
+✅ GOOD — prose carries the meaning, math sits on its own line:
+
+```
+The bound holds only when the KKT multiplier is at least the noise variance:
+
+$$
+\mu^\star \ge \sigma^2
+$$
+
+Since the scattered eigenvalues decay like
+
+$$
+\lambda_{k\ge2} = \Theta\!\left(\frac{M\alpha^2}{\kappa}\right)
+$$
+
+this condition fails in the high-LoS limit.
+```
+
+✅ GOOD — stating a result, then its symbol definitions:
+
+```
+The error floor in the pure-LoS limit is
+
+$$
+\lim_{\kappa\to\infty}\mathrm{MSE}_{\min}(\mathbf{s}) \;\ge\;
+N_r\sigma^2 + \|\mathbf{y}\|_2^2 - \frac{|\mathbf{a}_{\mathrm{rx}}^H\mathbf{y}|^2}{N_r}
+$$
+
+where the last term is the energy the surface can actually steer, along the
+single reachable receive direction.
+```
+
+## Applies to
+
+Chat responses and markdown files written into the repo. Follow the same
+convention in `theory/*.md` and any write-up meant to go into the article.

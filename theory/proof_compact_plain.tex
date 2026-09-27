@@ -1,0 +1,519 @@
+%% ===================================================================
+%%  A lower bound on the MSE of RIS-based analog linear synthesis
+%%  -- MACRO-FREE VERSION --
+%%
+%%  Every symbol is written out in full. There are no \newcommand
+%%  definitions, so the body can be pasted into any existing project
+%%  without copying a preamble.
+%%
+%%  Requires only: amsmath, amssymb, amsthm  (\boldsymbol comes with
+%%  amsmath, so the bm package is not needed).
+%%
+%%  If your project already defines theorem/lemma/corollary/remark
+%%  environments, delete the \newtheorem block below.
+%% ===================================================================
+
+\documentclass[11pt]{article}
+
+\usepackage{amsmath,amsfonts,amssymb,amsthm}
+\usepackage{geometry}
+\geometry{margin=1in}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+\newtheorem{corollary}{Corollary}
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}
+
+\title{A Lower Bound on the MSE of RIS-Based Analog Linear Synthesis}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+%% =================== BODY STARTS HERE ===================
+
+\section{System model and notation}
+
+A reconfigurable intelligent surface (RIS) of $M$ phase-shifting elements is
+asked to synthesize a target latent vector $\mathbf{y}\in\mathbb{C}^{N_r}$ from
+an input latent vector $\mathbf{s}\in\mathbb{C}^{N_t}$ during propagation. The
+forward model is
+\begin{equation}
+\mathbf{y}_{\mathrm{synth}}
+= \mathbf{H}_2\,\boldsymbol{\Phi}\,\mathbf{H}_1\,\mathbf{s} + \mathbf{w},
+\qquad
+\boldsymbol{\Phi} = \operatorname{diag}(\boldsymbol{\phi}),
+\qquad
+\mathbf{w}\sim\mathcal{CN}(\mathbf{0},\sigma^2\mathbf{I}_{N_r}),
+\label{eq:forward}
+\end{equation}
+with $\mathbf{H}_1\in\mathbb{C}^{M\times N_t}$,
+$\mathbf{H}_2\in\mathbb{C}^{N_r\times M}$, and the control variable confined to
+the complex torus
+\begin{equation}
+\boldsymbol{\phi}\in\mathbb{T}^{M} \triangleq
+\bigl\{\boldsymbol{\phi}\in\mathbb{C}^{M}:\ |\phi_m|=1,\ m=1,\dots,M\bigr\}.
+\label{eq:torus}
+\end{equation}
+
+Both links are Rician with factor $\kappa$. Writing
+$\varepsilon\triangleq 1/(\kappa+1)\in(0,1]$,
+\begin{equation}
+\mathbf{H}_1=\sqrt{1-\varepsilon}\,\mathbf{a}_{\mathrm{ris},1}
+             \mathbf{a}_{\mathrm{tx}}^{H}
+            +\sqrt{\varepsilon}\,\tilde{\mathbf{H}}_1,
+\qquad
+\mathbf{H}_2=\sqrt{1-\varepsilon}\,\mathbf{a}_{\mathrm{rx}}
+             \mathbf{a}_{\mathrm{ris},2}^{H}
+            +\sqrt{\varepsilon}\,\tilde{\mathbf{H}}_2.
+\label{eq:rician}
+\end{equation}
+
+\paragraph{Standing assumptions.}
+\begin{itemize}
+\item[(A1)] $\|\mathbf{a}_{\mathrm{tx}}\|_2^2=N_t$,
+      $\|\mathbf{a}_{\mathrm{rx}}\|_2^2=N_r$, and
+      $\bigl|[\mathbf{a}_{\mathrm{ris},i}]_m\bigr|=1$ for all $m$ and
+      $i\in\{1,2\}$, hence $\|\mathbf{a}_{\mathrm{ris},i}\|_2^2=M$.
+\item[(A2)] $\tilde{\mathbf{H}}_1,\tilde{\mathbf{H}}_2$ have i.i.d.\
+      $\mathcal{CN}(0,1)$ entries, mutually independent and independent of
+      $\mathbf{w}$.
+\item[(A3)] $\alpha\triangleq|\mathbf{a}_{\mathrm{tx}}^{H}\mathbf{s}|>0$ and
+      $\beta\triangleq\|\mathbf{s}\|_2$.
+\item[(A4)] $M\ge N_r\ge 2$.
+\end{itemize}
+
+All statements are conditional on a channel realization; probabilistic
+statements refer to the draw of $(\tilde{\mathbf{H}}_1,\tilde{\mathbf{H}}_2)$.
+Throughout,
+\begin{equation}
+\mathbf{P}^{\perp} \triangleq
+\mathbf{I}_{N_r}-\frac{\mathbf{a}_{\mathrm{rx}}\mathbf{a}_{\mathrm{rx}}^{H}}{N_r}
+\label{eq:Pperp}
+\end{equation}
+is the orthogonal projector onto the complement of the receive beam direction,
+and $\bigl(x\bigr)_{+}\triangleq\max(x,0)$. The quantity of interest is
+\begin{equation}
+\mathrm{MSE}_{\min}(\mathbf{s})
+\triangleq
+\min_{\boldsymbol{\phi}\in\mathbb{T}^{M}}\
+\mathbb{E}_{\mathbf{w}}
+\Bigl[\bigl\|\mathbf{y}-(\mathbf{H}_2\boldsymbol{\Phi}\mathbf{H}_1\mathbf{s}
+       +\mathbf{w})\bigr\|_2^2\Bigr].
+\label{eq:objective}
+\end{equation}
+
+\section{Reduction to a linear synthesis problem}
+
+\begin{lemma}[Reduction]
+\label{lem:reduction}
+With
+$\mathbf{A}\equiv\mathbf{A}(\mathbf{s})
+ \triangleq\mathbf{H}_2\operatorname{diag}(\mathbf{H}_1\mathbf{s})
+ \in\mathbb{C}^{N_r\times M}$,
+\begin{equation}
+\mathrm{MSE}_{\min}(\mathbf{s})=N_r\sigma^2+\mathcal{E}(\mathbf{s}),
+\qquad
+\mathcal{E}(\mathbf{s})\triangleq
+\min_{\boldsymbol{\phi}\in\mathbb{T}^{M}}\|\mathbf{y}-\mathbf{A}\boldsymbol{\phi}\|_2^2,
+\label{eq:reduction}
+\end{equation}
+and the $m$-th column of $\mathbf{A}$ is
+$\mathbf{A}\mathbf{e}_m=[\mathbf{H}_1\mathbf{s}]_m\,\mathbf{h}_{2,m}$, where
+$\mathbf{h}_{2,m}$ is the $m$-th column of $\mathbf{H}_2$.
+\end{lemma}
+
+\begin{proof}
+For deterministic $\mathbf{r}=\mathbf{y}-\mathbf{A}\boldsymbol{\phi}$,
+$\|\mathbf{r}-\mathbf{w}\|_2^2
+ =\|\mathbf{r}\|_2^2-2\operatorname{Re}(\mathbf{r}^{H}\mathbf{w})
+  +\|\mathbf{w}\|_2^2$;
+the cross term vanishes since $\mathbb{E}[\mathbf{w}]=\mathbf{0}$, and
+$\mathbb{E}\|\mathbf{w}\|_2^2=\operatorname{tr}(\sigma^2\mathbf{I}_{N_r})
+ =N_r\sigma^2$.
+Entrywise
+$[\boldsymbol{\Phi}\mathbf{H}_1\mathbf{s}]_m=[\mathbf{H}_1\mathbf{s}]_m\phi_m$,
+so $\boldsymbol{\Phi}\mathbf{H}_1\mathbf{s}
+ =\operatorname{diag}(\mathbf{H}_1\mathbf{s})\boldsymbol{\phi}$ and
+$\mathbf{H}_2\boldsymbol{\Phi}\mathbf{H}_1\mathbf{s}
+ =\mathbf{A}\boldsymbol{\phi}$. The column formula follows from
+$\mathbf{A}\mathbf{e}_m=\mathbf{H}_2\mathbf{e}_m[\mathbf{H}_1\mathbf{s}]_m$. The
+minimum is attained because $\mathbb{T}^{M}$ is compact and the objective
+continuous.
+\end{proof}
+
+The additive term $N_r\sigma^2$ is independent of $\boldsymbol{\phi}$ and must be
+carried throughout; everything below bounds the \emph{synthesis residual}
+$\mathcal{E}(\mathbf{s})$.
+
+\section{The geometric floor}
+
+\begin{theorem}[Range floor; exactness in the pure-LoS limit]
+\label{thm:floor}
+Let $\mathbf{P}^{\perp}_{\mathbf{A}}$ project onto
+$\operatorname{range}(\mathbf{A}(\mathbf{s}))^{\perp}$. Then
+\begin{equation}
+\mathcal{E}(\mathbf{s})\ \ge\
+\inf_{\boldsymbol{\phi}\in\mathbb{C}^{M}}
+ \|\mathbf{y}-\mathbf{A}\boldsymbol{\phi}\|_2^2
+=\bigl\|\mathbf{P}^{\perp}_{\mathbf{A}}\mathbf{y}\bigr\|_2^2,
+\qquad
+\operatorname{range}(\mathbf{A})
+=\operatorname{span}\bigl\{\mathbf{h}_{2,m}:[\mathbf{H}_1\mathbf{s}]_m\neq0\bigr\}
+\subseteq\operatorname{range}(\mathbf{H}_2).
+\label{eq:rangefloor}
+\end{equation}
+In the pure-LoS case $\varepsilon=0$,
+\begin{equation}
+\mathbf{A}(\mathbf{s})
+=(\mathbf{a}_{\mathrm{tx}}^{H}\mathbf{s})\,\mathbf{a}_{\mathrm{rx}}\,
+ \mathbf{a}_{\mathrm{ris},2}^{H}
+ \operatorname{diag}(\mathbf{a}_{\mathrm{ris},1}),
+\qquad
+\operatorname{rank}\mathbf{A}=1,
+\qquad
+\operatorname{range}(\mathbf{A})=\operatorname{span}\{\mathbf{a}_{\mathrm{rx}}\},
+\label{eq:rank1}
+\end{equation}
+so that
+\begin{equation}
+\mathcal{E}(\mathbf{s})\ \ge\
+\bigl\|\mathbf{P}^{\perp}\mathbf{y}\bigr\|_2^2
+=\|\mathbf{y}\|_2^2-\frac{|\mathbf{a}_{\mathrm{rx}}^{H}\mathbf{y}|^2}{N_r},
+\label{eq:losfloor}
+\end{equation}
+with \emph{equality} whenever
+$|\mathbf{a}_{\mathrm{rx}}^{H}\mathbf{y}|/N_r\le M\alpha$.
+\end{theorem}
+
+\begin{proof}
+Since $\mathbf{A}\boldsymbol{\phi}\in\operatorname{range}(\mathbf{A})$ for every
+$\boldsymbol{\phi}$ and $\mathbb{T}^{M}\subset\mathbb{C}^{M}$, the residual is at
+least the distance from $\mathbf{y}$ to $\operatorname{range}(\mathbf{A})$,
+attained by orthogonal projection. The range identity follows from
+Lemma~\ref{lem:reduction}: the $m$-th column spans the same line as
+$\mathbf{h}_{2,m}$ when $[\mathbf{H}_1\mathbf{s}]_m\neq0$ and vanishes otherwise.
+
+For $\varepsilon=0$ we have
+$\mathbf{H}_1=\mathbf{a}_{\mathrm{ris},1}\mathbf{a}_{\mathrm{tx}}^{H}$ and
+$\mathbf{H}_2=\mathbf{a}_{\mathrm{rx}}\mathbf{a}_{\mathrm{ris},2}^{H}$, hence
+$\mathbf{H}_1\mathbf{s}
+ =(\mathbf{a}_{\mathrm{tx}}^{H}\mathbf{s})\mathbf{a}_{\mathrm{ris},1}$, whose
+entries all have modulus $\alpha>0$ by (A1) and (A3); this gives
+\eqref{eq:rank1} and therefore \eqref{eq:losfloor}.
+
+For exactness, \eqref{eq:rank1} yields
+\begin{equation}
+\mathbf{A}\boldsymbol{\phi}
+=(\mathbf{a}_{\mathrm{tx}}^{H}\mathbf{s})\,c(\boldsymbol{\phi})\,
+ \mathbf{a}_{\mathrm{rx}},
+\qquad
+c(\boldsymbol{\phi})=\sum_{m=1}^{M}
+ \overline{[\mathbf{a}_{\mathrm{ris},2}]_m}\,
+ [\mathbf{a}_{\mathrm{ris},1}]_m\,\phi_m .
+\label{eq:cphi}
+\end{equation}
+Each summand has unit modulus and arbitrary phase as $\phi_m$ ranges over the
+unit circle, so $\{c(\boldsymbol{\phi}):\boldsymbol{\phi}\in\mathbb{T}^{M}\}$ is
+exactly the closed disk of radius $M$: containment is the triangle inequality,
+and conversely, fixing a target phase $\theta$ and pairing elements as
+$e^{i(\theta\pm\omega)}$ realizes $2\cos\omega\,e^{i\theta}$ per pair, so every
+modulus in $[0,M]$ is attainable (for odd $M$, use $\lfloor M/2\rfloor$ pairs
+plus one free element). The reachable set is thus
+$\{z\mathbf{a}_{\mathrm{rx}}:|z|\le M\alpha\}$, and the minimizing
+$z^{\star}=\mathbf{a}_{\mathrm{rx}}^{H}\mathbf{y}/N_r$ is feasible precisely
+under the stated condition.
+\end{proof}
+
+\begin{remark}
+Under pure LoS the RIS controls exactly one complex scalar: the received vector
+is locked to the direction $\mathbf{a}_{\mathrm{rx}}$ irrespective of
+$\mathbf{s}$ and $\boldsymbol{\phi}$. Neither the transmit power nor the surface
+size $M$ alters this; $M$ only sets the radius of the reachable disk.
+\end{remark}
+
+\begin{remark}
+At any finite $\kappa$ with $M\ge N_r$, $\mathbf{A}(\mathbf{s})$ has full row
+rank almost surely and \eqref{eq:rangefloor} degenerates to $0$. The
+finite-$\kappa$ statement therefore cannot be a rank statement; it must be a
+conditioning statement, which is Theorem~\ref{thm:finitekappa}.
+\end{remark}
+
+\section{Non-asymptotic floor at finite Rician factor}
+
+\begin{theorem}[Finite $\kappa$]
+\label{thm:finitekappa}
+Deterministically,
+\begin{equation}
+\mathcal{E}(\mathbf{s})\ \ge\
+\Bigl(\bigl\|\mathbf{P}^{\perp}\mathbf{y}\bigr\|_2
+ -\sqrt{M}\,\bigl\|\mathbf{P}^{\perp}\mathbf{A}(\mathbf{s})\bigr\|_2
+\Bigr)_{+}^{2},
+\qquad
+\bigl\|\mathbf{P}^{\perp}\mathbf{A}(\mathbf{s})\bigr\|_2
+\le\sqrt{\varepsilon}\,s_{\max}(\tilde{\mathbf{H}}_2)\,
+   \max_{m}\bigl|[\mathbf{H}_1\mathbf{s}]_m\bigr|.
+\label{eq:finitekappa}
+\end{equation}
+Consequently, for any $\delta\in(0,1)$, with probability at least $1-\delta$
+over the NLoS draw,
+\begin{equation}
+\mathrm{MSE}_{\min}(\mathbf{s})\ \ge\ N_r\sigma^2
++\Bigl(\bigl\|\mathbf{P}^{\perp}\mathbf{y}\bigr\|_2
+ -\Delta(\kappa,M,\delta)\Bigr)_{+}^{2},
+\label{eq:finitekappaprob}
+\end{equation}
+where, with $\tau=\sqrt{2\ln(2/\delta)}$,
+\begin{equation}
+\Delta(\kappa,M,\delta)
+=\sqrt{\frac{M}{\kappa+1}}
+ \Bigl(\sqrt{M}+\sqrt{N_r}+\tau\Bigr)
+ \Bigl(\alpha+\tfrac{\beta}{\sqrt{\kappa+1}}
+  \sqrt{\ln\tfrac{2M}{\delta}}\Bigr)
+=\mathcal{O}\!\left(\frac{M\alpha}{\sqrt{\kappa}}\right).
+\label{eq:delta}
+\end{equation}
+In particular
+$\liminf_{\kappa\to\infty}\mathcal{E}(\mathbf{s})
+ \ge\|\mathbf{P}^{\perp}\mathbf{y}\|_2^2$, recovering
+Theorem~\ref{thm:floor} continuously. The bound is non-vacuous as soon as
+$\kappa+1\gtrsim M^2\alpha^2/\|\mathbf{P}^{\perp}\mathbf{y}\|_2^2$.
+\end{theorem}
+
+\begin{proof}
+By (A1), $\mathbf{P}^{\perp}\mathbf{a}_{\mathrm{rx}}=\mathbf{0}$, so the
+rank-one LoS term of $\mathbf{H}_2$ is annihilated exactly and
+\begin{equation}
+\mathbf{P}^{\perp}\mathbf{H}_2
+=\sqrt{\varepsilon}\,\mathbf{P}^{\perp}\tilde{\mathbf{H}}_2 .
+\label{eq:annihilation}
+\end{equation}
+Fix any $\boldsymbol{\phi}\in\mathbb{T}^{M}$. Since $\mathbf{P}^{\perp}$ is an
+orthogonal projector, $\|\mathbf{r}\|_2\ge\|\mathbf{P}^{\perp}\mathbf{r}\|_2$,
+whence by the reverse triangle inequality and the definition of the spectral
+norm
+\begin{equation}
+\|\mathbf{y}-\mathbf{A}\boldsymbol{\phi}\|_2
+\ \ge\ \bigl\|\mathbf{P}^{\perp}\mathbf{y}
+        -\mathbf{P}^{\perp}\mathbf{A}\boldsymbol{\phi}\bigr\|_2
+\ \ge\ \bigl\|\mathbf{P}^{\perp}\mathbf{y}\bigr\|_2
+       -\bigl\|\mathbf{P}^{\perp}\mathbf{A}\bigr\|_2\|\boldsymbol{\phi}\|_2 .
+\label{eq:revtriangle}
+\end{equation}
+On the torus $\|\boldsymbol{\phi}\|_2=\sqrt{M}$ exactly; taking positive parts,
+squaring and minimizing over $\boldsymbol{\phi}$ gives the first part of
+\eqref{eq:finitekappa}. For the second part,
+$\mathbf{P}^{\perp}\mathbf{A}
+ =\mathbf{P}^{\perp}\mathbf{H}_2\operatorname{diag}(\mathbf{H}_1\mathbf{s})$
+with
+$\|\operatorname{diag}(\mathbf{H}_1\mathbf{s})\|_2
+ =\max_m|[\mathbf{H}_1\mathbf{s}]_m|$;
+apply submultiplicativity and \eqref{eq:annihilation}.
+
+For \eqref{eq:finitekappaprob}, the Davidson--Szarek bound gives
+$\Pr\bigl(s_{\max}(\tilde{\mathbf{H}}_2)>\sqrt{M}+\sqrt{N_r}+\tau\bigr)
+ \le e^{-\tau^2/2}$,
+which is at most $\delta/2$ for $\tau=\sqrt{2\ln(2/\delta)}$. Writing
+$z_m\triangleq\tilde{\mathbf{g}}_{1,m}^{T}\mathbf{s}\sim\mathcal{CN}(0,\beta^2)$,
+the variable $|z_m|/\beta$ is Rayleigh with
+$\Pr(|z_m|/\beta>t)=e^{-t^2}$, so a union bound over $m$ gives
+$\max_m|z_m|\le\beta\sqrt{\ln(2M/\delta)}$ with probability at least
+$1-\delta/2$; combined with
+$|[\mathbf{H}_1\mathbf{s}]_m|
+ \le\sqrt{1-\varepsilon}\,\alpha+\sqrt{\varepsilon}|z_m|$
+and a final union bound, \eqref{eq:delta} follows. Add $N_r\sigma^2$ via
+\eqref{eq:reduction}. The rate holds since
+$\sqrt{M}(\sqrt{M}+\sqrt{N_r}+\tau)=\Theta(M)$ for $M\ge N_r$.
+\end{proof}
+
+\section{Consequences}
+
+\begin{corollary}[Cosine objective with automatic gain control]
+\label{cor:cosine}
+For the scale-invariant matching objective,
+\begin{equation}
+\max_{\boldsymbol{\phi}\in\mathbb{T}^{M}}
+\frac{\bigl|\langle\mathbf{y},\mathbf{A}\boldsymbol{\phi}\rangle\bigr|}
+     {\|\mathbf{y}\|_2\,\|\mathbf{A}\boldsymbol{\phi}\|_2}
+\ \le\
+\frac{\|\mathbf{P}_{\mathbf{A}}\mathbf{y}\|_2}{\|\mathbf{y}\|_2}
+\ \xrightarrow[\ \varepsilon\to0\ ]{}\
+\frac{|\mathbf{a}_{\mathrm{rx}}^{H}\mathbf{y}|}
+     {\sqrt{N_r}\,\|\mathbf{y}\|_2},
+\label{eq:cosbound}
+\end{equation}
+and the gain-matched squared error obeys the same floor,
+\begin{equation}
+\min_{c>0}\|\mathbf{y}-c\,\mathbf{A}\boldsymbol{\phi}\|_2^2
+=\|\mathbf{y}\|_2^2\bigl(1-\cos^2\theta\bigr)
+\ \ge\ \bigl\|\mathbf{P}^{\perp}_{\mathbf{A}}\mathbf{y}\bigr\|_2^2 .
+\label{eq:agc}
+\end{equation}
+\end{corollary}
+
+\begin{proof}
+Cauchy--Schwarz applied to
+$\langle\mathbf{y},\mathbf{v}\rangle
+ =\langle\mathbf{P}_{\mathbf{A}}\mathbf{y},\mathbf{v}\rangle$ for
+$\mathbf{v}\in\operatorname{range}(\mathbf{A})$, together with the
+scale-optimized residual identity
+$\min_c\|\mathbf{y}-c\hat{\mathbf{v}}\|_2^2
+ =\|\mathbf{y}\|_2^2-|\hat{\mathbf{v}}^{H}\mathbf{y}|^2$ for unit
+$\hat{\mathbf{v}}$.
+\end{proof}
+
+\begin{corollary}[Digital pre- and post-processing does not escape the floor]
+\label{cor:airfc}
+Let
+$\mathbf{W}_{\mathrm{phys}}
+ =\mathbf{U}^{H}\mathbf{H}_2\boldsymbol{\Phi}\mathbf{H}_1
+  \mathbf{P}_{\mathrm{tx}}$
+for arbitrary $\mathbf{P}_{\mathrm{tx}}\in\mathbb{C}^{N_t\times N_t}$,
+$\mathbf{U}\in\mathbb{C}^{N_r\times N_r}$ and
+$\boldsymbol{\phi}\in\mathbb{T}^{M}$. At $\varepsilon=0$,
+$\operatorname{rank}(\mathbf{W}_{\mathrm{phys}})\le1$, and therefore for any
+target $\mathbf{W}$,
+\begin{equation}
+\frac{\|\mathbf{W}_{\mathrm{phys}}-\mathbf{W}\|_F}{\|\mathbf{W}\|_F}
+\ \ge\
+\sqrt{1-\frac{\sigma_1^2(\mathbf{W})}{\|\mathbf{W}\|_F^2}} .
+\label{eq:eckartyoung}
+\end{equation}
+\end{corollary}
+
+\begin{proof}
+By \eqref{eq:rank1},
+$\mathbf{H}_2\boldsymbol{\Phi}\mathbf{H}_1
+ =c(\boldsymbol{\phi})\mathbf{a}_{\mathrm{rx}}\mathbf{a}_{\mathrm{tx}}^{H}$
+is rank one for every $\boldsymbol{\phi}$, and rank does not increase under left
+or right multiplication. Apply the Eckart--Young theorem in the Frobenius norm.
+\end{proof}
+
+\section{The spectral route, for reference}
+
+Let
+$\mathbf{R}_{\mathrm{eq}}\triangleq\mathbf{A}\mathbf{A}^{H}
+ =\sum_{k=1}^{N_r}\lambda_k\mathbf{u}_k\mathbf{u}_k^{H}$
+with $\lambda_1\ge\cdots\ge\lambda_{N_r}\ge0$, and
+$y_k\triangleq\mathbf{u}_k^{H}\mathbf{y}$. Relaxing $\mathbb{T}^{M}$ to the ball
+$\{\|\boldsymbol{\phi}\|_2^2\le M\}$ and invoking weak duality for the resulting
+QCQP yields, \emph{unconditionally},
+\begin{equation}
+\mathcal{E}(\mathbf{s})\ \ge\ \sup_{\mu\ge0}
+\left[\sum_{k=1}^{N_r}\frac{\mu\,|y_k|^2}{\lambda_k+\mu}-\mu M\right],
+\label{eq:dual}
+\end{equation}
+with the supremum equal to the exact value of the relaxed problem by Slater's
+condition. Under \eqref{eq:rician}, with probability at least $1-\delta$ and for
+$M\ge N_r\ge3$,
+\begin{equation}
+\lambda_1=\Bigl(\tfrac{\kappa}{\kappa+1}\Bigr)^{2}MN_r\alpha^2
+          \bigl(1+o(1)\bigr),
+\qquad
+\lambda_k=\frac{c_k\,\kappa\,M\,\alpha^2}{(\kappa+1)^2},
+\quad 2\le k\le N_r-1,
+\label{eq:eigs}
+\end{equation}
+with $c_k=\Theta(1)$ determined by the Wishart edge. Dropping the leading mode
+and bounding $\lambda_{k\ge2}\le\bar\lambda$ in \eqref{eq:dual} gives the closed
+form
+\begin{equation}
+\sup_{\mu\ge0}\left[\frac{\mu Y}{\bar\lambda+\mu}-\mu M\right]
+=\Bigl(\sqrt{Y}-\sqrt{\bar\lambda M}\Bigr)_{+}^{2}
+=\Bigl(\sqrt{Y}-\Theta\bigl(M\alpha/\sqrt{\kappa}\bigr)\Bigr)_{+}^{2},
+\qquad
+Y\triangleq\sum_{k\ge2}|y_k|^2,
+\label{eq:closedform}
+\end{equation}
+attained at $\mu=\sqrt{Y\bar\lambda/M}-\bar\lambda$. This matches the
+$\mathcal{O}(M\alpha/\sqrt{\kappa})$ rate of Theorem~\ref{thm:finitekappa},
+confirming that the two routes agree.
+
+\begin{remark}[Validity of the squared-denominator form]
+\label{rem:errata}
+Let
+$G(\mu)=\sum_k\bigl(\tfrac{\mu}{\lambda_k+\mu}\bigr)^2|y_k|^2$ and
+$h(\mu)=\sum_k\lambda_k|y_k|^2/(\lambda_k+\mu)^2$. Then $G(\sigma^2)$
+lower-bounds $\mathcal{E}(\mathbf{s})$ \emph{if and only if}
+$h(\sigma^2)\ge M$, i.e.\ iff the KKT multiplier $\mu^{\star}$ of the power
+constraint (pinned by $h(\mu^{\star})=M$) satisfies $\mu^{\star}\ge\sigma^2$.
+This condition holds only in the intermediate band
+\begin{equation}
+\frac{M\alpha^2}{Y}\ \lesssim\ \kappa\ \lesssim\ \frac{M\alpha^2}{\sigma^2},
+\label{eq:band}
+\end{equation}
+and fails at both ends, in particular as $\kappa\to\infty$. Identifying the KKT
+multiplier with a Tikhonov regularization parameter $\mu\propto\sigma^2$ is
+therefore not a valid proof step; \eqref{eq:dual} is the correct unconditional
+substitute, and carries exponent $1$ together with the penalty $-\mu M$.
+\end{remark}
+
+\section{Assembled result}
+
+Collecting \eqref{eq:reduction}, \eqref{eq:dual}, \eqref{eq:finitekappaprob} and
+\eqref{eq:eigs}, with probability at least $1-\delta$,
+\begin{equation}
+\mathrm{MSE}_{\min}(\mathbf{s})\ \ge\ N_r\sigma^2+\max\left\{
+\underbrace{\Bigl(\|\mathbf{P}^{\perp}\mathbf{y}\|_2
+            -\Delta(\kappa,M,\delta)\Bigr)_{+}^{2}}_{\text{geometric}},
+\ \
+\underbrace{\sup_{\mu\ge0}\left[\sum_{k}
+ \frac{\mu\,|\mathbf{u}_k^{H}\mathbf{y}|^2}{\lambda_k+\mu}-\mu M\right]}
+ _{\text{spectral}}
+\right\}.
+\label{eq:assembled}
+\end{equation}
+Taking $\kappa\to\infty$ at fixed $M,N_r,\sigma^2$ gives $\Delta\to0$ and
+$\mathbf{u}_1\to\mathbf{a}_{\mathrm{rx}}/\sqrt{N_r}$ by Davis--Kahan, since the
+spectral gap $\lambda_1-\lambda_2=\Theta(MN_r\alpha^2)$ dominates the LoS--NLoS
+coupling $\mathcal{O}(\sqrt{\varepsilon M}N_r)$. Hence
+\begin{equation}
+\lim_{\kappa\to\infty}\mathrm{MSE}_{\min}(\mathbf{s})
+\ \ge\ N_r\sigma^2
++\left\|\Bigl(\mathbf{I}_{N_r}
+ -\tfrac{\mathbf{a}_{\mathrm{rx}}\mathbf{a}_{\mathrm{rx}}^{H}}{N_r}\Bigr)
+ \mathbf{y}\right\|_2^2
+= N_r\sigma^2+\|\mathbf{y}\|_2^2-|\mathbf{u}_1^{H}\mathbf{y}|^2 .
+\label{eq:limit}
+\end{equation}
+No secondary limit $\mathrm{SNR}\to\infty$ is required: the geometric floor is a
+statement about $\operatorname{range}(\mathbf{A}(\mathbf{s}))$ and is
+independent of $\sigma^2$, which enters only through the separate additive term
+$N_r\sigma^2$.
+
+\begin{remark}[Consequence]
+If the target is $\mathbf{y}=\mathbf{W}_{\mathrm{lin}}\mathbf{s}$ for a
+full-rank $\mathbf{W}_{\mathrm{lin}}\in\mathbb{C}^{N_r\times N_t}$, and
+$\mathbf{s}$ is not concentrated on
+$\mathbf{W}_{\mathrm{lin}}^{-1}\operatorname{span}
+ \{\mathbf{a}_{\mathrm{rx}}\}$, then for $N_r\ge2$
+\begin{equation}
+\mathbb{E}_{\mathbf{s}}
+ \bigl\|\mathbf{P}^{\perp}\mathbf{W}_{\mathrm{lin}}\mathbf{s}\bigr\|_2^2
+=\Theta\bigl(\mathbb{E}_{\mathbf{s}}
+ \|\mathbf{W}_{\mathrm{lin}}\mathbf{s}\|_2^2\bigr),
+\label{eq:consequence}
+\end{equation}
+i.e.\ a LoS-dominated link cannot carry a full-rank linear map at any SNR and
+with any number of RIS elements. Rich scattering is what makes
+$\|\mathbf{P}^{\perp}_{\mathbf{A}}\mathbf{y}\|_2=0$ attainable.
+\end{remark}
+
+\section{Limitations}
+
+The bounds are one-sided: they constrain what the surface cannot do, and do not
+certify that a particular optimizer approaches them. The relaxation underlying
+\eqref{eq:dual} is shown to be lossless in the rank-one regime, but its gap at
+intermediate $\kappa$ is not quantified here. All statements are per-input and
+per-realization; averaging over a data distribution requires
+$\mathbf{a}_{\mathrm{tx}}^{H}\mathbf{s}\neq0$ almost surely and integrable
+$\beta/\alpha$. The expansion \eqref{eq:eigs} requires
+$\kappa\gtrsim\ln M\cdot(\beta/\alpha)^2$, so the regime $M\to\infty$ at fixed
+$\kappa$ is not covered. Path loss is omitted; it rescales all $\lambda_k$ and
+$\Delta$ by a common factor and leaves \eqref{eq:losfloor} unaffected.
+
+%% =================== BODY ENDS HERE ===================
+
+\end{document}
