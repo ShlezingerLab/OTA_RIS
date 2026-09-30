@@ -1099,12 +1099,27 @@ def wireless_forward(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
         H_1_b = H_1_b.to(device)
         H_2_b = H_2_b.to(device)
     n_m = H_1_b.size(-2)
+    # === BLOCK-CHANNEL-FOR-PHI-OPT (experiment) ===================================
+    # Give the phi optimizer a block-constant channel estimate: within each block of
+    # `phi_block` consecutive samples, phi is optimized against the FIRST sample's
+    # H_1/H_2 (index floor(i/phi_block)*phi_block), while each sample keeps its own
+    # s / y target. phi is still solved per sample -- only the CSI seen by _phi_opt
+    # is blocked. The PHYSICAL wireless path below still uses the TRUE per-sample
+    # H_1_b/H_2_b, so this measures whether phi must be computed from per-sample CSI
+    # or a stale per-block channel estimate suffices. The final block is B % phi_block
+    # samples (or a full phi_block when B divides evenly). Set phi_block = 1 (or pass
+    # H_1_b/H_2_b directly) to restore per-sample CSI.
+    phi_block = 1 #delet this expreement if we dont need it 
+    _blk = (torch.arange(B, device=device) // phi_block) * phi_block
+    H_1_opt = H_1_b[_blk].contiguous()
+    H_2_opt = H_2_b[_blk].contiguous()
+    # === END BLOCK-CHANNEL-FOR-PHI-OPT ============================================
     if phi_cosine:
-        phi = _optimize_phi_gd(s, y_learned, H_1_b, H_2_b, n_m, iters=phi_iters)
+        phi = _optimize_phi_gd(s, y_learned, H_1_b, H_2_opt, n_m, iters=phi_iters)
     else:
-        phi = _optimize_phi_agc_mse(s, y_learned, H_1_b, H_2_b, n_m, iters=phi_iters)
-    H_1_s = torch.bmm(H_1_b, s.unsqueeze(-1)).squeeze(-1)              # (B, Nm)
-    y_ris_raw = torch.bmm(H_2_b, (H_1_s * phi).unsqueeze(-1)).squeeze(-1)  # (B, Nr) = A phi
+        phi = _optimize_phi_agc_mse(s, y_learned, H_1_opt, H_2_opt, n_m, iters=phi_iters)
+    H_1_s = torch.bmm(H_1_b, s.unsqueeze(-1)).squeeze(-1)              # (B, Nm)  TRUE channel
+    y_ris_raw = torch.bmm(H_2_b, (H_1_s * phi).unsqueeze(-1)).squeeze(-1)  # (B, Nr) = A phi, TRUE channel
     if abs_sigma2 is None:
         # Default: pipeline's relative-SNR noise (power referenced to the received signal).
         y_ris = y_ris_raw + noise(y_ris_raw, snr_db)
