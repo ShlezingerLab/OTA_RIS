@@ -34,7 +34,7 @@ Theory recap (single linear layer, f(s) = sigma(W s + b)):
     Degrees of freedom:  dim(reachable) <= min(N_m, rank(H1)*rank(H2), n_r*n_t)
     Exact realization:   N_m >= n_r*n_t and channels full rank  =>  eps_H = 0.
 
-The script produces two figures that should visibly support the theory:
+The script opens two figures (it does not write them to disk):
 
   * nm_sweep   : NMSE vs number of RIS elements N_m, overlaying
                    - unit-modulus phi (Adam, the achievable scheme),
@@ -45,15 +45,15 @@ The script produces two figures that should visibly support the theory:
                    the empirical curve should sit under the bound and scale ~ r^2.
 
 Channels come from ``channels.generate_channel_tensors_by_type`` (repo root).
-Default is ``synthetic_rayleigh`` so H1/H2 are full rank and the
-N_m = n_r n_t threshold is visible. ``geometric_ricean`` is available but
-high kappa collapses the cascade toward rank 1.
+Default is ``synthetic_ricean``. With ``--kappa`` omitted, the K-factor passed
+to the generator is 0 dB. High kappa collapses the cascade toward rank 1 and
+hides the N_m = n_r n_t threshold.
 
 Usage
 -----
+    python framework/ris_bounds_sim.py --experiment taylor_sweep --teacher sigmoid
+    python framework/ris_bounds_sim.py --experiment nm_sweep --teacher sigmoid --channel_type synthetic_rayleigh
     python framework/ris_bounds_sim.py --experiment both
-    python framework/ris_bounds_sim.py --experiment nm_sweep --teacher sigmoid
-    python framework/ris_bounds_sim.py --experiment taylor_sweep
     python framework/ris_bounds_sim.py --experiment legacy
 """
 
@@ -70,14 +70,6 @@ _REPO_ROOT = os.path.dirname(_SCRIPT_DIR)
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-_PLOT_DIR = os.path.join(_SCRIPT_DIR, "plots")
-
-# matplotlib only needed for the sweeps; import lazily / headless.
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
-
 # --------------------------------------------------------------------------- #
 # Defaults                                                                     #
 # --------------------------------------------------------------------------- #
@@ -87,9 +79,8 @@ DEFAULT_N_M = 64         # RIS elements (N)
 DEFAULT_POWER = 1.0
 DEFAULT_BATCH_SIZE = 1024
 DEFAULT_NUM_CHANNELS = 1000
-# Full-rank iid Rayleigh. geometric_ricean is a framework option, but high
-# kappa rank-collapses H1/H2 and hides the N_m = n_r*n_t threshold.
-DEFAULT_CHANNEL_TYPE = "synthetic_rayleigh"
+# iid Ricean. kappa=None is passed as 0 dB. High kappa rank-collapses H1/H2.
+DEFAULT_CHANNEL_TYPE = "synthetic_ricean"
 DEFAULT_KAPPA = None
 DEFAULT_TEACHER = "sigmoid"
 DEFAULT_PHI = "agc"
@@ -234,12 +225,53 @@ def make_ris_channel_pools(n_t, n_r, n_m, device, channel_type, kappa,
     return H_1_all.to(device), H_2_all.to(device)
 
 
-def _save_fig(fig, name: str) -> str:
-    os.makedirs(_PLOT_DIR, exist_ok=True)
-    out = os.path.join(_PLOT_DIR, name)
-    fig.savefig(out, dpi=140)
-    print(f"[saved] {out}")
-    return out
+def _matplotlib_interactive():
+    """True when running under IPython / Interactive Window (inline show works)."""
+    return "ipykernel" in sys.modules
+
+
+def _ensure_qt_runtime_dir():
+    """Give Qt a writable runtime dir when /run/user/... is not usable."""
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime_dir:
+        try:
+            os.makedirs(runtime_dir, mode=0o700, exist_ok=True)
+            if os.access(runtime_dir, os.W_OK | os.X_OK):
+                return
+        except OSError:
+            pass
+    uid = os.getuid() if hasattr(os, "getuid") else "user"
+    fallback_dir = os.path.join("/tmp", f"runtime-{uid}")
+    os.makedirs(fallback_dir, mode=0o700, exist_ok=True)
+    os.chmod(fallback_dir, 0o700)
+    os.environ["XDG_RUNTIME_DIR"] = fallback_dir
+
+
+def _matplotlib_pyplot():
+    """Import pyplot with matplotlib's default backend (not Agg)."""
+    _ensure_qt_runtime_dir()
+    import matplotlib.pyplot as plt
+    return plt
+
+
+def _matplotlib_can_show(plt):
+    """True when plt.show() can render inline or open a GUI window."""
+    if _matplotlib_interactive():
+        return True
+    backend = plt.get_backend().lower()
+    backend_name = backend.rsplit(".", 1)[-1]
+    non_gui_backends = {"agg", "pdf", "pgf", "ps", "svg", "template"}
+    return backend_name not in non_gui_backends
+
+
+def _show_plots():
+    """Open every figure created so far. Does not write a file."""
+    plt = _matplotlib_pyplot()
+    if _matplotlib_can_show(plt):
+        plt.show()
+        return
+    print("no interactive matplotlib display detected; figures were not saved")
+    plt.close("all")
 
 
 # --------------------------------------------------------------------------- #
@@ -363,6 +395,7 @@ def taylor_bound(teacher, s, s0, m4):
 # --------------------------------------------------------------------------- #
 def run_nm_sweep(args, device):
     """NMSE vs N_m: unit-modulus phi, unconstrained phi, and the rank floor."""
+    plt = _matplotlib_pyplot()
     teacher = make_teacher(args.teacher, args.n_t, args.n_r, device, seed=args.seed)
     s = generate_s(args.batch_size, args.n_t, args.power, device)
     mu_s, L = input_stats(s)
@@ -375,6 +408,14 @@ def run_nm_sweep(args, device):
         nm_values = sorted(set(
             [1, 2, 4, 8] + [max(1, cap // 2), cap, cap + cap // 2, 2 * cap, 3 * cap]
         ))
+
+    y_norm = float(torch.linalg.norm((G @ L).reshape(-1)).item())
+    eps_T, _, m4 = taylor_gap(teacher, s, mu_s, G)
+    if teacher.kind == "sigmoid":
+        eps_T_bound, _, _ = taylor_bound(teacher, s, mu_s, m4)
+    else:
+        eps_T_bound = 0.0
+    print(f"eps_T={eps_T:.3e}  bound={eps_T_bound:.3e}  (independent of N_m)")
 
     uni, unc, flr = [], [], []
     for n_m in nm_values:
@@ -390,32 +431,36 @@ def run_nm_sweep(args, device):
             u_i.append(ris_unitmod_nmse(G, H1, H2, L,
                                         iters=args.phi_iters * 4, step=0.05,
                                         restarts=2, seed=args.seed + t))
-        uni.append(sum(u_i) / len(u_i))
-        unc.append(sum(c_i) / len(c_i))
-        flr.append(sum(f_i) / len(f_i))
-        print(f"N_m={n_m:4d}  unit-mod={uni[-1]:.3e}  "
+        uni.append(y_norm * math.sqrt(max(sum(u_i) / len(u_i), 0.0)))
+        unc.append(y_norm * math.sqrt(max(sum(c_i) / len(c_i), 0.0)))
+        flr.append(y_norm * math.sqrt(max(sum(f_i) / len(f_i), 0.0)))
+        print(f"N_m={n_m:4d}  eps_H unit-mod={uni[-1]:.3e}  "
               f"unconstrained={unc[-1]:.3e}  rank-floor={flr[-1]:.3e}")
 
-    # ---- plot ----
-    fig, ax = plt.subplots(figsize=(7.2, 4.6))
-    ax.semilogy(nm_values, uni, "o-", label="unit-modulus $\\phi$ (achievable)")
-    ax.semilogy(nm_values, unc, "s--", label="unconstrained $\\phi\\in\\mathbb{C}^N$ (LS)")
-    ax.semilogy(nm_values, flr, "^:", label="channel-rank floor")
-    ax.axvline(args.n_t * args.n_r, color="k", lw=1, alpha=0.6)
-    ax.text(args.n_t * args.n_r, ax.get_ylim()[1],
-            r"  $N_m=n_r n_t$", va="top", fontsize=9)
-    ax.set_xlabel(r"RIS elements $N_m$")
-    ax.set_ylabel(r"RIS error NMSE $=\|(M(\phi)-G)\Sigma_s^{1/2}\|_F^2/\|G\Sigma_s^{1/2}\|_F^2$")
-    ax.set_title(f"RIS realization error vs size  ({args.teacher} teacher, "
-                 f"$n_t$={args.n_t}, $n_r$={args.n_r})")
-    ax.legend()
-    ax.grid(True, which="both", alpha=0.3)
-    fig.tight_layout()
-    return _save_fig(fig, "ris_nm_sweep.png")
+    # ε_H depends on N_m. ε_T does not, so it gets its own figure.
+    fig_h, ax_h = plt.subplots(figsize=(7.2, 4.6))
+    ax_h.semilogy(nm_values, [max(v, 1e-16) for v in uni], "o-",
+                  label="unit-modulus $\\phi$ (achievable)")
+    ax_h.semilogy(nm_values, [max(v, 1e-16) for v in unc], "s--",
+                  label=r"unconstrained $\phi\in\mathbb{C}^N$ (LS)")
+    ax_h.semilogy(nm_values, [max(v, 1e-16) for v in flr], "^:",
+                  label="channel-rank floor")
+    ax_h.axvline(args.n_t * args.n_r, color="k", lw=1, alpha=0.6)
+    ax_h.text(args.n_t * args.n_r, ax_h.get_ylim()[1],
+              r"  $N_m=n_r n_t$", va="top", fontsize=9)
+    ax_h.set_xlabel(r"RIS elements $N_m$")
+    ax_h.set_ylabel(r"$\varepsilon_H=\|(M(\phi)-G)\Sigma_s^{1/2}\|_F$")
+    ax_h.set_title(rf"$\varepsilon_H$ vs $N_m$  ({args.teacher}, "
+                   rf"$n_t$={args.n_t}, $n_r$={args.n_r})")
+    ax_h.legend()
+    ax_h.grid(True, which="both", alpha=0.3)
+    fig_h.tight_layout()
+    return fig_h
 
 
 def run_taylor_sweep(args, device):
     """eps_T vs input radius, with the (1/2) C2 ||W||^2 m4 bound."""
+    plt = _matplotlib_pyplot()
     if args.teacher != "sigmoid":
         print("[note] taylor_sweep is meaningful for --teacher sigmoid; using sigmoid.")
     teacher = make_teacher("sigmoid", args.n_t, args.n_r, device, seed=args.seed)
@@ -423,12 +468,14 @@ def run_taylor_sweep(args, device):
     powers = [float(p) for p in (args.power_list.split(",") if args.power_list
                                  else ["0.001", "0.003", "0.01", "0.03", "0.1", "0.3"])]
     radii, eps, bnd = [], [], []
-    s_ref = generate_s(args.batch_size, args.n_t, 1.0, device)
-    mu_s, _ = input_stats(s_ref)
-    s0 = mu_s
-    G = teacher.jacobian(s0)
+    if args.power not in powers:
+        powers = sorted(powers + [float(args.power)])
     for p in powers:
         s = generate_s(args.batch_size, args.n_t, p, device)
+        # Linearize at this cloud's own mean. One s0 from a different power
+        # shifts every radius by the same offset.
+        s0, _ = input_stats(s)
+        G = teacher.jacobian(s0)
         e, m2, m4 = taylor_gap(teacher, s, s0, G)
         b, C2, Wn = taylor_bound(teacher, s, s0, m4)
         radii.append(m2)
@@ -452,7 +499,7 @@ def run_taylor_sweep(args, device):
     ax.legend()
     ax.grid(True, which="both", alpha=0.3)
     fig.tight_layout()
-    return _save_fig(fig, "ris_taylor_sweep.png")
+    return fig
 
 
 # --------------------------------------------------------------------------- #
@@ -578,12 +625,17 @@ def main(argv=None):
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)
 
+    show = False
     if args.experiment in ("nm_sweep", "both"):
         print("=== Experiment: RIS error vs number of elements N_m ===")
         run_nm_sweep(args, device)
+        show = True
     if args.experiment in ("taylor_sweep", "both"):
         print("=== Experiment: first-order Taylor gap vs input spread ===")
         run_taylor_sweep(args, device)
+        show = True
+    if show:
+        _show_plots()
     if args.experiment == "legacy":
         teacher = make_teacher(args.teacher, args.n_t, args.n_r, device, seed=args.seed)
         s = generate_s(args.batch_size, args.n_t, args.power, device)
