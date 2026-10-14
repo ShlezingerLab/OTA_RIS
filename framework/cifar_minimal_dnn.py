@@ -905,6 +905,35 @@ def _optimize_phi_agc_mse(s, y, H_1, H_2, n_m, iters=100, step_size=0.1):
 
     return torch.exp(1j * theta).detach()
 
+
+def _optimize_phi_spectral(W, H_1, H_2, n_m, iters=100, step_size=0.1):
+    """Match phi by the spectral norm ||W - H2 diag(phi) H1||_2.
+
+    Temporary alternative to per-sample AGC MSE. W is the complex mid
+    (Nr, Nt); H_1 is (B, Nm, Nt), H_2 is (B, Nr, Nm). Independent of s.
+    Returns unit-modulus phi (B, Nm).
+    """
+    H_1 = H_1.detach()
+    H_2 = H_2.detach()
+    W = W.detach()
+    if W.dim() == 2:
+        W = W.unsqueeze(0)
+    B = H_1.size(0)
+    theta = torch.randn((B, n_m), device=H_1.device, requires_grad=True)
+    optimizer = torch.optim.Adam([theta], lr=step_size)
+
+    with torch.enable_grad():
+        for _ in range(iters):
+            phi = torch.exp(1j * theta)
+            H_eq = torch.bmm(H_2, torch.bmm(torch.diag_embed(phi), H_1))
+            loss = torch.linalg.matrix_norm(W - H_eq, ord=2).mean()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+    return torch.exp(1j * theta).detach()
+
+
 def _complex_W_from_linear(model):
     """Return the complex (N_r x N_t) mid weight for AirFC matching.
 
@@ -1072,12 +1101,13 @@ def make_ris_channel_pools(n_t, n_r, n_m, device, channel_type, kappa,
 
 def wireless_forward(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
                      H_1_b=None, H_2_b=None, return_parts=False, abs_sigma2=None,
-                     phi_cosine=False):
+                     phi_cosine=False, phi_spectral=False):
     """RIS-channel logits: encoder -> H_2 diag(phi) H_1 (replaces `linear`) -> decoder.
 
     Default phi solver is real-AGC MSE (``_optimize_phi_agc_mse``). Pass
-    ``phi_cosine=True`` for the older cosine-similarity Adam path. Noise and
-    real AGC are the same in both cases; only phi differs.
+    ``phi_cosine=True`` for the older cosine-similarity Adam path, or
+    ``phi_spectral=True`` to minimize ``||W - H2 diag(phi) H1||_2`` (no ``s``).
+    Noise and real AGC are the same in every case; only phi differs.
 
     If `H_1_b` / `H_2_b` are provided (batch channel tensors), they are used as-is;
     otherwise channels are sampled randomly from `H_1_all` / `H_2_all`.
@@ -1114,7 +1144,10 @@ def wireless_forward(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
     H_1_opt = H_1_b[_blk].contiguous()
     H_2_opt = H_2_b[_blk].contiguous()
     # === END BLOCK-CHANNEL-FOR-PHI-OPT ============================================
-    if phi_cosine:
+    if phi_spectral:
+        W = _complex_W_from_linear(model)
+        phi = _optimize_phi_spectral(W, H_1_opt, H_2_opt, n_m, iters=phi_iters)
+    elif phi_cosine:
         phi = _optimize_phi_gd(s, y_learned, H_1_b, H_2_opt, n_m, iters=phi_iters)
     else:
         phi = _optimize_phi_agc_mse(s, y_learned, H_1_opt, H_2_opt, n_m, iters=phi_iters)
@@ -1128,8 +1161,11 @@ def wireless_forward(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
         w = torch.randn_like(torch.view_as_real(y_ris_raw)) * math.sqrt(float(abs_sigma2) / 2.0)
         y_ris = y_ris_raw + torch.view_as_complex(w)
 
-    # Real positive AGC (same for AGC-MSE and cosine phi).
-    y_ris = _norm_match_to_target(y_ris, y_learned)
+    # Scale-match to target via real positive AGC (magnitude only). Skipped for the
+    # spectral path: there phi matches the operator W directly, so H_eq s is already
+    # at its natural scale and AGC is intentionally disabled.
+    if not phi_spectral:
+        y_ris = _norm_match_to_target(y_ris, y_learned)
 
     logits = model.decode(y_ris)                                 # (B, num_classes)
     if return_parts:
@@ -1249,7 +1285,8 @@ def airfc_forward(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
 
 @torch.no_grad()
 def evaluate_wireless(model, x, y, H_1_all, H_2_all, snr_db, device, phi_iters,
-                      batch_size=500, channel_indices=None, phi_cosine=False):
+                      batch_size=500, channel_indices=None, phi_cosine=False,
+                      phi_spectral=False):
     """Test accuracy (%) of the wireless RIS path.
 
     If `channel_indices` has shape (N,) matching `x`, each test sample uses that
@@ -1257,6 +1294,7 @@ def evaluate_wireless(model, x, y, H_1_all, H_2_all, snr_db, device, phi_iters,
     re-sampled randomly per batch.
 
     Default phi is AGC-MSE. ``phi_cosine=True`` uses cosine GD instead.
+    ``phi_spectral=True`` minimizes the spectral norm ``||W - H_eq||_2``.
     """
     model.eval()
     y = y.to(device)
@@ -1276,12 +1314,13 @@ def evaluate_wireless(model, x, y, H_1_all, H_2_all, snr_db, device, phi_iters,
         if channel_indices is None:
             logits = wireless_forward(
                 model, xb, H_1_all, H_2_all, snr_db, device, phi_iters,
-                phi_cosine=phi_cosine)
+                phi_cosine=phi_cosine, phi_spectral=phi_spectral)
         else:
             ch = channel_indices[start:start + batch_size]
             logits = wireless_forward(
                 model, xb, H_1_all, H_2_all, snr_db, device, phi_iters,
                 H_1_b=H_1_all[ch], H_2_b=H_2_all[ch], phi_cosine=phi_cosine,
+                phi_spectral=phi_spectral,
             )
         correct += (logits.argmax(1) == yb).sum().item()
         total += yb.size(0)
@@ -2698,7 +2737,7 @@ def evaluate_snr_sweep(model, x_te, y_te, snrs, device, channel_type, kappa,
                        phi_iters, num_channels, sim_models=None,
                        n_m=None, airfc_n_m=None, airfc_phi_iters=None,
                        do_wireless=True, do_airfc=True,
-                       dataset=DEFAULT_DATASET):
+                       dataset=DEFAULT_DATASET, phi_spectral=False):
     """Evaluate teacher / wireless / AirFC / SimNet accuracy vs SNR at fixed kappa.
 
     Wireless uses `n_m`; AirFC uses `airfc_n_m`. Channel indices are
@@ -2717,7 +2756,8 @@ def evaluate_snr_sweep(model, x_te, y_te, snrs, device, channel_type, kappa,
     sim_models = list(sim_models or [])
     print(
         f"\n=== SNR sweep setup | channel={channel_settings_label(channel_type, kappa)} | "
-        f"test_pool={num_channels} | N_m(wl)={n_m} | N_m(AirFC)={airfc_n_m} ==="
+        f"test_pool={num_channels} | N_m(wl)={n_m} | N_m(AirFC)={airfc_n_m}"
+        f"{' | phi=spectral ||W-H||_2' if phi_spectral else ''} ==="
     )
     H_1_wl = H_2_wl = ch_wl = H_1_af = H_2_af = ch_af = None
     airfc_cache = None
@@ -2747,7 +2787,7 @@ def evaluate_snr_sweep(model, x_te, y_te, snrs, device, channel_type, kappa,
         if do_wireless:
             wireless_acc = evaluate_wireless(
                 model, x_te, y_te, H_1_wl, H_2_wl, snr, device, phi_iters,
-                channel_indices=ch_wl,
+                channel_indices=ch_wl, phi_spectral=phi_spectral,
             )
         if do_airfc:
             airfc_acc = evaluate_airfc(
@@ -2783,9 +2823,11 @@ def evaluate_snr_sweep(model, x_te, y_te, snrs, device, channel_type, kappa,
 @torch.no_grad()
 def evaluate_n_m_sweep(model, x_te, y_te, teacher_acc, n_ms, device, snr_db,
                        channel_type, kappa, phi_iters, num_channels,
-                       airfc_phi_iters=None, dataset=DEFAULT_DATASET):
-    """Evaluate wireless RIS and AirFC accuracy vs N_m (same N_m for both).
+                       airfc_phi_iters=None, dataset=DEFAULT_DATASET,
+                       phi_spectral=False, do_airfc=False):
+    """Evaluate teacher vs wireless RIS accuracy vs N_m.
 
+    AirFC is included only when ``do_airfc`` is true (``--airfc true``).
     Wireless uses `phi_iters`; AirFC uses `airfc_phi_iters` (defaults to `phi_iters`).
     Returns list of (n_m, teacher_acc, wireless_acc, airfc_acc).
     """
@@ -2795,7 +2837,8 @@ def evaluate_n_m_sweep(model, x_te, y_te, teacher_acc, n_ms, device, snr_db,
         n_m = int(n_m)
         print(
             f"\n=== N_m sweep | N_m={n_m} | SNR={snr_db:g} dB | "
-            f"channel={channel_settings_label(channel_type, kappa)} ==="
+            f"channel={channel_settings_label(channel_type, kappa)}"
+            f"{' | phi=spectral ||W-H||_2' if phi_spectral else ''} ==="
         )
         pool_seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
         H_1_wl, H_2_wl = make_ris_channel_pools(
@@ -2806,26 +2849,34 @@ def evaluate_n_m_sweep(model, x_te, y_te, teacher_acc, n_ms, device, snr_db,
             apply_pathloss=True,
             seed=pool_seed,
         )
-        H_1_af, H_2_af = make_ris_channel_pools(
-            model.n_t, model.n_r, n_m, device,
-            channel_type=channel_type,
-            kappa=kappa,
-            num_channels=num_channels,
-            apply_pathloss=False,
-            seed=pool_seed,
-        )
         channel_indices = torch.randint(
             0, H_1_wl.size(0), (x_te.size(0),), device=device,
         )
         wireless_acc = evaluate_wireless(
             model, x_te, y_te, H_1_wl, H_2_wl, snr_db, device, phi_iters,
-            channel_indices=channel_indices,
+            channel_indices=channel_indices, phi_spectral=phi_spectral,
         )
-        airfc_acc = evaluate_airfc(
-            model, x_te, y_te, H_1_af, H_2_af, snr_db, device, airfc_phi_iters,
-            channel_indices=channel_indices, dataset=dataset,
-        )
-        print(f"  wireless acc={wireless_acc:.2f}% | AirFC acc={airfc_acc:.2f}%")
+        airfc_acc = float("nan")
+        if do_airfc:
+            H_1_af, H_2_af = make_ris_channel_pools(
+                model.n_t, model.n_r, n_m, device,
+                channel_type=channel_type,
+                kappa=kappa,
+                num_channels=num_channels,
+                apply_pathloss=False,
+                seed=pool_seed,
+            )
+            airfc_acc = evaluate_airfc(
+                model, x_te, y_te, H_1_af, H_2_af, snr_db, device, airfc_phi_iters,
+                channel_indices=channel_indices, dataset=dataset,
+            )
+        parts = [
+            f"teacher={teacher_acc:.2f}%",
+            f"wireless={wireless_acc:.2f}%",
+        ]
+        if do_airfc:
+            parts.append(f"AirFC={airfc_acc:.2f}%")
+        print("  " + " | ".join(parts))
         results.append(
             (float(n_m), float(teacher_acc), float(wireless_acc), float(airfc_acc))
         )
@@ -2847,7 +2898,8 @@ def plot_n_m_sweep(n_ms, teacher_acc, wireless_accs, airfc_accs, path=None):
         label=f"teacher upper bound ({teacher_acc:.1f}%)",
     )
     ax.plot(x_values, wireless_accs, marker="o", color="C0", label="wireless RIS")
-    ax.plot(x_values, airfc_accs, marker="D", color="C1", label="AirFC (P, Phi, U)")
+    if airfc_accs is not None and np.isfinite(airfc_accs).any():
+        ax.plot(x_values, airfc_accs, marker="D", color="C1", label="AirFC (P, Phi, U)")
     ax.set_xlabel(r"$N_m$ (RIS elements)")
     ax.set_ylabel("Accuracy (%)")
     ax.set_title(r"CIFAR accuracy vs $N_m$")
@@ -3039,7 +3091,7 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
              dataset=DEFAULT_DATASET,
              data_dir=None,
              airfc_debug=False, mse=False, mse_opt_subset=16,
-             phi_cosine=False, ls=False):
+             phi_cosine=False, ls=False, phi_spectral=False):
     """Train (or load) the teacher net and return (test_acc, wireless_acc, simnet_acc).
 
     When `load_only=True`, skip training and load a saved checkpoint from
@@ -3472,7 +3524,7 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
             phi_iters, num_channels_test, sim_models=sim_entries,
             n_m=n_m, airfc_n_m=airfc_n_m, airfc_phi_iters=airfc_phi_iters,
             do_wireless=do_wireless_sweep, do_airfc=do_airfc_sweep,
-            dataset=dataset,
+            dataset=dataset, phi_spectral=phi_spectral,
         )
         hdr = ["SNR(dB)", "teacher acc"]
         if do_wireless_sweep:
@@ -3591,21 +3643,27 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
                     )
                     print(f"  saved MSE N_m-sweep arrays to: {npz_path}")
     elif n_m_sweep is not None:
-        print("\n=== N_m sweep (wireless RIS / AirFC vs N_m) ===")
+        print("\n=== N_m sweep (teacher vs wireless RIS) ===")
         sweep_results = evaluate_n_m_sweep(
             model, x_te, y_te, acc, n_m_sweep, device, snr_db,
             channel_type, kappa, phi_iters, num_channels_test,
             airfc_phi_iters=airfc_phi_iters, dataset=dataset,
+            phi_spectral=phi_spectral, do_airfc=run_airfc,
         )
-        print(f"simulation upper bound : {acc:.2f}%")
-        print("\n     N_m | wireless acc | AirFC acc | gap(wl) | gap(airfc)")
+        print(f"teacher : {acc:.2f}%")
+        if run_airfc:
+            print("\n     N_m | teacher acc | wireless acc | AirFC acc | gap(wl)")
+        else:
+            print("\n     N_m | teacher acc | wireless acc | gap(wl)")
         for n_m_value, teacher_acc, sweep_wireless_acc, sweep_airfc_acc in sweep_results:
-            print(
-                f"{n_m_value:8g} | {sweep_wireless_acc:12.2f}% | "
-                f"{sweep_airfc_acc:9.2f}% | "
-                f"{teacher_acc - sweep_wireless_acc:7.2f}% | "
-                f"{teacher_acc - sweep_airfc_acc:9.2f}%"
+            line = (
+                f"{n_m_value:8g} | {teacher_acc:11.2f}% | "
+                f"{sweep_wireless_acc:12.2f}% | "
             )
+            if run_airfc:
+                line += f"{sweep_airfc_acc:9.2f}% | "
+            line += f"{teacher_acc - sweep_wireless_acc:7.2f}%"
+            print(line)
         if make_plots:
             n_ms = [row[0] for row in sweep_results]
             wireless_accs = [row[2] for row in sweep_results]
@@ -3638,7 +3696,8 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
                 num_channels=num_channels_test, apply_pathloss=True,
             )
             wireless_acc = evaluate_wireless(
-                model, x_te, y_te, H_1_all, H_2_all, snr_db, device, phi_iters)
+                model, x_te, y_te, H_1_all, H_2_all, snr_db, device, phi_iters,
+                phi_spectral=phi_spectral)
         if run_airfc:
             print(
                 f"\n=== AirFC path | n_t={model.n_t}, n_r={model.n_r}, "
@@ -4178,6 +4237,11 @@ if __name__ == "__main__":
                              "Linear RIS curve using cosine-similarity phi GD. "
                              "Default wireless phi is AGC-MSE. Bare --phi_cosine "
                              "means true.")
+    parser.add_argument("--phi_spectral", type=str, nargs="?", const="true",
+                        default="false", choices=["true", "false"],
+                        help="Wireless phi minimizes spectral norm "
+                             "||W - H2 diag(phi) H1||_2 instead of per-sample "
+                             "AGC MSE. Bare --phi_spectral means true.")
     parser.add_argument("--airfc_phi_iters", type=int, default=None,
                         help="AirFC P/Phi/U GD iters (default: same as --phi_iters)")
     parser.add_argument("--channel_type", type=str, default=None,
@@ -4225,6 +4289,7 @@ if __name__ == "__main__":
     airfc = args.airfc == "true"
     airfc_debug = args.airfc_debug == "true"
     phi_cosine = args.phi_cosine == "true"
+    phi_spectral = args.phi_spectral == "true"
     mse = args.mse == "true"
     ls = args.ls == "true"
     compare_teachers = args.compare_teachers == "true"
@@ -4395,7 +4460,7 @@ if __name__ == "__main__":
             dataset=dataset,
             airfc_debug=airfc_debug, mse=mse,
             mse_opt_subset=args.mse_opt_subset,
-            phi_cosine=phi_cosine, ls=ls,
+            phi_cosine=phi_cosine, ls=ls, phi_spectral=phi_spectral,
         )
         if wireless_acc is not None:
             print(f"wireless acc : {wireless_acc:.2f}%")
