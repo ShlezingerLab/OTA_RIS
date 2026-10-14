@@ -1871,11 +1871,18 @@ def augment_cifar_batch(xb: torch.Tensor) -> torch.Tensor:
 
 
 def train(model, x, y, device, epochs, lr, batch_size, weight_decay,
-          augment=False):
+          augment=False, wnorm_tau=None, wnorm_mode=None, wnorm_lambda=1.0):
     """Minimal Adam + CrossEntropy training loop (mirrors the checkerboard demo).
 
     When `augment=True`, applies CIFAR flip + pad-4 random crop each batch
     (use for `--data cifar`; leave False for MNIST). Uses CosineAnnealingLR.
+
+    W-norm matching (experiment, `theory/wip_14_10.md` §6.3): when ``wnorm_tau``
+    is set and the mid has a complex ``W_c`` (``--inter linear``), constrain
+    ``||W_lin||_F = wnorm_tau`` so the frob-path scale ``eta -> 1`` (no receiver
+    gain). ``wnorm_mode='hard'`` projects ``W_c`` onto the norm-``tau`` sphere
+    after every step; ``'soft'`` adds ``wnorm_lambda * ((||W_c|| - tau)/tau)^2``
+    to the loss. Default (``wnorm_tau=None``) is the unconstrained teacher.
     """
     model = model.to(device)
     x, y = x.to(device), y.to(device)
@@ -1883,6 +1890,11 @@ def train(model, x, y, device, epochs, lr, batch_size, weight_decay,
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     criterion = nn.CrossEntropyLoss()
     n = x.size(0)
+    has_wc = hasattr(model, "mid") and hasattr(model.mid, "W_c")
+    do_wnorm = wnorm_tau is not None and has_wc
+    if do_wnorm and wnorm_mode == "hard":              # start on the sphere
+        with torch.no_grad():
+            model.mid.W_c.mul_(wnorm_tau / model.mid.W_c.norm().clamp_min(1e-8))
 
     for epoch in range(epochs):
         model.train()
@@ -1895,9 +1907,16 @@ def train(model, x, y, device, epochs, lr, batch_size, weight_decay,
                 xb = augment_cifar_batch(xb)
             logits = model(xb)
             loss = criterion(logits, yb)
+            if do_wnorm and wnorm_mode == "soft":
+                loss = loss + wnorm_lambda * ((model.mid.W_c.norm() - wnorm_tau)
+                                              / wnorm_tau) ** 2
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            if do_wnorm and wnorm_mode == "hard":      # project back onto the sphere
+                with torch.no_grad():
+                    model.mid.W_c.mul_(
+                        wnorm_tau / model.mid.W_c.norm().clamp_min(1e-8))
             running_loss += loss.item() * xb.size(0)
             correct += (logits.argmax(1) == yb).sum().item()
             total += xb.size(0)
