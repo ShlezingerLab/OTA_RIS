@@ -934,6 +934,83 @@ def _optimize_phi_spectral(W, H_1, H_2, n_m, iters=100, step_size=0.1):
     return torch.exp(1j * theta).detach()
 
 
+def _sigma_half_from_batch(s):
+    """Return ``Sigma_s^{1/2}`` (Nt, Nt) from a batch of transmit vectors ``s``.
+
+    ``Sigma_s = E[s s^H]`` is the complex input covariance, estimated from the
+    batch (``s`` is (B, Nt) complex). The matrix square root is formed via the
+    Hermitian eigendecomposition. Using only this one fixed matrix keeps the
+    phi design ``s``-free (one phi for every image); the data-weighted Frobenius
+    objective matches ``W`` in proportion to how much energy the data puts in
+    each input direction.
+    """
+    Sigma = (s.mH @ s) / s.size(0)
+    ev, U = torch.linalg.eigh(Sigma)
+    ev = ev.clamp_min(0)
+    return (U * ev.sqrt()) @ U.mH
+
+
+def _optimize_phi_frob(W, H_1, H_2, n_m, sigma_half=None, iters=100, step_size=0.1):
+    """Match phi by the Frobenius operator error with an optimal global scale.
+
+    Minimizes over unit-modulus ``phi`` (with a closed-form global complex scale
+    ``eta``)::
+
+        min_eta || (W - eta * H_eq) S ||_F,     H_eq = H2 diag(phi) H1,
+
+    where ``S = sigma_half`` (``Sigma_s^{1/2}`` for the data-weighted variant) or
+    the identity (uniform variant, ``sigma_half=None``). Returns ``(phi, eta)``:
+    unit-modulus ``phi`` (B, Nm) and the per-channel global complex ``eta`` (B,)
+    to apply to ``H_eq s`` at inference.
+
+    The single global ``eta`` supplies the one scale DOF the spectral objective
+    lacks; with it a unit-modulus ``phi`` matches ``W`` up to a gain, which clears
+    the ``sigma_min(W)`` accuracy bar for ``N_m >~ n_r*n_t`` (empirically ~teacher
+    accuracy at ``N_m=256``). Still ``s``-free: only the channel and the data
+    covariance (via ``sigma_half``) enter, never the individual image.
+    """
+    H_1 = H_1.detach()
+    H_2 = H_2.detach()
+    W = W.detach()
+    if W.dim() == 2:
+        W = W.unsqueeze(0)
+    B = H_1.size(0)
+    S = None if sigma_half is None else sigma_half.detach()
+    theta = torch.randn((B, n_m), device=H_1.device, requires_grad=True)
+    optimizer = torch.optim.Adam([theta], lr=step_size)
+
+    def _eta_resid(phi):
+        H_eq = torch.bmm(H_2, torch.bmm(torch.diag_embed(phi), H_1))   # (B,Nr,Nt)
+        A = H_eq if S is None else torch.matmul(H_eq, S)
+        Bt = W if S is None else torch.matmul(W, S)
+        num = (A.conj() * Bt).sum(dim=(-2, -1))
+        den = (A.abs() ** 2).sum(dim=(-2, -1)).clamp_min(1e-8)
+        eta = num / den                                               # (B,) complex
+        return eta, Bt - eta.view(-1, 1, 1) * A
+
+    with torch.enable_grad():
+        for _ in range(iters):
+            phi = torch.exp(1j * theta)
+            _, resid = _eta_resid(phi)
+            loss = torch.linalg.norm(resid, dim=(-2, -1)).mean()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+    phi = torch.exp(1j * theta).detach()
+    eta, _ = _eta_resid(phi)
+    return phi, eta.detach()
+
+
+def _phi_label(phi_spectral=False, phi_frob=False, phi_weighted=False):
+    """Short banner tag naming the non-default wireless phi objective (or '')."""
+    if phi_spectral:
+        return " | phi=spectral ||W-H||_2"
+    if phi_frob:
+        return " | phi=frob ||W-eta*H||_F" + (" (Sigma_s-weighted)" if phi_weighted else "")
+    return ""
+
+
 def _complex_W_from_linear(model):
     """Return the complex (N_r x N_t) mid weight for AirFC matching.
 
@@ -1101,13 +1178,17 @@ def make_ris_channel_pools(n_t, n_r, n_m, device, channel_type, kappa,
 
 def wireless_forward(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
                      H_1_b=None, H_2_b=None, return_parts=False, abs_sigma2=None,
-                     phi_cosine=False, phi_spectral=False):
+                     phi_cosine=False, phi_spectral=False, phi_frob=False,
+                     phi_weighted=False):
     """RIS-channel logits: encoder -> H_2 diag(phi) H_1 (replaces `linear`) -> decoder.
 
     Default phi solver is real-AGC MSE (``_optimize_phi_agc_mse``). Pass
-    ``phi_cosine=True`` for the older cosine-similarity Adam path, or
-    ``phi_spectral=True`` to minimize ``||W - H2 diag(phi) H1||_2`` (no ``s``).
-    Noise and real AGC are the same in every case; only phi differs.
+    ``phi_cosine=True`` for the older cosine-similarity Adam path;
+    ``phi_spectral=True`` to minimize ``||W - H2 diag(phi) H1||_2`` (no ``s``); or
+    ``phi_frob=True`` to minimize the Frobenius error ``min_eta ||W - eta H_eq||_F``
+    with a global scale ``eta`` (``phi_weighted=True`` weights it by ``Sigma_s^{1/2}``).
+    The ``frob`` path applies its own global ``eta`` instead of per-image AGC; all
+    other paths share the noise + real-AGC receive chain. Only phi differs.
 
     If `H_1_b` / `H_2_b` are provided (batch channel tensors), they are used as-is;
     otherwise channels are sampled randomly from `H_1_all` / `H_2_all`.
@@ -1144,9 +1225,15 @@ def wireless_forward(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
     H_1_opt = H_1_b[_blk].contiguous()
     H_2_opt = H_2_b[_blk].contiguous()
     # === END BLOCK-CHANNEL-FOR-PHI-OPT ============================================
+    eta_frob = None
     if phi_spectral:
         W = _complex_W_from_linear(model)
         phi = _optimize_phi_spectral(W, H_1_opt, H_2_opt, n_m, iters=phi_iters)
+    elif phi_frob:
+        W = _complex_W_from_linear(model)
+        sigma_half = _sigma_half_from_batch(s) if phi_weighted else None
+        phi, eta_frob = _optimize_phi_frob(
+            W, H_1_opt, H_2_opt, n_m, sigma_half=sigma_half, iters=phi_iters)
     elif phi_cosine:
         phi = _optimize_phi_gd(s, y_learned, H_1_b, H_2_opt, n_m, iters=phi_iters)
     else:
@@ -1161,10 +1248,13 @@ def wireless_forward(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
         w = torch.randn_like(torch.view_as_real(y_ris_raw)) * math.sqrt(float(abs_sigma2) / 2.0)
         y_ris = y_ris_raw + torch.view_as_complex(w)
 
-    # Scale-match to target via real positive AGC (magnitude only). Skipped for the
-    # spectral path: there phi matches the operator W directly, so H_eq s is already
-    # at its natural scale and AGC is intentionally disabled.
-    if not phi_spectral:
+    # Scale-match to target. The frob path applies its own single global complex
+    # eta (s-free, from _optimize_phi_frob); the spectral path uses the raw operator
+    # output (AGC intentionally disabled); every other path uses real positive AGC
+    # (magnitude only).
+    if phi_frob:
+        y_ris = eta_frob.view(-1, 1) * y_ris
+    elif not phi_spectral:
         y_ris = _norm_match_to_target(y_ris, y_learned)
 
     logits = model.decode(y_ris)                                 # (B, num_classes)
@@ -1286,7 +1376,7 @@ def airfc_forward(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
 @torch.no_grad()
 def evaluate_wireless(model, x, y, H_1_all, H_2_all, snr_db, device, phi_iters,
                       batch_size=500, channel_indices=None, phi_cosine=False,
-                      phi_spectral=False):
+                      phi_spectral=False, phi_frob=False, phi_weighted=False):
     """Test accuracy (%) of the wireless RIS path.
 
     If `channel_indices` has shape (N,) matching `x`, each test sample uses that
@@ -1295,6 +1385,8 @@ def evaluate_wireless(model, x, y, H_1_all, H_2_all, snr_db, device, phi_iters,
 
     Default phi is AGC-MSE. ``phi_cosine=True`` uses cosine GD instead.
     ``phi_spectral=True`` minimizes the spectral norm ``||W - H_eq||_2``.
+    ``phi_frob=True`` minimizes ``min_eta ||W - eta H_eq||_F`` (uniform) or, with
+    ``phi_weighted=True``, the ``Sigma_s``-weighted Frobenius error.
     """
     model.eval()
     y = y.to(device)
@@ -1314,13 +1406,15 @@ def evaluate_wireless(model, x, y, H_1_all, H_2_all, snr_db, device, phi_iters,
         if channel_indices is None:
             logits = wireless_forward(
                 model, xb, H_1_all, H_2_all, snr_db, device, phi_iters,
-                phi_cosine=phi_cosine, phi_spectral=phi_spectral)
+                phi_cosine=phi_cosine, phi_spectral=phi_spectral,
+                phi_frob=phi_frob, phi_weighted=phi_weighted)
         else:
             ch = channel_indices[start:start + batch_size]
             logits = wireless_forward(
                 model, xb, H_1_all, H_2_all, snr_db, device, phi_iters,
                 H_1_b=H_1_all[ch], H_2_b=H_2_all[ch], phi_cosine=phi_cosine,
-                phi_spectral=phi_spectral,
+                phi_spectral=phi_spectral, phi_frob=phi_frob,
+                phi_weighted=phi_weighted,
             )
         correct += (logits.argmax(1) == yb).sum().item()
         total += yb.size(0)
@@ -2737,7 +2831,8 @@ def evaluate_snr_sweep(model, x_te, y_te, snrs, device, channel_type, kappa,
                        phi_iters, num_channels, sim_models=None,
                        n_m=None, airfc_n_m=None, airfc_phi_iters=None,
                        do_wireless=True, do_airfc=True,
-                       dataset=DEFAULT_DATASET, phi_spectral=False):
+                       dataset=DEFAULT_DATASET, phi_spectral=False,
+                       phi_frob=False, phi_weighted=False):
     """Evaluate teacher / wireless / AirFC / SimNet accuracy vs SNR at fixed kappa.
 
     Wireless uses `n_m`; AirFC uses `airfc_n_m`. Channel indices are
@@ -2757,7 +2852,7 @@ def evaluate_snr_sweep(model, x_te, y_te, snrs, device, channel_type, kappa,
     print(
         f"\n=== SNR sweep setup | channel={channel_settings_label(channel_type, kappa)} | "
         f"test_pool={num_channels} | N_m(wl)={n_m} | N_m(AirFC)={airfc_n_m}"
-        f"{' | phi=spectral ||W-H||_2' if phi_spectral else ''} ==="
+        f"{_phi_label(phi_spectral, phi_frob, phi_weighted)} ==="
     )
     H_1_wl = H_2_wl = ch_wl = H_1_af = H_2_af = ch_af = None
     airfc_cache = None
@@ -2788,6 +2883,7 @@ def evaluate_snr_sweep(model, x_te, y_te, snrs, device, channel_type, kappa,
             wireless_acc = evaluate_wireless(
                 model, x_te, y_te, H_1_wl, H_2_wl, snr, device, phi_iters,
                 channel_indices=ch_wl, phi_spectral=phi_spectral,
+                phi_frob=phi_frob, phi_weighted=phi_weighted,
             )
         if do_airfc:
             airfc_acc = evaluate_airfc(
@@ -2824,7 +2920,8 @@ def evaluate_snr_sweep(model, x_te, y_te, snrs, device, channel_type, kappa,
 def evaluate_n_m_sweep(model, x_te, y_te, teacher_acc, n_ms, device, snr_db,
                        channel_type, kappa, phi_iters, num_channels,
                        airfc_phi_iters=None, dataset=DEFAULT_DATASET,
-                       phi_spectral=False, do_airfc=False):
+                       phi_spectral=False, do_airfc=False,
+                       phi_frob=False, phi_weighted=False):
     """Evaluate teacher vs wireless RIS accuracy vs N_m.
 
     AirFC is included only when ``do_airfc`` is true (``--airfc true``).
@@ -2838,7 +2935,7 @@ def evaluate_n_m_sweep(model, x_te, y_te, teacher_acc, n_ms, device, snr_db,
         print(
             f"\n=== N_m sweep | N_m={n_m} | SNR={snr_db:g} dB | "
             f"channel={channel_settings_label(channel_type, kappa)}"
-            f"{' | phi=spectral ||W-H||_2' if phi_spectral else ''} ==="
+            f"{_phi_label(phi_spectral, phi_frob, phi_weighted)} ==="
         )
         pool_seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
         H_1_wl, H_2_wl = make_ris_channel_pools(
@@ -2855,6 +2952,7 @@ def evaluate_n_m_sweep(model, x_te, y_te, teacher_acc, n_ms, device, snr_db,
         wireless_acc = evaluate_wireless(
             model, x_te, y_te, H_1_wl, H_2_wl, snr_db, device, phi_iters,
             channel_indices=channel_indices, phi_spectral=phi_spectral,
+            phi_frob=phi_frob, phi_weighted=phi_weighted,
         )
         airfc_acc = float("nan")
         if do_airfc:
@@ -3091,7 +3189,8 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
              dataset=DEFAULT_DATASET,
              data_dir=None,
              airfc_debug=False, mse=False, mse_opt_subset=16,
-             phi_cosine=False, ls=False, phi_spectral=False):
+             phi_cosine=False, ls=False, phi_spectral=False,
+             phi_frob=False, phi_weighted=False):
     """Train (or load) the teacher net and return (test_acc, wireless_acc, simnet_acc).
 
     When `load_only=True`, skip training and load a saved checkpoint from
@@ -3525,6 +3624,7 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
             n_m=n_m, airfc_n_m=airfc_n_m, airfc_phi_iters=airfc_phi_iters,
             do_wireless=do_wireless_sweep, do_airfc=do_airfc_sweep,
             dataset=dataset, phi_spectral=phi_spectral,
+            phi_frob=phi_frob, phi_weighted=phi_weighted,
         )
         hdr = ["SNR(dB)", "teacher acc"]
         if do_wireless_sweep:
@@ -3649,6 +3749,7 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
             channel_type, kappa, phi_iters, num_channels_test,
             airfc_phi_iters=airfc_phi_iters, dataset=dataset,
             phi_spectral=phi_spectral, do_airfc=run_airfc,
+            phi_frob=phi_frob, phi_weighted=phi_weighted,
         )
         print(f"teacher : {acc:.2f}%")
         if run_airfc:
@@ -3689,7 +3790,8 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
             print(
                 f"\n=== Wireless RIS path | n_t={model.n_t}, n_r={model.n_r}, "
                 f"n_m={n_m}, SNR={snr_db:g} dB, phi_iters={phi_iters}, "
-                f"channel={channel_settings_label(channel_type, kappa)} ==="
+                f"channel={channel_settings_label(channel_type, kappa)}"
+                f"{_phi_label(phi_spectral, phi_frob, phi_weighted)} ==="
             )
             H_1_all, H_2_all = make_ris_channel_pools(
                 model.n_t, model.n_r, n_m, device, channel_type, kappa,
@@ -3697,7 +3799,8 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
             )
             wireless_acc = evaluate_wireless(
                 model, x_te, y_te, H_1_all, H_2_all, snr_db, device, phi_iters,
-                phi_spectral=phi_spectral)
+                phi_spectral=phi_spectral, phi_frob=phi_frob,
+                phi_weighted=phi_weighted)
         if run_airfc:
             print(
                 f"\n=== AirFC path | n_t={model.n_t}, n_r={model.n_r}, "
@@ -4242,6 +4345,17 @@ if __name__ == "__main__":
                         help="Wireless phi minimizes spectral norm "
                              "||W - H2 diag(phi) H1||_2 instead of per-sample "
                              "AGC MSE. Bare --phi_spectral means true.")
+    parser.add_argument("--phi_frob", type=str, nargs="?", const="true",
+                        default="false", choices=["true", "false"],
+                        help="Wireless phi minimizes the Frobenius operator error "
+                             "min_eta ||W - eta H_eq||_F with a global complex scale "
+                             "eta (s-free; reaches teacher accuracy at N_m>~n_r*n_t). "
+                             "Bare --phi_frob means true.")
+    parser.add_argument("--phi_weighted", type=str, nargs="?", const="true",
+                        default="false", choices=["true", "false"],
+                        help="With --phi_frob, weight the Frobenius error by "
+                             "Sigma_s^{1/2} (data covariance). Bare --phi_weighted "
+                             "means true. Implies --phi_frob.")
     parser.add_argument("--airfc_phi_iters", type=int, default=None,
                         help="AirFC P/Phi/U GD iters (default: same as --phi_iters)")
     parser.add_argument("--channel_type", type=str, default=None,
@@ -4290,6 +4404,8 @@ if __name__ == "__main__":
     airfc_debug = args.airfc_debug == "true"
     phi_cosine = args.phi_cosine == "true"
     phi_spectral = args.phi_spectral == "true"
+    phi_weighted = args.phi_weighted == "true"
+    phi_frob = args.phi_frob == "true" or phi_weighted   # --phi_weighted implies --phi_frob
     mse = args.mse == "true"
     ls = args.ls == "true"
     compare_teachers = args.compare_teachers == "true"
@@ -4461,6 +4577,7 @@ if __name__ == "__main__":
             airfc_debug=airfc_debug, mse=mse,
             mse_opt_subset=args.mse_opt_subset,
             phi_cosine=phi_cosine, ls=ls, phi_spectral=phi_spectral,
+            phi_frob=phi_frob, phi_weighted=phi_weighted,
         )
         if wireless_acc is not None:
             print(f"wireless acc : {wireless_acc:.2f}%")
