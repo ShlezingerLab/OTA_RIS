@@ -1257,6 +1257,16 @@ def wireless_forward(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
     elif not phi_spectral:
         y_ris = _norm_match_to_target(y_ris, y_learned)
 
+    # The operator-matching paths (spectral/frob) target the pre-BN complex W, so if
+    # the teacher mid has BatchNorm, re-apply it digitally before decoding (same as
+    # airfc_forward). The signal paths (default/cosine) match intermediate(s) with BN
+    # already baked into the target, so they must NOT re-apply it.
+    if (phi_spectral or phi_frob) and getattr(model, "mid", None) is not None \
+            and getattr(model.mid, "bn", None) is not None:
+        yf = torch.view_as_real(y_ris).reshape(B, -1)
+        yf = model.mid.bn(yf)
+        y_ris = torch.view_as_complex(yf.reshape(B, model.n_r, 2).contiguous())
+
     logits = model.decode(y_ris)                                 # (B, num_classes)
     if return_parts:
         return logits, y_learned, y_ris, s, H_1_b, H_2_b, y_ris_raw
