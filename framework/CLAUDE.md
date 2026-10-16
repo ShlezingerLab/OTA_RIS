@@ -15,7 +15,7 @@ every CLI flag, the checkpoint naming scheme, and each `--inter` /
 parsing or adding a flag** — don't duplicate that content here or in commit
 messages, just point at it. Argparse defaults live in the `DEFAULT_*` /
 `_DEFAULT_*` constants block near the top (e.g. `DEFAULT_N_T=16`,
-`DEFAULT_N_R=8`, `DEFAULT_N_M=64`, `DEFAULT_CHANNEL_TYPE="geometric_ricean"`,
+`DEFAULT_N_R=8`, `DEFAULT_N_M=256`, `DEFAULT_CHANNEL_TYPE="geometric_ricean"`,
 `DEFAULT_KAPPA=10`, `DEFAULT_SNR_DB=60`); most argparse defaults are `None` and
 fall back to these, so change behavior there, not in `add_argument`.
 

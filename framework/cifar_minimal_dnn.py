@@ -117,7 +117,7 @@ COMPARE_E2E_PATH_MNIST = os.path.join(
 # ---------------------------------------------------------------------------
 DEFAULT_N_T = 16
 DEFAULT_N_R = 8
-DEFAULT_N_M = 64
+DEFAULT_N_M = 256
 DEFAULT_NUM_CLASSES = 10
 DEFAULT_POWER = 1.0
 DEFAULT_SNR_DB = 60.0
