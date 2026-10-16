@@ -2538,7 +2538,8 @@ def evaluate_kappa_sweep(model, x_te, y_te, teacher_acc, kappas, device,
                          n_m=None, inter_label="RIS",
                          do_wireless=True, do_airfc=False,
                          airfc_n_m=None, airfc_phi_iters=None,
-                         dataset=DEFAULT_DATASET, phi_cosine=False):
+                         dataset=DEFAULT_DATASET, phi_cosine=False,
+                         phi_frob=False, phi_weighted=False):
     """Sweep a single teacher's wireless RIS / AirFC across Ricean kappa.
 
     - teacher_acc: fixed digital bound (passed in).
@@ -2546,16 +2547,18 @@ def evaluate_kappa_sweep(model, x_te, y_te, teacher_acc, kappas, device,
     - AirFC: P/Phi/U AO; requires --inter linear.
     - SimNet E2E: optional list of ``(label, CifarSimCNN)`` (each own channel pool).
     - ``phi_cosine``: also evaluate Linear RIS with cosine GD on the same channels.
+    - ``phi_frob``: also evaluate the s-free frob RIS (eta=1) as an extra curve.
 
     Returns list of
     ``(kappa, teacher_acc, ris_acc_or_nan, sim_accs_tuple, airfc_acc_or_nan,
-    ris_cosine_acc_or_nan)``.
+    ris_cosine_acc_or_nan, ris_frob_acc_or_nan)``.
     """
     n_m = int(model.n_m if n_m is None else n_m)
     airfc_n_m = int(n_m if airfc_n_m is None else airfc_n_m)
     airfc_phi_iters = int(phi_iters if airfc_phi_iters is None else airfc_phi_iters)
     sim_models = list(sim_models or [])
     do_phi_cosine = bool(phi_cosine) and bool(do_wireless)
+    do_phi_frob = bool(phi_frob) and bool(do_wireless)
     results = []
     for kappa in kappas:
         print(
@@ -2565,6 +2568,7 @@ def evaluate_kappa_sweep(model, x_te, y_te, teacher_acc, kappas, device,
         )
         ris = float("nan")
         ris_cosine = float("nan")
+        ris_frob = float("nan")
         airfc_acc = float("nan")
         airfc_res = float("nan")
         if do_wireless or do_airfc:
@@ -2581,6 +2585,11 @@ def evaluate_kappa_sweep(model, x_te, y_te, teacher_acc, kappas, device,
                     ris_cosine = evaluate_wireless(
                         model, x_te, y_te, H_1_wl, H_2_wl, snr_db, device, phi_iters,
                         channel_indices=ch_wl, phi_cosine=True,
+                    )
+                if do_phi_frob:
+                    ris_frob = evaluate_wireless(
+                        model, x_te, y_te, H_1_wl, H_2_wl, snr_db, device, phi_iters,
+                        channel_indices=ch_wl, phi_frob=True, phi_weighted=phi_weighted,
                     )
             if do_airfc:
                 airfc_acc, airfc_res = evaluate_airfc(
@@ -2604,6 +2613,8 @@ def evaluate_kappa_sweep(model, x_te, y_te, teacher_acc, kappas, device,
             parts.append(f"{inter_label} RIS={ris:.2f}%")
         if do_phi_cosine:
             parts.append(f"RIS cosine={ris_cosine:.2f}%")
+        if do_phi_frob:
+            parts.append(f"RIS frob={ris_frob:.2f}%")
         if do_airfc:
             parts.append(f"AirFC={airfc_acc:.2f}% (relF={airfc_res:.3f})")
         for (label, _m), acc in zip(sim_models, sim_accs):
@@ -2618,6 +2629,7 @@ def evaluate_kappa_sweep(model, x_te, y_te, teacher_acc, kappas, device,
                 sim_accs,
                 float(airfc_acc),
                 float(ris_cosine),
+                float(ris_frob),
             )
         )
     return results
@@ -2818,12 +2830,14 @@ def plot_n_m_sweep_mse(n_ms, nmse_agc, nmse_mrt, nmse_ls, free_opt, phys_opt,
 
 def plot_kappa_sweep(kappas, teacher_acc, ris_accs=None, path=None,
                      simnet_accs=None, airfc_accs=None, snr_db=None,
-                     inter_label="RIS", simnet_series=None, ris_cosine_accs=None):
+                     inter_label="RIS", simnet_series=None, ris_cosine_accs=None,
+                     ris_frob_accs=None):
     """Plot teacher bound + optional wireless RIS / AirFC / SimNet vs log10(1/kappa).
 
     ``simnet_series`` is ``[(label, accs), ...]``. A single 1-D ``simnet_accs``
     is treated as one curve labeled ``E2E``. ``ris_cosine_accs`` is the optional
-    cosine-phi Linear RIS curve (``--phi_cosine``). Default ``ris_accs`` is AGC-MSE.
+    cosine-phi Linear RIS curve (``--phi_cosine``); ``ris_frob_accs`` the s-free
+    frob curve (``--phi_frob``). Default ``ris_accs`` is AGC-MSE.
     """
     plt = _matplotlib_pyplot()
     inv_kappa = 1.0 / np.asarray(kappas, dtype=np.float64)
@@ -2845,6 +2859,11 @@ def plot_kappa_sweep(kappas, teacher_acc, ris_accs=None, path=None,
         if np.isfinite(ris_cosine_accs).any():
             ax.plot(x_values, ris_cosine_accs, marker="^", color="C4",
                     label="RIS cosine")
+    if ris_frob_accs is not None:
+        ris_frob_accs = np.asarray(ris_frob_accs, dtype=np.float64)[order]
+        if np.isfinite(ris_frob_accs).any():
+            ax.plot(x_values, ris_frob_accs, marker="s", color="C0",
+                    label="RIS frob (s-free)")
     if airfc_accs is not None:
         airfc_accs = np.asarray(airfc_accs, dtype=np.float64)[order]
         if np.isfinite(airfc_accs).any():
@@ -3597,11 +3616,14 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
         if not do_wireless_sweep and not do_airfc_sweep and not has_sim:
             print("  kappa sweep: nothing to evaluate "
                   "(enable --wireless / --airfc / --simnet)")
+        do_phi_frob_k = do_wireless_sweep and phi_frob
         extras = []
         if do_wireless_sweep:
             extras.append(f"{inter_name} RIS")
         if do_wireless_sweep and phi_cosine:
             extras.append("RIS cosine")
+        if do_phi_frob_k:
+            extras.append("RIS frob")
         if do_airfc_sweep:
             extras.append("AirFC")
         extras.extend(sim_labels)
@@ -3617,6 +3639,7 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
             do_wireless=do_wireless_sweep, do_airfc=do_airfc_sweep,
             airfc_n_m=airfc_n_m, airfc_phi_iters=airfc_phi_iters,
             dataset=dataset, phi_cosine=phi_cosine,
+            phi_frob=phi_frob, phi_weighted=phi_weighted,
         )
         print(f"{inter_name} teacher : {acc:.2f}%")
         headers = ["kappa", "1/kappa"]
@@ -3624,11 +3647,14 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
             headers.append(f"{inter_name} RIS")
         if do_wireless_sweep and phi_cosine:
             headers.append("RIS cosine")
+        if do_phi_frob_k:
+            headers.append("RIS frob")
         if do_airfc_sweep:
             headers.append("AirFC")
         headers.extend(sim_labels)
         print("\n   " + " | ".join(f"{h:>10}" for h in headers))
-        for kappa_value, _, ris, sweep_sim_accs, sweep_airfc_acc, sweep_cos in sweep_results:
+        for (kappa_value, _, ris, sweep_sim_accs, sweep_airfc_acc, sweep_cos,
+             sweep_frob) in sweep_results:
             cols = [
                 f"{kappa_value:10g}",
                 f"{1.0 / kappa_value:10.4f}",
@@ -3637,6 +3663,8 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
                 cols.append(f"{ris:9.2f}%")
             if do_wireless_sweep and phi_cosine:
                 cols.append(f"{sweep_cos:9.2f}%")
+            if do_phi_frob_k:
+                cols.append(f"{sweep_frob:9.2f}%")
             if do_airfc_sweep:
                 cols.append(f"{sweep_airfc_acc:9.2f}%")
             for acc_i in sweep_sim_accs:
@@ -3654,6 +3682,9 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
                 [row[5] for row in sweep_results]
                 if (do_wireless_sweep and phi_cosine) else None
             )
+            ris_frob_accs = (
+                [row[6] for row in sweep_results] if do_phi_frob_k else None
+            )
             sweep_plot_path = (
                 os.path.join(
                     plot_dir,
@@ -3665,6 +3696,7 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
                 kappas, acc, ris_accs=ris_accs, path=sweep_plot_path,
                 airfc_accs=airfc_accs, snr_db=snr_db, inter_label=inter_name,
                 simnet_series=simnet_series, ris_cosine_accs=ris_cosine_accs,
+                ris_frob_accs=ris_frob_accs,
             )
 
     if snr_sweep is not None:
