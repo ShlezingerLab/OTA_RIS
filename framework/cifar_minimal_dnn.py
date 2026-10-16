@@ -1005,10 +1005,19 @@ def _optimize_phi_frob(W, H_1, H_2, n_m, sigma_half=None, iters=100, step_size=0
 def _phi_label(phi_spectral=False, phi_frob=False, phi_weighted=False):
     """Short banner tag naming the non-default wireless phi objective (or '')."""
     if phi_spectral:
-        return " | phi=spectral ||W-H||_2"
+        return " | +phi=spectral ||W-H||_2"
     if phi_frob:
-        return " | phi=frob ||W-eta*H||_F" + (" (Sigma_s-weighted)" if phi_weighted else "")
+        return " | +phi=frob ||W-eta*H||_F" + (" (Sigma_s-weighted)" if phi_weighted else "")
     return ""
+
+
+def _phi_extra_name(phi_spectral=False, phi_frob=False, phi_weighted=False):
+    """Short column name for the EXTRA operator-matching curve in sweeps."""
+    if phi_spectral:
+        return "spectral"
+    if phi_frob:
+        return "frob-w" if phi_weighted else "frob"
+    return "extra"
 
 
 def _complex_W_from_linear(model):
@@ -1187,8 +1196,10 @@ def wireless_forward(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
     ``phi_spectral=True`` to minimize ``||W - H2 diag(phi) H1||_2`` (no ``s``); or
     ``phi_frob=True`` to minimize the Frobenius error ``min_eta ||W - eta H_eq||_F``
     with a global scale ``eta`` (``phi_weighted=True`` weights it by ``Sigma_s^{1/2}``).
-    The ``frob`` path applies its own global ``eta`` instead of per-image AGC; all
-    other paths share the noise + real-AGC receive chain. Only phi differs.
+    The ``frob`` path uses ``eta == 1`` (no receiver gain): it only folds ``eta``'s
+    gauge phase into ``phi`` (real-positive W-alignment) and applies unit gain -- this
+    assumes ``W`` was trained so ``|eta| ~= 1`` (``||W||_F = tau``, see §6.3). The
+    spectral path uses the raw output (no AGC); all other paths use real AGC.
 
     If `H_1_b` / `H_2_b` are provided (batch channel tensors), they are used as-is;
     otherwise channels are sampled randomly from `H_1_all` / `H_2_all`.
@@ -1234,6 +1245,11 @@ def wireless_forward(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
         sigma_half = _sigma_half_from_batch(s) if phi_weighted else None
         phi, eta_frob = _optimize_phi_frob(
             W, H_1_opt, H_2_opt, n_m, sigma_half=sigma_half, iters=phi_iters)
+        # eta == 1 by design: W is trained so |eta| ~= 1 (||W||_F = tau). We do NOT
+        # apply the computed magnitude -- only fold eta's (arbitrary, gauge) phase
+        # into phi so H_eq is real-positive-aligned to W, then use unit gain. The
+        # RIS realizes H_eq ~= W directly, no receiver gain.
+        phi = phi * (eta_frob / eta_frob.abs().clamp_min(1e-12)).unsqueeze(-1)
     elif phi_cosine:
         phi = _optimize_phi_gd(s, y_learned, H_1_b, H_2_opt, n_m, iters=phi_iters)
     else:
@@ -1248,13 +1264,11 @@ def wireless_forward(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
         w = torch.randn_like(torch.view_as_real(y_ris_raw)) * math.sqrt(float(abs_sigma2) / 2.0)
         y_ris = y_ris_raw + torch.view_as_complex(w)
 
-    # Scale-match to target. The frob path applies its own single global complex
-    # eta (s-free, from _optimize_phi_frob); the spectral path uses the raw operator
-    # output (AGC intentionally disabled); every other path uses real positive AGC
-    # (magnitude only).
-    if phi_frob:
-        y_ris = eta_frob.view(-1, 1) * y_ris
-    elif not phi_spectral:
+    # Scale-match to target. The frob path uses eta == 1 (no gain): W is trained so
+    # |eta| ~= 1 and the phase gauge is already folded into phi above. The spectral
+    # path uses the raw operator output (AGC intentionally disabled); every other
+    # path uses real positive AGC (magnitude only).
+    if not (phi_spectral or phi_frob):
         y_ris = _norm_match_to_target(y_ris, y_learned)
 
     # The operator-matching paths (spectral/frob) target the pre-BN complex W, so if
@@ -2872,7 +2886,9 @@ def evaluate_snr_sweep(model, x_te, y_te, snrs, device, channel_type, kappa,
     ``sim_models`` is an optional list of ``(label, CifarSimCNN)``.
 
     Returns list of (snr_db, teacher_acc, wireless_acc_or_nan, sim_accs_tuple,
-    airfc_acc_or_nan).
+    airfc_acc_or_nan, extra_acc_or_nan). ``wireless_acc`` is always the legacy
+    per-image AGC-MSE phi; ``extra_acc`` is the operator-matching phi
+    (spectral/frob) when requested, added as an extra curve (else NaN).
     """
     n_m = int(model.n_m if n_m is None else n_m)
     airfc_n_m = n_m if airfc_n_m is None else int(airfc_n_m)
@@ -2907,13 +2923,22 @@ def evaluate_snr_sweep(model, x_te, y_te, snrs, device, channel_type, kappa,
         model.snr_db = snr
         teacher_acc = evaluate(model, x_te, y_te, device)
         wireless_acc = float("nan")
+        extra_acc = float("nan")
         airfc_acc = float("nan")
         if do_wireless:
+            # Legacy wireless column is ALWAYS the default per-image AGC-MSE phi.
             wireless_acc = evaluate_wireless(
                 model, x_te, y_te, H_1_wl, H_2_wl, snr, device, phi_iters,
-                channel_indices=ch_wl, phi_spectral=phi_spectral,
-                phi_frob=phi_frob, phi_weighted=phi_weighted,
+                channel_indices=ch_wl,
             )
+            # When an operator-matching phi (spectral/frob) is requested, add it as
+            # an EXTRA column alongside legacy (same channel pool), not instead of it.
+            if phi_spectral or phi_frob:
+                extra_acc = evaluate_wireless(
+                    model, x_te, y_te, H_1_wl, H_2_wl, snr, device, phi_iters,
+                    channel_indices=ch_wl, phi_spectral=phi_spectral,
+                    phi_frob=phi_frob, phi_weighted=phi_weighted,
+                )
         if do_airfc:
             airfc_acc = evaluate_airfc(
                 model, x_te, y_te, H_1_af, H_2_af, snr, device, airfc_phi_iters,
@@ -2924,9 +2949,12 @@ def evaluate_snr_sweep(model, x_te, y_te, snrs, device, channel_type, kappa,
                 sim_models, sim_pools, x_te, y_te, device, snr_db=snr,
             )
         ) if sim_models else ()
+        extra_name = _phi_extra_name(phi_spectral, phi_frob, phi_weighted)
         parts = [f"teacher={teacher_acc:.2f}%"]
         if do_wireless:
-            parts.append(f"wireless={wireless_acc:.2f}%")
+            parts.append(f"wireless(legacy)={wireless_acc:.2f}%")
+            if phi_spectral or phi_frob:
+                parts.append(f"{extra_name}={extra_acc:.2f}%")
         if do_airfc:
             parts.append(f"AirFC={airfc_acc:.2f}%")
         for (label, _m), acc in zip(sim_models, sim_accs):
@@ -2939,6 +2967,7 @@ def evaluate_snr_sweep(model, x_te, y_te, snrs, device, channel_type, kappa,
                 float(wireless_acc),
                 sim_accs,
                 float(airfc_acc),
+                float(extra_acc),
             )
         )
     model.snr_db = prev_teacher_snr
@@ -3041,11 +3070,13 @@ def plot_n_m_sweep(n_ms, teacher_acc, wireless_accs, airfc_accs, path=None):
 
 
 def plot_snr_sweep(snrs, teacher_accs, wireless_accs=None, path=None, simnet_accs=None,
-                   airfc_accs=None, kappa=None, simnet_series=None):
+                   airfc_accs=None, kappa=None, simnet_series=None,
+                   extra_accs=None, extra_label="frob"):
     """Show or optionally save accuracy vs SNR (dB).
 
     ``simnet_series`` is ``[(label, accs), ...]``. A single 1-D ``simnet_accs``
-    is treated as one curve labeled ``SimNet E2E``.
+    is treated as one curve labeled ``SimNet E2E``. ``extra_accs`` is an optional
+    extra operator-matching curve (spectral/frob) plotted alongside legacy wireless.
     """
     plt = _matplotlib_pyplot()
     x_values = np.asarray(snrs, dtype=np.float64)
@@ -3060,7 +3091,12 @@ def plot_snr_sweep(snrs, teacher_accs, wireless_accs=None, path=None, simnet_acc
         wireless_accs = np.asarray(wireless_accs, dtype=np.float64)[order]
         if np.isfinite(wireless_accs).any():
             ax.plot(x_values, wireless_accs, marker="o", color="C0",
-                    label="wireless RIS")
+                    label="wireless RIS (legacy AGC-MSE)")
+    if extra_accs is not None:
+        extra_accs = np.asarray(extra_accs, dtype=np.float64)[order]
+        if np.isfinite(extra_accs).any():
+            ax.plot(x_values, extra_accs, marker="s", color="C3",
+                    label=f"wireless RIS ({extra_label}, s-free)")
     if airfc_accs is not None:
         airfc_accs = np.asarray(airfc_accs, dtype=np.float64)[order]
         if np.isfinite(airfc_accs).any():
@@ -3655,22 +3691,29 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
             dataset=dataset, phi_spectral=phi_spectral,
             phi_frob=phi_frob, phi_weighted=phi_weighted,
         )
+        want_extra = do_wireless_sweep and (phi_spectral or phi_frob)
+        extra_name = _phi_extra_name(phi_spectral, phi_frob, phi_weighted)
         hdr = ["SNR(dB)", "teacher acc"]
         if do_wireless_sweep:
-            hdr.append("wireless acc")
+            hdr.append("wireless(legacy)")
+            if want_extra:
+                hdr.append(f"{extra_name} acc")
         if do_airfc_sweep:
             hdr.append("AirFC acc")
         hdr.extend(sim_labels)
         print("\n   " + " | ".join(hdr))
         for (
-            snr_value, teacher_acc, sweep_wireless_acc, sweep_sim_accs, sweep_airfc_acc,
+            snr_value, teacher_acc, sweep_wireless_acc, sweep_sim_accs,
+            sweep_airfc_acc, sweep_extra_acc,
         ) in sweep_results:
             cols = [
                 f"{snr_value:9g}",
                 f"{teacher_acc:11.2f}%",
             ]
             if do_wireless_sweep:
-                cols.append(f"{sweep_wireless_acc:12.2f}%")
+                cols.append(f"{sweep_wireless_acc:16.2f}%")
+                if want_extra:
+                    cols.append(f"{sweep_extra_acc:{len(extra_name)+4}.2f}%")
             if do_airfc_sweep:
                 cols.append(f"{sweep_airfc_acc:9.2f}%")
             for acc_i in sweep_sim_accs:
@@ -3680,6 +3723,7 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
             snrs = [row[0] for row in sweep_results]
             teacher_accs = [row[1] for row in sweep_results]
             wireless_accs = [row[2] for row in sweep_results] if do_wireless_sweep else None
+            extra_accs = [row[5] for row in sweep_results] if want_extra else None
             simnet_series = [
                 (lab, [row[3][i] for row in sweep_results])
                 for i, lab in enumerate(sim_labels)
@@ -3697,6 +3741,7 @@ def run_once(n_t=DEFAULT_N_T, n_r=DEFAULT_N_R, n_m=DEFAULT_N_M,
                 path=sweep_plot_path,
                 airfc_accs=airfc_accs, kappa=kappa,
                 simnet_series=simnet_series,
+                extra_accs=extra_accs, extra_label=extra_name,
             )
 
     if n_m_sweep is not None and mse:
