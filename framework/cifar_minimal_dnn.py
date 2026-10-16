@@ -951,23 +951,22 @@ def _sigma_half_from_batch(s):
 
 
 def _optimize_phi_frob(W, H_1, H_2, n_m, sigma_half=None, iters=100, step_size=0.1):
-    """Match phi by the Frobenius operator error with an optimal global scale.
+    """Match phi by the Frobenius operator error, with ``eta == 1`` (no gain).
 
-    Minimizes over unit-modulus ``phi`` (with a closed-form global complex scale
-    ``eta``)::
+    Minimizes over unit-modulus ``phi``::
 
-        min_eta || (W - eta * H_eq) S ||_F,     H_eq = H2 diag(phi) H1,
+        min_phi || (W - H_eq) S ||_F,     H_eq = H2 diag(phi) H1,
 
     where ``S = sigma_half`` (``Sigma_s^{1/2}`` for the data-weighted variant) or
-    the identity (uniform variant, ``sigma_half=None``). Returns ``(phi, eta)``:
-    unit-modulus ``phi`` (B, Nm) and the per-channel global complex ``eta`` (B,)
-    to apply to ``H_eq s`` at inference.
+    the identity (uniform variant, ``sigma_half=None``). Returns ``(phi, eta)``
+    with unit-modulus ``phi`` (B, Nm) and ``eta = 1`` (ones, kept for signature
+    compatibility -- no scale is computed or applied).
 
-    The single global ``eta`` supplies the one scale DOF the spectral objective
-    lacks; with it a unit-modulus ``phi`` matches ``W`` up to a gain, which clears
-    the ``sigma_min(W)`` accuracy bar for ``N_m >~ n_r*n_t`` (empirically ~teacher
-    accuracy at ``N_m=256``). Still ``s``-free: only the channel and the data
-    covariance (via ``sigma_half``) enter, never the individual image.
+    This assumes ``W`` is trained so ``||W||_F = tau ~= ||H_eq||_F`` (see §6.3), so
+    the RIS realizes ``H_eq ~= W`` directly with no receiver gain. (The earlier
+    variant computed a global complex ``eta = <H_eq,W>/||H_eq||^2``; that is now
+    commented out in the body.) ``s``-free: only the channel and, optionally, the
+    data covariance (via ``sigma_half``) enter, never the individual image.
     """
     H_1 = H_1.detach()
     H_2 = H_2.detach()
@@ -979,26 +978,28 @@ def _optimize_phi_frob(W, H_1, H_2, n_m, sigma_half=None, iters=100, step_size=0
     theta = torch.randn((B, n_m), device=H_1.device, requires_grad=True)
     optimizer = torch.optim.Adam([theta], lr=step_size)
 
-    def _eta_resid(phi):
+    def _resid(phi):
         H_eq = torch.bmm(H_2, torch.bmm(torch.diag_embed(phi), H_1))   # (B,Nr,Nt)
         A = H_eq if S is None else torch.matmul(H_eq, S)
         Bt = W if S is None else torch.matmul(W, S)
-        num = (A.conj() * Bt).sum(dim=(-2, -1))
-        den = (A.abs() ** 2).sum(dim=(-2, -1)).clamp_min(1e-8)
-        eta = num / den                                               # (B,) complex
-        return eta, Bt - eta.view(-1, 1, 1) * A
+        # eta == 1 by design: W is trained so ||W||_F = tau ~= ||H_eq||_F, so we
+        # minimize ||W - H_eq|| directly and NEVER compute a scale. (The old global
+        # complex eta = <H_eq,W>/||H_eq||^2 is commented out.)
+        # num = (A.conj() * Bt).sum(dim=(-2, -1))
+        # den = (A.abs() ** 2).sum(dim=(-2, -1)).clamp_min(1e-8)
+        # eta = num / den                                               # (B,) complex
+        return Bt - A
 
     with torch.enable_grad():
         for _ in range(iters):
             phi = torch.exp(1j * theta)
-            _, resid = _eta_resid(phi)
-            loss = torch.linalg.norm(resid, dim=(-2, -1)).mean()
+            loss = torch.linalg.norm(_resid(phi), dim=(-2, -1)).mean()
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
     phi = torch.exp(1j * theta).detach()
-    eta, _ = _eta_resid(phi)
+    eta = torch.ones(B, dtype=phi.dtype, device=phi.device)           # eta == 1
     return phi, eta.detach()
 
 
@@ -1194,12 +1195,11 @@ def wireless_forward(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
     Default phi solver is real-AGC MSE (``_optimize_phi_agc_mse``). Pass
     ``phi_cosine=True`` for the older cosine-similarity Adam path;
     ``phi_spectral=True`` to minimize ``||W - H2 diag(phi) H1||_2`` (no ``s``); or
-    ``phi_frob=True`` to minimize the Frobenius error ``min_eta ||W - eta H_eq||_F``
-    with a global scale ``eta`` (``phi_weighted=True`` weights it by ``Sigma_s^{1/2}``).
-    The ``frob`` path uses ``eta == 1`` (no receiver gain): it only folds ``eta``'s
-    gauge phase into ``phi`` (real-positive W-alignment) and applies unit gain -- this
-    assumes ``W`` was trained so ``|eta| ~= 1`` (``||W||_F = tau``, see §6.3). The
-    spectral path uses the raw output (no AGC); all other paths use real AGC.
+    ``phi_frob=True`` to minimize the Frobenius error ``||W - H_eq||_F`` with
+    ``eta == 1`` / no receiver gain (``phi_weighted=True`` weights it by
+    ``Sigma_s^{1/2}``). The ``frob`` path applies ``phi`` raw and assumes ``W`` was
+    trained so ``||W||_F = tau`` (see §6.3), so ``H_eq ~= W`` directly. The spectral
+    path uses the raw output (no AGC); all other paths use real AGC.
 
     If `H_1_b` / `H_2_b` are provided (batch channel tensors), they are used as-is;
     otherwise channels are sampled randomly from `H_1_all` / `H_2_all`.
@@ -1236,20 +1236,16 @@ def wireless_forward(model, x, H_1_all, H_2_all, snr_db, device, phi_iters,
     H_1_opt = H_1_b[_blk].contiguous()
     H_2_opt = H_2_b[_blk].contiguous()
     # === END BLOCK-CHANNEL-FOR-PHI-OPT ============================================
-    eta_frob = None
     if phi_spectral:
         W = _complex_W_from_linear(model)
         phi = _optimize_phi_spectral(W, H_1_opt, H_2_opt, n_m, iters=phi_iters)
     elif phi_frob:
         W = _complex_W_from_linear(model)
         sigma_half = _sigma_half_from_batch(s) if phi_weighted else None
-        phi, eta_frob = _optimize_phi_frob(
+        # eta == 1 by design: _optimize_phi_frob minimizes ||W - H_eq||_F directly
+        # (no eta computed), so phi is already aligned to W. Use it raw, no gain.
+        phi, _ = _optimize_phi_frob(
             W, H_1_opt, H_2_opt, n_m, sigma_half=sigma_half, iters=phi_iters)
-        # eta == 1 by design: W is trained so |eta| ~= 1 (||W||_F = tau). We do NOT
-        # apply the computed magnitude -- only fold eta's (arbitrary, gauge) phase
-        # into phi so H_eq is real-positive-aligned to W, then use unit gain. The
-        # RIS realizes H_eq ~= W directly, no receiver gain.
-        phi = phi * (eta_frob / eta_frob.abs().clamp_min(1e-12)).unsqueeze(-1)
     elif phi_cosine:
         phi = _optimize_phi_gd(s, y_learned, H_1_b, H_2_opt, n_m, iters=phi_iters)
     else:
@@ -1409,8 +1405,8 @@ def evaluate_wireless(model, x, y, H_1_all, H_2_all, snr_db, device, phi_iters,
 
     Default phi is AGC-MSE. ``phi_cosine=True`` uses cosine GD instead.
     ``phi_spectral=True`` minimizes the spectral norm ``||W - H_eq||_2``.
-    ``phi_frob=True`` minimizes ``min_eta ||W - eta H_eq||_F`` (uniform) or, with
-    ``phi_weighted=True``, the ``Sigma_s``-weighted Frobenius error.
+    ``phi_frob=True`` minimizes ``||W - H_eq||_F`` with ``eta == 1`` (uniform) or,
+    with ``phi_weighted=True``, the ``Sigma_s``-weighted Frobenius error.
     """
     model.eval()
     y = y.to(device)
@@ -4422,8 +4418,9 @@ if __name__ == "__main__":
     parser.add_argument("--phi_frob", type=str, nargs="?", const="true",
                         default="false", choices=["true", "false"],
                         help="Wireless phi minimizes the Frobenius operator error "
-                             "min_eta ||W - eta H_eq||_F with a global complex scale "
-                             "eta (s-free; reaches teacher accuracy at N_m>~n_r*n_t). "
+                             "||W - H_eq||_F with eta=1 (no receiver gain; s-free). "
+                             "Added as an EXTRA curve alongside legacy in sweeps. "
+                             "Assumes W trained so ||W||_F=tau (--n_m must match). "
                              "Bare --phi_frob means true.")
     parser.add_argument("--phi_weighted", type=str, nargs="?", const="true",
                         default="false", choices=["true", "false"],
